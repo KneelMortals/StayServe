@@ -59,7 +59,6 @@ class _RoomFormState extends ConsumerState<RoomForm> {
   late RoomType _roomType;
   late FurnishingType _furnishing;
   late GenderPreference _gender;
-  late RoomStatus _status;
   late DateTime _availableFrom;
   late List<String> _amenities;
 
@@ -87,31 +86,38 @@ class _RoomFormState extends ConsumerState<RoomForm> {
     final room = widget.initialRoom;
 
     _titleController = TextEditingController(text: room?.title ?? '');
-    _descriptionController = TextEditingController(text: room?.description ?? '');
+    _descriptionController = TextEditingController(
+      text: room?.description ?? '',
+    );
     _rentController = TextEditingController(
       text: room == null ? '' : room.monthlyRent.toStringAsFixed(0),
     );
     _depositController = TextEditingController(
       text: room == null ? '' : room.securityDeposit.toStringAsFixed(0),
     );
-    _addressController = TextEditingController(text: room?.location.address ?? '');
+    _addressController = TextEditingController(
+      text: room?.location.address ?? '',
+    );
     _cityController = TextEditingController(text: room?.location.city ?? '');
     _stateController = TextEditingController(text: room?.location.state ?? '');
-    _pincodeController = TextEditingController(text: room?.location.pincode ?? '');
-    _occupancyController =
-        TextEditingController(text: '${room?.occupancy ?? 1}');
+    _pincodeController = TextEditingController(
+      text: room?.location.pincode ?? '',
+    );
+    _occupancyController = TextEditingController(
+      text: '${room?.occupancy ?? 1}',
+    );
 
     _roomType = room?.roomType ?? RoomType.single;
     _furnishing = room?.furnishing ?? FurnishingType.unfurnished;
     _gender = room?.genderPreference ?? GenderPreference.any;
-    _status = room?.status ?? RoomStatus.available;
     _availableFrom = room?.availableFrom ?? DateTime.now();
     _amenities = [...?room?.amenities];
 
     _existingImages = [...?room?.images];
     _selectedHomeId = room?.homeId ?? widget.initialHomeId;
     _homeNameController = TextEditingController(
-      text: room?.homeName ??
+      text:
+          room?.homeName ??
           (widget.initialHomeId != null
               ? _nameOfHome(widget.initialHomeId!)
               : ''),
@@ -145,7 +151,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
     final now = DateTime.now();
 
     final homeName = _homeNameController.text.trim();
-    final homeId = _selectedHomeId ??
+    final homeId =
+        _selectedHomeId ??
         (homeName.isEmpty
             ? null
             : 'HOME-${DateTime.now().millisecondsSinceEpoch}');
@@ -173,7 +180,10 @@ class _RoomFormState extends ConsumerState<RoomForm> {
       currentOccupancy: existing?.currentOccupancy ?? 0,
       genderPreference: _gender,
       images: _existingImages,
-      status: _status,
+      // The status is server-owned: a new listing starts as `available`, and
+      // an existing listing keeps the status it has (it is changed through
+      // the "My rooms" screen, never through this form).
+      status: existing?.status ?? RoomStatus.available,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       latitude: _latitude,
@@ -192,9 +202,9 @@ class _RoomFormState extends ConsumerState<RoomForm> {
         ),
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Listing saved')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Listing saved')));
       Navigator.of(context).pop(true);
     } catch (e) {
       if (!mounted) return;
@@ -267,7 +277,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
                   label: 'Rent (₹)',
                   hint: 'per month',
                   keyboardType: TextInputType.number,
-                  validator: (v) => AppValidators.validateMinValue(v, 1000, 'Rent'),
+                  validator: (v) =>
+                      AppValidators.validateMinValue(v, 1000, 'Rent'),
                 ),
               ),
               const SizedBox(width: AppSpacing.md),
@@ -277,7 +288,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
                   label: 'Deposit (₹)',
                   hint: 'refundable',
                   keyboardType: TextInputType.number,
-                  validator: (v) => AppValidators.validateMinValue(v, 0, 'Deposit'),
+                  validator: (v) =>
+                      AppValidators.validateMinValue(v, 0, 'Deposit'),
                 ),
               ),
             ],
@@ -308,13 +320,13 @@ class _RoomFormState extends ConsumerState<RoomForm> {
             getLabel: (e) => e.label,
           ),
           const SizedBox(height: AppSpacing.md),
-          _buildDropdown<RoomStatus>(
-            label: 'Status',
-            value: _status,
-            items: RoomStatus.values,
-            onChanged: (v) => setState(() => _status = v!),
-            getLabel: (e) => e.label,
-          ),
+          // The listing status is **server-owned**: it is changed through the
+          // "Mark occupied" / "Mark available" action on the "My rooms"
+          // screen (the `setRoomListingAvailability` callable), not here.
+          // A dropdown whose value was silently dropped on save would only
+          // confuse the owner.
+          if (widget.initialRoom != null)
+            _buildReadOnlyStatus(widget.initialRoom!.status),
           const SizedBox(height: AppSpacing.md),
           AppTextField(
             controller: _occupancyController,
@@ -484,8 +496,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
             isFull
                 ? 'Maximum ${AppConstants.maxImagesPerRoom} photos reached'
                 : total == 0
-                    ? 'Add photos'
-                    : 'Add more photos',
+                ? 'Add photos'
+                : 'Add more photos',
           ),
         ),
       ],
@@ -637,18 +649,16 @@ class _RoomFormState extends ConsumerState<RoomForm> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  hasCoordinates
-                      ? 'Location picked'
-                      : 'No location picked yet',
+                  hasCoordinates ? 'Location picked' : 'No location picked yet',
                   style: theme.textTheme.titleSmall,
                 ),
                 const SizedBox(height: AppSpacing.xs),
                 Text(
                   hasCoordinates
                       ? '${_latitude!.toStringAsFixed(5)}, '
-                          '${_longitude!.toStringAsFixed(5)}'
+                            '${_longitude!.toStringAsFixed(5)}'
                       : 'Pick your current location so students can see how '
-                          'far away the room is.',
+                            'far away the room is.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -791,7 +801,7 @@ class _RoomFormState extends ConsumerState<RoomForm> {
         Text(
           homes.isEmpty
               ? 'Publish several rooms of the same house by giving them the '
-                  'same home name.'
+                    'same home name.'
               : 'Pick one of your homes to add another room to it.',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
@@ -815,9 +825,9 @@ class _RoomFormState extends ConsumerState<RoomForm> {
 
   void _showMessage(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Widget _buildSectionTitle(String title) {
@@ -841,6 +851,28 @@ class _RoomFormState extends ConsumerState<RoomForm> {
           .map((e) => DropdownMenuItem(value: e, child: Text(getLabel(e))))
           .toList(),
       onChanged: onChanged,
+    );
+  }
+
+  /// The current listing status, shown as a read-only value.
+  ///
+  /// The status is server-owned — it is changed through the "Mark occupied" /
+  /// "Mark available" action on the "My rooms" screen, which calls
+  /// `setRoomListingAvailability`.
+  Widget _buildReadOnlyStatus(RoomStatus status) {
+    return InputDecorator(
+      decoration: const InputDecoration(labelText: 'Status'),
+      child: Row(
+        children: [
+          Expanded(child: Text(status.label)),
+          const Icon(Icons.lock_outline, size: 16),
+          const SizedBox(width: AppSpacing.xs),
+          Text(
+            'changed from "My rooms"',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
     );
   }
 

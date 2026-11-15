@@ -176,6 +176,7 @@ firebase login
 firebase use myfirstapp-fa30f52b
 
 node tools/backfill_registration.mjs --apply    # dry run first, without --apply
+node tools/backfill_rooms.mjs --apply           # dry run first, without --apply
 firebase deploy --only functions
 firebase deploy --only firestore:rules,firestore:indexes
 firebase deploy --only storage
@@ -333,7 +334,7 @@ membership. The corresponding work happens in a Cloud Function that checks the
 | Collection / field | Client may | Server owns |
 |---|---|---|
 | `users/{uid}` | read own profile, write `name`, `phone`, `profileImage`, `fcmToken`, `savedRooms`, `pincode`, `updatedAt` | `role`, `isActive`, `registrationCompleted`, the whole document **delete** |
-| `rooms/{roomId}` | create a listing (without `status` / `currentOccupancy`), edit the listing fields | `status`, `currentOccupancy`, the document **delete** |
+| `rooms/{roomId}` | create a listing (with the **initial** `status: available` / `currentOccupancy: 0`, or with both fields left out), edit the listing fields | any other `status` / `currentOccupancy` value, the document **delete** |
 | `joinRequests/{id}` | read own/own-room requests | **everything** — create, update and delete |
 | `payments/{id}` | read own/own-room payments | **everything** — write |
 | `commissionInvoices/{id}` | live admin may set `status` + bookkeeping | create, delete, amount, rent, parties |
@@ -355,7 +356,47 @@ Every one of them re-reads the profile of the caller, so a demoted or banned
 administrator loses the access immediately — a stale custom claim is never
 enough.
 
-### 5.1.1 The registration marker
+### 5.1.1 The listing fields a student searches by
+
+The student search compares the listing status with an **equality**
+(`status == available`). A Firestore equality query never matches a document
+that does not have the field, so a listing without a status would be
+invisible to every student — even though it is a valid listing.
+
+Three things keep that from happening:
+
+1. the create payload states the initial values (`status: available`,
+   `currentOccupancy: 0`); the rules accept **only** those two values, so a
+   client can neither publish a listing as occupied nor pretend that it
+   already has tenants;
+2. the `onRoomCreated` trigger gives a listing the same defaults when a
+   client left them out (an older app version);
+3. the app filters the status **in Dart**, so a listing whose status is
+   missing is still offered (a missing status means "available").
+
+Listings that were written before this rule existed are repaired with:
+
+```bash
+node tools/backfill_rooms.mjs          # dry run
+node tools/backfill_rooms.mjs --apply  # write status/currentOccupancy
+```
+
+The script is idempotent, only fills in **missing** fields and uses the
+document's `updateTime` as a precondition. A listing that is already
+`inactive` or `occupied` keeps its status.
+
+> **Status of this project:** the backfill has been applied — both listings
+> now carry `status: available` and `currentOccupancy: 0`. A fresh dry run
+> reports `Already complete: 2, Legacy candidates: 0`.
+
+The end-to-end proof (a throw-away owner uploads a listing, a throw-away
+student searches for it) runs against the deployed project:
+
+```bash
+node tools/verify_room_visibility.mjs
+```
+
+### 5.1.2 The registration marker
 
 A profile is only a *live* account when it has
 `registrationCompleted: true` **and** `isActive: true`. New accounts are
@@ -402,7 +443,7 @@ cd ~/Desktop/StayServe
 tools/test_firestore_rules.sh
 ```
 
-It starts the emulator, exercises 97 allow/deny assertions (the account
+It starts the emulator, exercises 99 allow/deny assertions (the account
 state, the profile writes, the room fields, the server-owned booking,
 payment and invoice collections, the notification bookkeeping, the two-party
 messaging, the capacity guard and the migration switch) and prints a summary.
@@ -429,24 +470,21 @@ service-account key) and it **writes to the production database**: the
 throw-away account, its profile, one notification and one room listing are
 created and deleted again.
 
-> **Current status:** the script itself works against production (it creates
-> the throw-away account, promotes it through the server-side channel, seeds
-> the notification and removes everything again — the database is verified
-> clean afterwards). It currently reports **36 passed, 7 failed**, and every
-> failure is one of the paths the new rules close:
+> **Current status:** the rules are deployed and the script reports
+> **44 passed, 0 failed** against the real project (it creates the throw-away
+> account, promotes it through the server-side channel, seeds the notification
+> and removes everything again — the database is verified clean afterwards).
 >
-> | Failing assertion | New rule |
+> The listing assertions are:
+>
+> | Assertion | Rule |
 > |---|---|
-> | creating a notification is allowed | notifications are server-owned (`allow create: if false;`) |
-> | changing the content of a notification is allowed | only the read bookkeeping may change |
-> | deleting a notification is allowed | deletion goes through `deleteNotification` |
-> | an owner may send the server-owned status on create | `rooms.status` is server-owned |
-> | an owner may change the listing status directly | `setRoomListingAvailability` owns it |
-> | an owner may change the occupancy counter directly | the booking state machine owns it |
-> | an owner may delete a room directly | `deleteRoomListing` owns it |
->
-> After `firebase deploy --only firestore:rules` the script has to report
-> **43 passed, 0 failed**.
+> | an owner may create their own room (without the server-owned fields) | the create may leave `status` / `currentOccupancy` out |
+> | an owner may send the initial server-owned state on create | only `available` / `0` are accepted on the create |
+> | an owner may NOT create a room that is already occupied | a client cannot publish a listing as occupied |
+> | an owner may NOT change the listing status directly | `setRoomListingAvailability` owns it |
+> | an owner may NOT change the occupancy counter directly | the booking state machine owns it |
+> | an owner may NOT delete a room directly | `deleteRoomListing` owns it |
 
 > **Three gotchas when editing `firestore.rules`:**
 >
@@ -502,7 +540,7 @@ token expires:
 
 The rules are **fail-closed**: a profile without `registrationCompleted: true`
 or with `isActive: false` has no access at all. Backfill the legacy profiles
-(section 5.1.1) before the first deployment of these rules.
+(section 5.1.2) before the first deployment of these rules.
 
 ---
 
@@ -674,11 +712,13 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    critical) in `functions/`. Worth running `npm audit fix` before a
    production release.
 7. **The Flutter test suite is growing but still thin in places.** There are
-   now 258 Dart/widget tests (session, routing, booking, payment, chat,
+   now 266 Dart/widget tests (session, routing, booking, payment, chat,
    layout, button audit), 34 backend state-machine checks, 16 room
-   listing/deletion checks and 97 Firestore-rules assertions in the
+   listing/deletion checks and 99 Firestore-rules assertions in the
    emulator. The OTP sign-up flow is additionally covered end to end by
-   `tools/signup_e2e.mjs` (real mail → code → verify → profile written).
+   `tools/signup_e2e.mjs` (real mail → code → verify → profile written), and
+   the "owner uploads a room → the student sees it" path by
+   `tools/verify_room_visibility.mjs`.
 8. **The project is not under version control.** Every edit is a direct
    filesystem change, so there is no way to roll back.
 9. **The custom claims are attached asynchronously.** The `onUserCreate`
@@ -702,11 +742,14 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
     The backfill has been applied for this project (the only legacy profile
     was the admin account), but a new account created before the marker was
     introduced would have no access at all until it is backfilled — or until
-    the temporary legacy window (section 5.1.1) is opened.
-13. **The new Firestore rules are not deployed yet.** The deployed rules are
-    still the old ones: the production check reports 7 failures (section
-    5.3) that all disappear with `firebase deploy --only firestore:rules`.
-    The Cloud Functions of this repair round are likewise not deployed.
+    the temporary legacy window (section 5.1.2) is opened. The same applies
+    to the listings: `tools/backfill_rooms.mjs` has filled the two existing
+    listings with their `status` / `currentOccupancy`.
+13. **The new Firestore rules and the Cloud Functions are deployed.** The
+    production check reports **44 passed, 0 failed** (section 5.3). The
+    `onRoomCreated` trigger gives a listing the server-owned defaults when a
+    client leaves them out — it has to stay deployed, otherwise a listing of
+    an older app version would be invisible in the student search.
 
 ---
 
@@ -715,9 +758,10 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
 The app was reported to show random demo rooms after login. Both possible
 sources were checked and are clean:
 
-* **Firestore** — the `rooms` collection is **empty** (verified through the
-  Firestore REST API with a throw-away account that was deleted afterwards),
-  and every other candidate collection name is denied by the catch-all rule.
+* **Firestore** — the `rooms` collection holds only the **real** listings of
+  the real users (verified through the Firestore REST API with a throw-away
+  account that was deleted afterwards), and every other candidate collection
+  name is denied by the catch-all rule.
 * **The code** — there is no mock/demo room data anywhere under `lib/`. The
   hardcoded mock lists were removed in the first repair round.
 
@@ -725,3 +769,9 @@ If demo rooms are still visible, the running app is an **old build** — install
 the freshly built APK (`build/app/outputs/flutter-apk/app-debug.apk`). The
 rooms that were shown came from the old hardcoded lists, not from the
 database.
+
+> The listings that are really in the database are visible in the student
+> search. A listing that was written without the server-owned `status` was
+> invisible there — the backfill (`tools/backfill_rooms.mjs`) has repaired the
+> two existing listings, and `tools/verify_room_visibility.mjs` proves the
+> whole path end to end against the deployed project.

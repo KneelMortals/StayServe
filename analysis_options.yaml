@@ -17,6 +17,10 @@ analyzer:
     - ios/Pods/**
     - macos/Pods/**
     - _backup_stray_generated/**
+    - android/**
+    - ios/**
+    - web/**
+    - macos/**
 
 linter:
   # The lint rules applied to this project can be customized in the
