@@ -1,0 +1,85 @@
+rules_version = '2';
+
+// ---------------------------------------------------------------------------
+// Firebase Storage rules.
+//
+// The deployed rules used to be
+//
+//     match /{allPaths=**} { allow read, write: if false; }
+//
+// which denies **every** upload — that is why the owner could not attach a
+// photo to a listing ("auth issue while uploading pics as owner"). The rules
+// below open the storage up again, but only for live, registered accounts
+// with the matching role.
+//
+// The Firestore profile is the source of truth for the role. A custom claim
+// alone is not enough: it stays in an already-issued ID token until that
+// token expires, so a demoted admin could otherwise keep writing files.
+// ---------------------------------------------------------------------------
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // A live account has completed its registration and is active.
+    function isLiveRegisteredAccount() {
+      return request.auth != null &&
+        firestore.exists(/databases/(default)/documents/users/$(request.auth.uid)) &&
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
+          .data.get('registrationCompleted', false) == true &&
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
+          .data.get('isActive', false) == true;
+    }
+
+    function isLiveOwner() {
+      return isLiveRegisteredAccount() &&
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
+          .data.get('role', '') == 'owner';
+    }
+
+    function isLiveAdmin() {
+      return isLiveRegisteredAccount() &&
+        request.auth.token.get('admin', false) == true &&
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
+          .data.get('role', '') == 'admin';
+    }
+
+    // -----------------------------------------------------------------------
+    // The photos of a room listing.
+    //
+    // They are stored under
+    //
+    //     rooms/{ownerUid}/{roomId}/{fileName}
+    //
+    // The uid of the owner is part of the path, so the rules can check it
+    // without trusting a field sent by the client. A signed-in owner may
+    // only write below their own folder, and can never upload into the
+    // folder of another owner.
+    //
+    // Reading is open to live, registered accounts — the photos are shown to
+    // the students inside the app.
+    // -----------------------------------------------------------------------
+    match /rooms/{ownerId}/{roomId}/{fileName} {
+      allow read: if isLiveRegisteredAccount();
+      allow write: if isLiveOwner() &&
+        request.auth.uid == ownerId &&
+        (
+          request.resource == null ||
+          (
+            request.resource.size < 10 * 1024 * 1024 &&
+            request.resource.contentType.matches('image/.*')
+          )
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Everything else (profile pictures, files the admin uploads, …).
+    //
+    // Reading is open to live, registered accounts; writing is reserved for
+    // a live administrator. The current Firebase claim is also required, but
+    // it is never sufficient on its own.
+    // -----------------------------------------------------------------------
+    match /{allPaths=**} {
+      allow read: if isLiveRegisteredAccount();
+      allow write: if isLiveAdmin();
+    }
+  }
+}

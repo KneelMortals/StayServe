@@ -1,0 +1,134 @@
+name: stayserve
+description: "StayServe - Room Finder Platform for Students"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.5.1
+  riverpod_annotation: ^2.3.5
+
+  # Routing
+  go_router: ^14.2.0
+
+  # Firebase
+  firebase_core: ^3.4.0
+  firebase_auth: ^5.1.0
+  cloud_firestore: ^5.2.0
+  firebase_storage: ^12.1.0
+  firebase_messaging: ^15.0.0
+  # Pinned below 5.6.0 / 5.5.0 on purpose: from 5.6.0 (cloud_functions) and
+  # 5.5.0 (firebase_remote_config) onwards these plugins apply the Kotlin
+  # Gradle Plugin themselves, which Flutter rejects:
+  #
+  #   WARNING: Your app uses the following plugins that apply Kotlin Gradle
+  #   Plugin (KGP): cloud_functions, firebase_remote_config
+  #   Future versions of Flutter will fail to build ...
+  #
+  # 5.5.2 / 5.4.7 are the newest releases that do **not** apply KGP; their
+  # Kotlin sources are compiled by AGP 9's built-in Kotlin support.
+  cloud_functions: '>=5.1.0 <5.6.0'
+  firebase_remote_config: '>=5.1.0 <5.5.0'
+
+  # Serialization
+  # NOTE: models are hand-written (no code generation) so that the project
+  # builds with the installed Flutter/Dart SDK without build_runner.
+
+  # UI & Media
+  cached_network_image: ^3.4.1
+  image_picker: ^1.1.2
+  photo_view: ^0.15.0
+
+  # Utils
+  intl: ^0.19.0
+  url_launcher: ^6.2.6
+  permission_handler: ^11.3.1
+  uuid: ^4.4.0
+  package_info_plus: ^10.2.2
+  geolocator: ^14.1.2
+  geocoding: ^5.0.1
+
+  # Payments - UPI only via url_launcher (already included)
+
+  # Charts
+  fl_chart: ^0.68.0
+
+  # Local Storage
+  shared_preferences: ^2.2.3
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  mockito: ^5.4.4
+  firebase_auth_mocks: ^0.14.2
+  flutter_native_splash: ^2.3.10
+  flutter_launcher_icons: ^0.13.1
+
+# ---------------------------------------------------------------------------
+# The Firebase core packages are pinned to a matching pair on purpose.
+#
+# `cloud_functions 5.5.2` (the newest release that does not apply the Kotlin
+# Gradle Plugin) asks for `firebase_core_platform_interface ^5.3.1`, which
+# drags in `firebase_core 3.15.0`. That pair is broken: the Java side of
+# `firebase_core 3.15.0` was generated with a newer Pigeon release than the
+# Dart side of `firebase_core_platform_interface 5.4.2`, so the two use
+# *different method-channel names*
+#
+#   Dart:  dev.flutter.pigeon.FirebaseCoreHostApi.initializeApp
+#   Java:  dev.flutter.pigeon.firebase_core_platform_interface.FirebaseCoreHostApi.initializeApp
+#
+# The native side then never receives a request and every Firebase call dies
+# with
+#
+#   PlatformException(channel-error, Unable to establish connection on channel.)
+#
+# which surfaced as "Firebase failed to initialise" and as the mysterious
+# "auth issue" on the login screen.
+#
+# `firebase_core 3.15.2` + `firebase_core_platform_interface 6.0.3` are the
+# matching pair (both generated with Pigeon 25.x). Overriding them here keeps
+# the KGP-free plugin versions *and* a working Firebase stack.
+# ---------------------------------------------------------------------------
+dependency_overrides:
+  firebase_core: 3.15.2
+  firebase_core_platform_interface: 6.0.3
+  # `cloud_functions 5.5.2` still talks to the native side over the classic
+  # `plugins.flutter.io/firebase_functions` method channel, while
+  # `cloud_functions_platform_interface 5.8.x` has already moved to Pigeon
+  # (`dev.flutter.pigeon.cloud_functions_platform_interface.CloudFunctionsHostApi.call`).
+  # The two generations do not understand each other, so the last
+  # method-channel release is pinned here.
+  cloud_functions_platform_interface: 5.7.2
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/logo.png
+    - assets/images/logo_minimal.png
+    - assets/images/
+    - assets/icons/
+
+flutter_native_splash:
+  color: "#2E7D32"
+  image: assets/images/logo_minimal.png
+  android_12:
+    image: assets/images/logo_minimal.png
+    color: "#2E7D32"
+  ios: true
+  web: false
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/logo_minimal.png"
+  min_sdk_android: 21

@@ -1,0 +1,52 @@
+{
+  "conditions": [],
+  "parameters": {
+    "min_app_version": {
+      "defaultValue": {
+        "value": "1.0.0"
+      }
+    },
+    "latest_version": {
+      "defaultValue": {
+        "value": "1.0.0"
+      }
+    },
+    "force_update": {
+      "defaultValue": {
+        "value": "false"
+      }
+    },
+    "update_message": {
+      "defaultValue": {
+        "value": "A new version is available. Please update to continue."
+      }
+    },
+    "update_url_android": {
+      "defaultValue": {
+        "value": ""
+      }
+    },
+    "update_url_ios": {
+      "defaultValue": {
+        "value": ""
+      }
+    },
+    "maintenance_mode": {
+      "defaultValue": {
+        "value": "false"
+      }
+    },
+    "maintenance_message": {
+      "defaultValue": {
+        "value": "App is under maintenance. Please try again later."
+      }
+    }
+  },
+  "parameterGroups": {},
+  "version": {
+    "description": "StayServe release settings",
+    "versionNumber": "1",
+    "updateOrigin": "CONSOLE",
+    "updateType": "REMOTE_CONFIG_UPDATE_TYPE_UNSPECIFIED"
+  }
+}
