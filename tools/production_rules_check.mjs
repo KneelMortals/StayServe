@@ -573,10 +573,15 @@ async function main() {
   check('a client cannot create a notification for somebody else', denied(forgeNotification), `HTTP ${forgeNotification.status}`);
 
   console.log('\n--- the rooms collection is clean ---');
-  // The client may not delete a room any more, so both throw-away listings
-  // are removed through the server-side channel before the collection is
+  // The client may not delete a room any more, so every throw-away listing
+  // is removed through the server-side channel before the collection is
   // inspected.
-  for (const path of [`/rooms/${roomId}`, `/rooms/${roomId}-status`]) {
+  for (const path of [
+    `/rooms/${roomId}`,
+    `/rooms/${roomId}-initial`,
+    `/rooms/${roomId}-status`,
+    `/rooms/${roomId}-occupied`,
+  ]) {
     const removed = await adminFs('DELETE', path);
     console.log(`  removed ${path} (server channel) -> HTTP ${removed.status}`);
   }
