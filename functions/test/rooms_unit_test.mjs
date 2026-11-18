@@ -16,6 +16,7 @@ const require = createRequire(import.meta.url);
 const {
   decideRoomListingAvailability,
   decideRoomDeletion,
+  storageObjectPathFromDownloadUrl,
 } = require(path.join(HERE, '..', 'lib', 'rooms.js'));
 
 let pass = 0;
@@ -120,6 +121,38 @@ check(
   'an invalid occupancy is refused',
   decideRoomDeletion(Number.NaN, []),
   { allowed: false, reason: 'invalid-occupancy' },
+);
+
+console.log('\n=== room-photo Storage cleanup paths ===');
+
+check(
+  'a Firebase Storage download URL yields its object path',
+  storageObjectPathFromDownloadUrl(
+    'https://firebasestorage.googleapis.com/v0/b/stayserve.appspot.com/o/rooms%2Fowner-1%2FRM-1%2Fphoto.jpg?alt=media&token=abc',
+  ),
+  'rooms/owner-1/RM-1/photo.jpg',
+);
+check(
+  'a legacy Storage download URL yields its object path',
+  storageObjectPathFromDownloadUrl(
+    'https://storage.googleapis.com/stayserve.appspot.com/rooms/owner-1/RM-1/photo.jpg',
+  ),
+  'rooms/owner-1/RM-1/photo.jpg',
+);
+check(
+  'an unrelated URL is not treated as a Storage object',
+  storageObjectPathFromDownloadUrl('https://example.com/photo.jpg'),
+  null,
+);
+check(
+  'a malformed URL is not treated as a Storage object',
+  storageObjectPathFromDownloadUrl('not a url'),
+  null,
+);
+check(
+  'a missing URL is not treated as a Storage object',
+  storageObjectPathFromDownloadUrl(null),
+  null,
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -1,10 +1,10 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../../core/index.dart';
 import '../../../../../firebase/owner/owner_repository.dart';
-import '../../../../../models/room_model.dart';
+import '../../../../../models/owned_room_model.dart';
 import '../providers/owner_providers.dart';
 import '../widgets/room_form.dart';
 
@@ -37,7 +37,7 @@ class EditRoomScreen extends ConsumerWidget {
         // unsaved change.
         error: (error, _) => _buildError(context, ref),
         data: (rooms) {
-          RoomModel? room;
+          OwnedRoomModel? room;
           for (final candidate in rooms) {
             if (candidate.roomId == roomId) {
               room = candidate;
@@ -55,6 +55,7 @@ class EditRoomScreen extends ConsumerWidget {
 
           return RoomForm(
             initialRoom: room,
+            initialPrivateLocation: room.privateLocation,
             submitLabel: 'Save Changes',
             homes: ref.watch(ownerHomesProvider),
             onSubmit: (draft) async {

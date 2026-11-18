@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Small helpers for showing feedback to the user.
 ///
@@ -31,6 +31,23 @@ extension AppSnackBarX on BuildContext {
         SnackBar(
           content: Text(message),
           backgroundColor: Theme.of(this).colorScheme.primary,
+        ),
+      );
+  }
+
+  /// Shows a warning message.
+  ///
+  /// This is used for operations which were accepted but did not reach their
+  /// final state — for example a deletion which is queued for a retry.
+  void showWarningSnackBar(String message) {
+    final messenger = ScaffoldMessenger.maybeOf(this);
+    if (messenger == null) return;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: Theme.of(this).colorScheme.tertiary,
         ),
       );
   }

@@ -20,6 +20,54 @@ final adminRepositoryProvider = Provider<AdminRepository>((ref) {
   );
 });
 
+/// The server's explicit outcome of an immediate account-deletion request.
+///
+/// A successful callable call does **not** necessarily mean the account was
+/// removed immediately. The deletion may be blocked by active booking data
+/// or it may have to be retried after a transient Storage/Firestore failure.
+/// The UI keeps those states distinct so an administrator is never told
+/// that an account was deleted when it is still queued.
+class AccountDeletionResult {
+  final bool completed;
+  final bool queued;
+  final bool blocked;
+  final bool retryable;
+  final String state;
+  final String message;
+
+  const AccountDeletionResult({
+    required this.completed,
+    required this.queued,
+    required this.blocked,
+    required this.retryable,
+    required this.state,
+    required this.message,
+  });
+
+  factory AccountDeletionResult.fromData(Map<String, dynamic> data) {
+    final state = (data['state'] as String? ?? '').trim().toLowerCase();
+    final completed = data['completed'] == true || state == 'completed';
+    final blocked = data['blocked'] == true || state == 'blocked';
+    final queued =
+        data['queued'] == true ||
+        state == 'queued' ||
+        state == 'blocked' ||
+        (!completed && !blocked);
+    final retryable = data['retryable'] is bool
+        ? data['retryable'] as bool
+        : !completed && !blocked;
+
+    return AccountDeletionResult(
+      completed: completed,
+      queued: queued,
+      blocked: blocked,
+      retryable: retryable,
+      state: state.isEmpty ? (completed ? 'completed' : 'queued') : state,
+      message: (data['message'] as String? ?? '').trim(),
+    );
+  }
+}
+
 class AdminRepository {
   final FirebaseFirestore _firestore;
   final FirebaseFunctions _functions;
@@ -77,10 +125,15 @@ class AdminRepository {
     }
   }
 
-  Future<void> _callDeleteUser(String uid) async {
+  Future<AccountDeletionResult> _callDeleteUser(String uid) async {
     try {
       final callable = _functions.httpsCallable('deleteUserCompletely');
-      await callable.call({'uid': uid});
+      final response = await callable.call({'uid': uid});
+      final raw = response.data;
+      if (raw is! Map) {
+        throw Exception('The deletion response was invalid');
+      }
+      return AccountDeletionResult.fromData(Map<String, dynamic>.from(raw));
     } catch (e) {
       AppLogger.warning('Cloud Function deleteUserCompletely failed', error: e);
       throw Exception(_readableError(e, 'Could not delete the user'));
@@ -202,8 +255,15 @@ class AdminRepository {
   }
 
   Future<void> deleteUser(String uid) async {
-    // Use Cloud Function for complete deletion (Auth + Firestore)
+    // Use Cloud Function for complete deletion (Auth + Firestore).
+    // Callers which need to distinguish "completed", "blocked" and
+    // "queued for retry" use [deleteUserWithResult] instead.
     await _callDeleteUser(uid);
+  }
+
+  /// Deletes an account and returns the server's explicit deletion state.
+  Future<AccountDeletionResult> deleteUserWithResult(String uid) async {
+    return _callDeleteUser(uid);
   }
 
   // ============ ROOM MANAGEMENT ============
@@ -223,7 +283,7 @@ class AdminRepository {
           var rooms = snapshot.docs
               .map((doc) {
                 try {
-                  return RoomModel.fromJson(doc.data());
+                  return RoomModel.fromJson(doc.data(), documentId: doc.id);
                 } catch (_) {
                   return null;
                 }
@@ -330,7 +390,10 @@ class AdminRepository {
                 .get();
             for (final doc in roomSnapshot.docs) {
               try {
-                rooms[doc.id] = RoomModel.fromJson(doc.data());
+                rooms[doc.id] = RoomModel.fromJson(
+                  doc.data(),
+                  documentId: doc.id,
+                );
               } catch (_) {
                 // A room that cannot be read is simply shown without a title.
               }
@@ -513,7 +576,8 @@ class AdminRepository {
     // would not be counted at all.
     final availableRooms = roomsSnap.docs.where((doc) {
       try {
-        return RoomModel.fromJson(doc.data()).status == RoomStatus.available;
+        return RoomModel.fromJson(doc.data(), documentId: doc.id).status ==
+            RoomStatus.available;
       } catch (_) {
         return false;
       }

@@ -1,10 +1,13 @@
-import * as admin from 'firebase-admin';
+import * as firestore from 'firebase-admin/firestore';
+import * as functions from 'firebase-functions/v1';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-const db = admin.firestore();
+import { isValidMonthlyRent } from './roomValidation';
+
+const db = firestore.getFirestore();
 
 /**
  * Platform-wide money settings.
@@ -15,10 +18,55 @@ const db = admin.firestore();
  * student is quoted and the amount that is actually charged can drift apart.
  */
 
+/** The documented fallback when no valid platform fee is configured. */
+export const DEFAULT_PLATFORM_FEE_PERCENTAGE = 30;
+
+/** Whether a value is a usable platform-fee percentage. */
+export function isValidFeePercentage(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= 100
+  );
+}
+
+/** Parses and validates a configured platform-fee percentage. */
+export function parsePlatformFeePercentage(
+  raw: string,
+  fallback = DEFAULT_PLATFORM_FEE_PERCENTAGE,
+): number {
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+
+  const value = Number(trimmed);
+  return isValidFeePercentage(value) ? value : fallback;
+}
+
+/**
+ * Parses the environment fallback once.
+ *
+ * A malformed value must never become `NaN`, a negative fee or a fee above
+ * 100 %. Those values would corrupt payment intents and invoices. Invalid
+ * configuration falls back to the documented default and is logged so the
+ * operator can correct it.
+ */
+function configuredFeePercentage(): number {
+  const raw = (process.env.PLATFORM_FEE_PERCENTAGE || '').trim();
+  if (!raw) return DEFAULT_PLATFORM_FEE_PERCENTAGE;
+
+  const value = Number(raw);
+  if (isValidFeePercentage(value)) return value;
+
+  console.error(
+    `Invalid PLATFORM_FEE_PERCENTAGE=${JSON.stringify(raw)}; ` +
+      `using ${DEFAULT_PLATFORM_FEE_PERCENTAGE} instead.`,
+  );
+  return DEFAULT_PLATFORM_FEE_PERCENTAGE;
+}
+
 /** Percentage of the monthly rent charged as the platform fee. */
-export const PLATFORM_FEE_PERCENTAGE = Number(
-  process.env.PLATFORM_FEE_PERCENTAGE || '30',
-);
+export const PLATFORM_FEE_PERCENTAGE = configuredFeePercentage();
 
 /**
  * The UPI address that receives every payment collected through the app.
@@ -56,6 +104,10 @@ export async function resolveFeePayer(): Promise<FeePayer> {
     if (value === 'student' || value === 'owner') return value;
   } catch (error) {
     console.error('Failed to read the platform fee payer:', error);
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The platform fee settings could not be read. Please try again.',
+    );
   }
   return 'owner';
 }
@@ -76,11 +128,13 @@ export async function resolveFeePercentage(): Promise<number> {
   try {
     const snapshot = await db.collection('settings').doc('platform').get();
     const value = snapshot.get('commissionPercentage');
-    if (typeof value === 'number' && value >= 0 && value <= 100) {
-      return value;
-    }
+    if (isValidFeePercentage(value)) return value;
   } catch (error) {
     console.error('Failed to read the platform fee setting:', error);
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The platform fee settings could not be read. Please try again.',
+    );
   }
   return PLATFORM_FEE_PERCENTAGE;
 }
@@ -103,24 +157,85 @@ export async function resolveFeePercentage(): Promise<number> {
  * A request of an older version of the app has no snapshot, so the current
  * setting is used for those.
  */
-export async function resolveAgreedTerms(
+/**
+ * Resolves the agreed terms from an already-read request and settings value.
+ *
+ * Transactions need a synchronous, snapshot-based version of this logic:
+ * reading the settings document outside the transaction could return terms
+ * that changed before the booking was committed.
+ */
+export function resolveAgreedTermsFromData(
   request: Record<string, any>,
-): Promise<{ percentage: number; payer: FeePayer }> {
-  const snapshotPercentage = Number(request.commissionPercentageAtJoin);
-  const percentage =
-    Number.isFinite(snapshotPercentage) &&
-    snapshotPercentage >= 0 &&
-    snapshotPercentage <= 100
-      ? snapshotPercentage
-      : await resolveFeePercentage();
+  settings: Record<string, any> | undefined,
+): { percentage: number; payer: FeePayer } {
+  const snapshotValue = request.commissionPercentageAtJoin;
+  const snapshotPercentage =
+    typeof snapshotValue === 'number'
+      ? snapshotValue
+      : typeof snapshotValue === 'string' && snapshotValue.trim() !== ''
+        ? Number(snapshotValue)
+        : Number.NaN;
+  const percentage = isValidFeePercentage(snapshotPercentage)
+    ? snapshotPercentage
+    : isValidFeePercentage(settings?.commissionPercentage)
+      ? settings.commissionPercentage
+      : PLATFORM_FEE_PERCENTAGE;
 
   const snapshotPayer = String(request.platformFeePayer || '');
   const payer: FeePayer =
     snapshotPayer === 'student' || snapshotPayer === 'owner'
       ? snapshotPayer
-      : await resolveFeePayer();
+      : settings?.feePayer === 'student' || settings?.feePayer === 'owner'
+        ? settings.feePayer
+        : 'owner';
 
   return { percentage, payer };
+}
+
+/**
+ * Resolves the platform fee percentage and payer for a booking request.
+ *
+ * The settings document is read once so both values come from the same
+ * server-side snapshot.
+ */
+export async function resolveAgreedTerms(
+  request: Record<string, any>,
+): Promise<{ percentage: number; payer: FeePayer }> {
+  const snapshotValue = request.commissionPercentageAtJoin;
+  const snapshotPercentage =
+    typeof snapshotValue === 'number'
+      ? snapshotValue
+      : typeof snapshotValue === 'string' && snapshotValue.trim() !== ''
+        ? Number(snapshotValue)
+        : Number.NaN;
+  const snapshotPayer = String(request.platformFeePayer || '');
+  const hasSnapshotPercentage = isValidFeePercentage(snapshotPercentage);
+  const hasSnapshotPayer =
+    snapshotPayer === 'student' || snapshotPayer === 'owner';
+
+  // A complete agreement snapshot does not depend on the live settings
+  // document. This keeps an existing booking payable during a settings read
+  // outage and preserves the terms that were agreed when it was made.
+  if (hasSnapshotPercentage && hasSnapshotPayer) {
+    return {
+      percentage: snapshotPercentage,
+      payer: snapshotPayer as FeePayer,
+    };
+  }
+
+  try {
+    const snapshot = await db.collection('settings').doc('platform').get();
+    return resolveAgreedTermsFromData(
+      request,
+      snapshot.data() as Record<string, any> | undefined,
+    );
+  } catch (error) {
+    console.error('Failed to read the platform fee settings:', error);
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The platform fee settings could not be read. Please try again.',
+    );
+  }
 }
 
 /**
@@ -131,7 +246,27 @@ export async function resolveAgreedTerms(
  * screen the student sees always agree.
  */
 export function platformFeeFor(monthlyRent: number, percentage: number): number {
-  return Math.round((monthlyRent * percentage) / 100);
+  if (!isValidMonthlyRent(monthlyRent)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The rent for this booking is not valid',
+    );
+  }
+  if (!isValidFeePercentage(percentage)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The platform fee percentage is not valid',
+    );
+  }
+
+  const amount = Math.round((monthlyRent * percentage) / 100);
+  if (percentage > 0 && amount <= 0) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The platform fee percentage does not produce a valid amount',
+    );
+  }
+  return amount;
 }
 
 /**
@@ -147,6 +282,9 @@ export async function areNotificationsEnabled(): Promise<boolean> {
     if (typeof value === 'boolean') return value;
   } catch (error) {
     console.error('Failed to read the notifications setting:', error);
+    // Notification settings fail closed. An operational error must not turn
+    // into an unexpected push to every affected account.
+    return false;
   }
   return true;
 }

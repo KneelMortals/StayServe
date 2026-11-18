@@ -27,11 +27,13 @@ flutter run                       # debug on a connected device
 flutter build apk --release      # build/app/outputs/flutter-apk/app-release.apk
 ```
 
-The Cloud Functions are a separate package:
+The root package contains the Firebase CLI used by the local emulator and
+security-rules suites. The Cloud Functions are a separate package:
 
 ```bash
+npm ci                           # Firebase CLI and rules-test tooling
 cd functions
-npm install
+npm ci
 npm run build                    # tsc — also runs automatically on deploy
 ```
 
@@ -161,18 +163,20 @@ profile; a fresh dry run reports `Already complete: 1, Legacy candidates: 0`).
 
 ```bash
 flutter analyze lib test      # expect: No issues found!
-flutter test                  # the Dart/widget regression suite (258 tests)
-node tools/functions_unit_test.mjs        # backend state-machine checks (34)
-node functions/test/rooms_unit_test.mjs  # room listing + deletion checks (16)
-tools/test_firestore_rules.sh # the rules, against the Firestore emulator (97)
-node tools/production_rules_check.mjs   # the rules, against the deployed project
+flutter test                  # the Dart/widget regression suite (303 tests)
+npm run test:functions        # backend unit/security and room checks
+npm run test:callables        # backend callable state-machine suite (416)
+tools/test_firestore_rules.sh # Firestore rules, against the emulator (170)
+tools/test_storage_rules.sh   # Storage rules, against both emulators (30)
+tools/test_private_location_cli.sh # private-location operator CLI regression
+node tools/production_rules_check.mjs # deployed Firestore rules (46)
+node tools/production_core_flow_smoke.mjs # isolated production core flow (25)
 ```
 
-The functions must be compiled before the Node checks read their helpers:
-
-```bash
-cd functions && npm run build
-```
+`npm test` runs the three backend/rules suites together. The functions are
+compiled automatically before the Node checks read their helpers. The same
+analysis, tests and release builds run in `.github/workflows/ci.yml` for
+pushes and pull requests.
 
 ---
 
@@ -183,7 +187,8 @@ variables, the OTP providers, the deployment commands and the troubleshooting
 notes.
 
 Use this rollout order so existing accounts are not locked out by the stricter
-registration checks:
+registration checks. If Firebase CLI is installed only by the root `npm ci`,
+replace `firebase` with `npx firebase` in the commands below:
 
 ```bash
 firebase login
@@ -197,10 +202,14 @@ firebase deploy --only storage
 flutter build apk --release
 ```
 
-The exact room address is still stored in the public room document. Moving it
-to a participant-only private collection requires the staged data migration
-in [`docs/PRIVATE_LOCATION_MIGRATION.md`](docs/PRIVATE_LOCATION_MIGRATION.md)
-before room-location privacy can be considered fixed.
+The exact room address is stored in the server-owned
+`roomPrivate/{roomId}` collection. Public `rooms/{roomId}` documents retain
+only city/state and the rounded `geoCell`; an accepted student receives the
+exact address through `getRoomVisitDetails`. The staged production rollout
+for this project is complete and the durable finalization latch prevents the
+legacy exact-public-write window from reopening. The full procedure and
+recovery rules remain in
+[`docs/PRIVATE_LOCATION_MIGRATION.md`](docs/PRIVATE_LOCATION_MIGRATION.md).
 
 > **Rotate the mailbox token.** A live bearer token for the OTP mailbox was
 > committed to the repository in `.mail_inbox.json`. The file has been deleted

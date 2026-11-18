@@ -1,7 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -47,11 +47,11 @@ class _FakeFunctionsService extends FunctionsService {
 /// Records the booking request instead of sending it to the server.
 class _FakeJoinRequestRepository extends StudentJoinRequestRepository {
   _FakeJoinRequestRepository()
-      : super(
-          firestore: _FakeFirestore(),
-          auth: MockFirebaseAuth(),
-          functions: _FakeFunctionsService(),
-        );
+    : super(
+        firestore: _FakeFirestore(),
+        auth: MockFirebaseAuth(),
+        functions: _FakeFunctionsService(),
+      );
 
   String? requestedRoomId;
   bool called = false;
@@ -104,7 +104,7 @@ class _FakeLocationNotifier extends UserLocationNotifier {
 /// out the requests of the student.
 class _FakeStudentRepository extends StudentRepository {
   _FakeStudentRepository()
-      : super(firestore: _FakeFirestore(), auth: MockFirebaseAuth());
+    : super(firestore: _FakeFirestore(), auth: MockFirebaseAuth());
 
   /// The requests the student has. The list is read **every time** the
   /// provider is invalidated, so a cancelled request really disappears.
@@ -128,14 +128,7 @@ RoomModel _room() {
     description: 'A room for the test',
     monthlyRent: 12000,
     securityDeposit: 30000,
-    location: const Location(
-      address: 'MG Road',
-      city: 'Bengaluru',
-      state: 'Karnataka',
-      pincode: '560001',
-      latitude: 12.9716,
-      longitude: 77.5946,
-    ),
+    location: const Location(city: 'Bengaluru', state: 'Karnataka'),
     roomType: RoomType.single,
     furnishing: FurnishingType.semi,
     availableFrom: now,
@@ -180,7 +173,8 @@ Future<void> _pumpRoom(
   required MockUser user,
   GoRouter? router,
 }) async {
-  final goRouter = router ??
+  final goRouter =
+      router ??
       GoRouter(
         initialLocation: '/room/room-1',
         routes: [
@@ -201,6 +195,7 @@ Future<void> _pumpRoom(
     ProviderScope(
       overrides: [
         currentUserProvider.overrideWithValue(user),
+        currentUserRoleProvider.overrideWithValue(UserRole.student),
         authStateProvider.overrideWith((ref) => Stream.value(user)),
         roomProvider.overrideWith((ref, roomId) => Stream.value(_room())),
         userLocationProvider.overrideWith(_FakeLocationNotifier.new),
@@ -219,92 +214,76 @@ Future<void> _pumpRoom(
 }
 
 void main() {
-  testWidgets(
-    'booking a room sends the request and turns the button into '
-    '"Cancel booking"',
-    (tester) async {
-      final joinRequests = _FakeJoinRequestRepository();
-      final studentRepository = _FakeStudentRepository();
-      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+  testWidgets('booking a room sends the request and turns the button into '
+      '"Cancel booking"', (tester) async {
+    final joinRequests = _FakeJoinRequestRepository();
+    final studentRepository = _FakeStudentRepository();
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
 
-      await _pumpRoom(
-        tester,
-        joinRequests: joinRequests,
-        studentRepository: studentRepository,
-        user: user,
-      );
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
 
-      // The room is on the screen and the booking button is reachable.
-      expect(find.text('Test room'), findsWidgets);
-      final requestButton = find.widgetWithText(
-        AppButton,
-        'Request to Book',
-      );
-      expect(requestButton, findsOneWidget);
+    // The room is on the screen and the booking button is reachable.
+    expect(find.text('Test room'), findsWidgets);
+    final requestButton = find.widgetWithText(AppButton, 'Request to Book');
+    expect(requestButton, findsOneWidget);
 
-      await tester.ensureVisible(requestButton);
-      await tester.pumpAndSettle();
-      await tester.tap(requestButton);
-      await tester.pumpAndSettle();
+    await tester.ensureVisible(requestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(requestButton);
+    await tester.pumpAndSettle();
 
-      // The dialog explains the terms and offers the platform UPI.
-      expect(find.text('Request to book'), findsOneWidget);
-      expect(find.textContaining('shauryaprataprai461-2@oksbi'), findsOneWidget);
+    // The dialog explains the terms and offers the platform UPI.
+    expect(find.text('Request to book'), findsOneWidget);
+    expect(find.textContaining('shauryaprataprai461-2@oksbi'), findsOneWidget);
 
-      await tester.tap(find.widgetWithText(FilledButton, 'Send Request'));
-      await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Send Request'));
+    await tester.pumpAndSettle();
 
-      // The request really went out ...
-      expect(joinRequests.called, isTrue);
-      expect(joinRequests.requestedRoomId, 'room-1');
+    // The request really went out ...
+    expect(joinRequests.called, isTrue);
+    expect(joinRequests.requestedRoomId, 'room-1');
 
-      // ... and the button of the room says "Cancel booking" now.
-      //
-      // Before the fix it still said "Request to Book" — and a second tap
-      // produced the strange error "You have already requested to join this
-      // room" from the server.
-      expect(
-        find.widgetWithText(AppButton, 'Request to Book'),
-        findsNothing,
-      );
-      expect(
-        find.widgetWithText(AppButton, 'Cancel booking'),
-        findsOneWidget,
-      );
-    },
-  );
+    // ... and the button of the room says "Cancel booking" now.
+    //
+    // Before the fix it still said "Request to Book" — and a second tap
+    // produced the strange error "You have already requested to join this
+    // room" from the server.
+    expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
+    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsOneWidget);
+  });
 
-  testWidgets(
-    'cancelling the booking dialog does not send a request',
-    (tester) async {
-      final joinRequests = _FakeJoinRequestRepository();
-      final studentRepository = _FakeStudentRepository();
-      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+  testWidgets('cancelling the booking dialog does not send a request', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository();
+    final studentRepository = _FakeStudentRepository();
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
 
-      await _pumpRoom(
-        tester,
-        joinRequests: joinRequests,
-        studentRepository: studentRepository,
-        user: user,
-      );
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
 
-      final requestButton = find.widgetWithText(AppButton, 'Request to Book');
-      await tester.ensureVisible(requestButton);
-      await tester.pumpAndSettle();
-      await tester.tap(requestButton);
-      await tester.pumpAndSettle();
+    final requestButton = find.widgetWithText(AppButton, 'Request to Book');
+    await tester.ensureVisible(requestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(requestButton);
+    await tester.pumpAndSettle();
 
-      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
-      await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+    await tester.pumpAndSettle();
 
-      expect(joinRequests.called, isFalse);
-      expect(find.text('Student Requests'), findsNothing);
-      expect(
-        find.widgetWithText(AppButton, 'Request to Book'),
-        findsOneWidget,
-      );
-    },
-  );
+    expect(joinRequests.called, isFalse);
+    expect(find.text('Student Requests'), findsNothing);
+    expect(find.widgetWithText(AppButton, 'Request to Book'), findsOneWidget);
+  });
 
   testWidgets(
     'a request that already exists turns the button into "Cancel booking"',
@@ -323,42 +302,29 @@ void main() {
 
       // The student has already asked for this room — the button must not
       // offer a second request.
-      expect(
-        find.widgetWithText(AppButton, 'Request to Book'),
-        findsNothing,
-      );
-      expect(
-        find.widgetWithText(AppButton, 'Cancel booking'),
-        findsOneWidget,
-      );
+      expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
+      expect(find.widgetWithText(AppButton, 'Cancel booking'), findsOneWidget);
     },
   );
 
-  testWidgets(
-    'a cancelled request lets the student ask for the room again',
-    (tester) async {
-      final joinRequests = _FakeJoinRequestRepository();
-      final studentRepository = _FakeStudentRepository()
-        ..requests = [_request(status: JoinRequestStatus.cancelled)];
-      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+  testWidgets('a cancelled request lets the student ask for the room again', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository();
+    final studentRepository = _FakeStudentRepository()
+      ..requests = [_request(status: JoinRequestStatus.cancelled)];
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
 
-      await _pumpRoom(
-        tester,
-        joinRequests: joinRequests,
-        studentRepository: studentRepository,
-        user: user,
-      );
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
 
-      expect(
-        find.widgetWithText(AppButton, 'Request to Book'),
-        findsOneWidget,
-      );
-      expect(
-        find.widgetWithText(AppButton, 'Cancel booking'),
-        findsNothing,
-      );
-    },
-  );
+    expect(find.widgetWithText(AppButton, 'Request to Book'), findsOneWidget);
+    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsNothing);
+  });
 
   testWidgets(
     'cancelling the booking asks the server and turns the button back',
@@ -396,70 +362,62 @@ void main() {
     },
   );
 
-  testWidgets(
-    'a booking that already has money in it cannot be cancelled',
-    (tester) async {
-      final joinRequests = _FakeJoinRequestRepository();
-      final studentRepository = _FakeStudentRepository()
-        ..requests = [_request(advancePaid: true)];
-      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+  testWidgets('a booking that already has money in it cannot be cancelled', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository();
+    final studentRepository = _FakeStudentRepository()
+      ..requests = [_request(advancePaid: true)];
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
 
-      await _pumpRoom(
-        tester,
-        joinRequests: joinRequests,
-        studentRepository: studentRepository,
-        user: user,
-      );
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
 
-      final cancelButton = find.widgetWithText(AppButton, 'Cancel booking');
-      expect(cancelButton, findsOneWidget);
+    final cancelButton = find.widgetWithText(AppButton, 'Cancel booking');
+    expect(cancelButton, findsOneWidget);
 
-      await tester.ensureVisible(cancelButton);
-      await tester.pumpAndSettle();
-      await tester.tap(cancelButton);
-      await tester.pumpAndSettle();
+    await tester.ensureVisible(cancelButton);
+    await tester.pumpAndSettle();
+    await tester.tap(cancelButton);
+    await tester.pumpAndSettle();
 
-      // The button is locked — the server would refuse it anyway.
-      expect(find.text('Cancel booking?'), findsNothing);
-      expect(joinRequests.cancelledRequestId, isNull);
-      expect(
-        find.textContaining('cannot be cancelled any more'),
-        findsOneWidget,
-      );
-    },
-  );
+    // The button is locked — the server would refuse it anyway.
+    expect(find.text('Cancel booking?'), findsNothing);
+    expect(joinRequests.cancelledRequestId, isNull);
+    expect(find.textContaining('cannot be cancelled any more'), findsOneWidget);
+  });
 
-  testWidgets(
-    'a second request does not produce the error of the server',
-    (tester) async {
-      final joinRequests = _FakeJoinRequestRepository()
-        ..createError = 'You have already requested to join this room';
-      final studentRepository = _FakeStudentRepository();
-      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+  testWidgets('a second request does not produce the error of the server', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository()
+      ..createError = 'You have already requested to join this room';
+    final studentRepository = _FakeStudentRepository();
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
 
-      await _pumpRoom(
-        tester,
-        joinRequests: joinRequests,
-        studentRepository: studentRepository,
-        user: user,
-      );
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
 
-      final requestButton = find.widgetWithText(AppButton, 'Request to Book');
-      await tester.ensureVisible(requestButton);
-      await tester.pumpAndSettle();
-      await tester.tap(requestButton);
-      await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(FilledButton, 'Send Request'));
-      await tester.pumpAndSettle();
+    final requestButton = find.widgetWithText(AppButton, 'Request to Book');
+    await tester.ensureVisible(requestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(requestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Send Request'));
+    await tester.pumpAndSettle();
 
-      // The raw error of the server is **not** shown ...
-      expect(find.textContaining('Request failed'), findsNothing);
+    // The raw error of the server is **not** shown ...
+    expect(find.textContaining('Request failed'), findsNothing);
 
-      // ... the student gets an explanation ...
-      expect(
-        find.textContaining('already requested this room'),
-        findsOneWidget,
-      );
-    },
-  );
+    // ... the student gets an explanation ...
+    expect(find.textContaining('already requested this room'), findsOneWidget);
+  });
 }

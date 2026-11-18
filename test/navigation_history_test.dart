@@ -33,17 +33,19 @@ void main() {
       expect(history.locations, ['/student/home', '/student/search']);
     });
 
-    test('going back returns the previous page and forgets the current one',
-        () {
-      final history = NavigationHistory()
-        ..record('/student/home')
-        ..record('/student/search');
+    test(
+      'going back returns the previous page and forgets the current one',
+      () {
+        final history = NavigationHistory()
+          ..record('/student/home')
+          ..record('/student/search');
 
-      expect(history.back(), '/student/home');
-      expect(history.locations, ['/student/home']);
-      expect(history.canGoBack, isFalse);
-      expect(history.back(), isNull);
-    });
+        expect(history.back(), '/student/home');
+        expect(history.locations, ['/student/home']);
+        expect(history.canGoBack, isFalse);
+        expect(history.back(), isNull);
+      },
+    );
 
     test('does not grow without bound', () {
       final history = NavigationHistory();

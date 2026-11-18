@@ -106,14 +106,49 @@ service cloud.firestore {
         );
     }
 
+    // The same legacy exception as [legacyProfileIsEligible], but with the
+    // already-read profile passed in. Reading the profile once keeps the
+    // room-update rule below below Firestore's expression-evaluation limit.
+    function legacyProfileIsEligibleWithProfile(profile) {
+      return exists(/databases/$(database)/documents/system/registration) &&
+        get(/databases/$(database)/documents/system/registration)
+          .data.get('legacyMode', false) == true &&
+        get(/databases/$(database)/documents/system/registration)
+          .data.get('legacyCutoff', null) != null &&
+        profile.get('registrationCompleted', null) == null &&
+        profile.get('createdAt', null) != null &&
+        profile.get('createdAt', null) <
+        get(/databases/$(database)/documents/system/registration)
+          .data.get('legacyCutoff', null);
+    }
+
+    function isLiveOwnerProfile(profile) {
+      return profile.get('role', '') == 'owner' &&
+        (
+          (
+            profile.get('registrationCompleted', false) == true &&
+            profile.get('isActive', false) == true
+          ) ||
+          (
+            legacyProfileIsEligibleWithProfile(profile) &&
+            (
+              profile.get('isActive', true) == true ||
+              profile.get('isActive', null) == null
+            )
+          )
+        );
+    }
+
     // The live role is read from the profile, not from a stale token.  The
     // token's admin claim is still required below because it is used by
     // the client to decide when to refresh its session; however, the
     // claim alone can never grant access.
     function isLiveOwner() {
-      return isLiveRegisteredAccount() &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid))
-          .data.get('role', '') == 'owner';
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        isLiveOwnerProfile(
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data
+        );
     }
 
     // Administrative access requires all of the following:
@@ -133,16 +168,23 @@ service cloud.firestore {
           .data.get('isActive', false) == true;
     }
 
-    // Identity-only helpers.  Callers which protect a collection combine
-    // these with isLiveRegisteredAccount() so that a signed-in but
-    // unregistered account cannot use a relationship to bypass the
-    // account-state check.
+    // Relationship helpers.  They combine the document's party id with the
+    // caller's **live** role.  Identity alone is not enough: a demoted owner
+    // must not keep reading owner-side booking data with an old token, and a
+    // user who is no longer a student must not keep reading tenant-side
+    // booking and payment data.
     function isOwner(ownerId) {
-      return request.auth != null && request.auth.uid == ownerId;
+      return request.auth != null &&
+        request.auth.uid == ownerId &&
+        isLiveOwner();
     }
 
     function isStudent(studentId) {
-      return request.auth != null && request.auth.uid == studentId;
+      return request.auth != null &&
+        request.auth.uid == studentId &&
+        isLiveRegisteredAccount() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid))
+          .data.get('role', '') == 'student';
     }
 
     // ======================================================================
@@ -150,7 +192,8 @@ service cloud.firestore {
     // ======================================================================
 
     // Fields which a user may change on their own profile.  `role`,
-    // `isActive` and `registrationCompleted` are deliberately absent.
+    // `roleClaimed`, `isActive` and `registrationCompleted` are deliberately
+    // absent.
     function changesOnlyAllowedSelfFields() {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
         'name',
@@ -173,6 +216,7 @@ service cloud.firestore {
     function profileBootstrapIsAllowed() {
       return request.resource.data.get('uid', request.auth.uid) == request.auth.uid &&
         request.resource.data.get('role', 'student') in ['student', 'owner'] &&
+        request.resource.data.get('roleClaimed', false) == false &&
         request.resource.data.get('isActive', true) == true &&
         request.resource.data.get('registrationCompleted', false) == false &&
         (
@@ -199,6 +243,164 @@ service cloud.firestore {
     // occupancy counter are not in this list.  The two server-owned state
     // fields are additionally compared below, so even a future list edit
     // cannot make them client-writable.
+    // The photo list is a list of strings with at most the same number of
+    // entries as the app allows. The explicit index checks are needed because
+    // Firestore Rules cannot iterate over a list to inspect every element.
+    // Every URL must also be an HTTPS Firebase Storage URL. This prevents a
+    // modified client from turning the room card into a tracker for an
+    // arbitrary third-party host. A legacy list which the owner does not
+    // change is allowed to remain as it is; every newly written list must
+    // have the valid shape.
+    function isRoomImageUrl(value) {
+      return value is string &&
+        value.size() > 0 &&
+        value.size() <= 2048 &&
+        value.matches(
+          'https://(firebasestorage\\.googleapis\\.com|storage\\.googleapis\\.com)/.*'
+        );
+    }
+
+    function roomImagesAreValid() {
+      let images = request.resource.data.get('images', []);
+      return images is list &&
+        images.size() <= 10 &&
+        (images.size() < 1 || isRoomImageUrl(images[0])) &&
+        (images.size() < 2 || isRoomImageUrl(images[1])) &&
+        (images.size() < 3 || isRoomImageUrl(images[2])) &&
+        (images.size() < 4 || isRoomImageUrl(images[3])) &&
+        (images.size() < 5 || isRoomImageUrl(images[4])) &&
+        (images.size() < 6 || isRoomImageUrl(images[5])) &&
+        (images.size() < 7 || isRoomImageUrl(images[6])) &&
+        (images.size() < 8 || isRoomImageUrl(images[7])) &&
+        (images.size() < 9 || isRoomImageUrl(images[8])) &&
+        (images.size() < 10 || isRoomImageUrl(images[9]));
+    }
+
+    // ----------------------------------------------------------------------
+    // Public/private room-location policy
+    // ----------------------------------------------------------------------
+    //
+    // Firestore rules work at document granularity: they cannot hide one
+    // field while returning the rest of the same document. The exact address
+    // therefore lives in `roomPrivate/{roomId}` and the public room document
+    // contains only coarse locality data in the final stage.
+    //
+    // Older app versions still write the exact location into the public
+    // document. During the compatibility window the server-owned switch
+    // `system/locationPrivacy.allowClientExactLocationWrites` may be true.
+    // The client cannot read or change that switch. Before the final rules
+    // are deployed it must be set to false, after every public exact field
+    // has been removed by the migration.
+    function locationPrivacyConfigExists() {
+      return exists(/databases/$(database)/documents/system/locationPrivacy);
+    }
+
+    function clientExactLocationWritesAllowed() {
+      return locationPrivacyConfigExists() &&
+        get(/databases/$(database)/documents/system/locationPrivacy)
+          .data.get('allowClientExactLocationWrites', false) == true &&
+        get(/databases/$(database)/documents/system/locationPrivacy)
+          .data.get('finalized', false) != true;
+    }
+
+    function exactPublicLocationFieldsArePresent(data) {
+      let location = data.get('location', {});
+      return data.keys().hasAny([
+        'address',
+        'pincode',
+        'latitude',
+        'longitude'
+      ]) ||
+        (
+          location is map &&
+          location.keys().hasAny([
+            'address',
+            'pincode',
+            'latitude',
+            'longitude'
+          ])
+        );
+    }
+
+    function publicRoomCreateLocationIsAllowed(data) {
+      let location = data.get('location', {});
+      let coarseLocationIsValid = location is map &&
+        (
+          location.keys().hasOnly(['city', 'state']) &&
+          location.get('city', '') is string &&
+          location.get('state', '') is string
+        );
+      let hasExactFields = exactPublicLocationFieldsArePresent(data);
+
+      return (!hasExactFields && coarseLocationIsValid) ||
+        (hasExactFields && clientExactLocationWritesAllowed());
+    }
+
+    function publicLocationUpdateIsAllowed() {
+      let changedKeys = request.resource.data
+        .diff(resource.data)
+        .affectedKeys();
+
+      // Existing legacy documents may still contain exact fields while the
+      // data migration runs. Only a write which changes one of those fields
+      // needs the transitional server-owned switch.
+      return !changedKeys.hasAny([
+        'location',
+        'address',
+        'pincode',
+        'latitude',
+        'longitude'
+      ]) || clientExactLocationWritesAllowed();
+    }
+
+    function roomCreateCannotForgeServerLocationFields() {
+      return !request.resource.data.keys().hasAny([
+        'geoCell',
+        'locationRevision',
+        'locationUpdatedAt',
+        'locationPrivacyVersion'
+      ]);
+    }
+
+    function roomCreateCannotForgeListingGeneration() {
+      // The generation identifies one immutable lifetime of a room id. It is
+      // assigned by the server and may never be chosen by a client.
+      return !request.resource.data.keys().hasAny(['listingGeneration']);
+    }
+
+    function roomIdHasNoDeletionTombstone(roomId) {
+      // A deleted room id stays reserved until its old photos and reviews
+      // have really been removed. Reusing the id earlier would make the old
+      // prefix cleanup delete the new listing's files.
+      return !exists(/databases/$(database)/documents/roomDeletionTombstones/$(roomId));
+    }
+
+    function roomCreateCannotForgeCleanupLock() {
+      // The cleanup lock is written by the server while it removes orphaned
+      // Storage objects. A client-created lock could otherwise freeze the
+      // owner's room edits until its forged expiry time.
+      return !request.resource.data.keys().hasAny(['photoCleanupLock']);
+    }
+
+    function roomMonthlyRentIsValid(data) {
+      let rent = data.get('monthlyRent', null);
+      return rent is number &&
+        rent >= 1000 &&
+        rent <= 1000000;
+    }
+
+    function roomCapacityIsValid(data) {
+      let capacity = data.get('occupancy', null);
+      let current = data.get('currentOccupancy', 0);
+      return capacity is int &&
+        capacity >= 1 &&
+        capacity <= 20 &&
+        current is int &&
+        current >= 0 &&
+        current <= 20 &&
+        current <= capacity;
+    }
+
     function changesOnlyAllowedRoomFields() {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
         'title',
@@ -221,21 +423,38 @@ service cloud.firestore {
       ]);
     }
 
+    function roomPhotoCleanupIsLocked() {
+      let lock = resource.data.get('photoCleanupLock', null);
+      return lock is map &&
+        lock.get('expiresAt', request.time) > request.time;
+    }
+
     function ownerMayUpdateRoom() {
-      return isLiveOwner() &&
-        isOwner(resource.data.get('ownerId', '')) &&
+      // `isOwner` already checks the live owner role and the owner id, so
+      // repeating `isLiveOwner()` here would only expand the rules
+      // expression beyond Firestore's evaluation limit.
+      return isOwner(resource.data.get('ownerId', '')) &&
+        !roomPhotoCleanupIsLocked() &&
+        resource.data.get('deletionInProgress', false) != true &&
         changesOnlyAllowedRoomFields() &&
+        publicLocationUpdateIsAllowed() &&
+        (
+          request.resource.data.get('images', null) ==
+            resource.data.get('images', null) ||
+          roomImagesAreValid()
+        ) &&
         request.resource.data.get('ownerId', '') ==
           resource.data.get('ownerId', '') &&
         request.resource.data.get('createdAt', null) ==
           resource.data.get('createdAt', null) &&
+        request.resource.data.get('listingGeneration', null) ==
+          resource.data.get('listingGeneration', null) &&
         request.resource.data.get('currentOccupancy', 0) ==
           resource.data.get('currentOccupancy', 0) &&
         request.resource.data.get('status', null) ==
           resource.data.get('status', null) &&
-        request.resource.data.get('occupancy', 0) > 0 &&
-        request.resource.data.get('occupancy', 0) >=
-          resource.data.get('currentOccupancy', 0) &&
+        roomMonthlyRentIsValid(request.resource.data) &&
+        roomCapacityIsValid(request.resource.data) &&
         request.resource.data.get('roomId', '') ==
           resource.data.get('roomId', '');
     }
@@ -292,8 +511,15 @@ service cloud.firestore {
       // occupied or pretend that it already has tenants, and it may never
       // change either field afterwards (see `ownerMayUpdateRoom`).
       allow create: if isLiveOwner() &&
+        roomIdHasNoDeletionTombstone(roomId) &&
+        roomImagesAreValid() &&
+        publicRoomCreateLocationIsAllowed(request.resource.data) &&
+        roomCreateCannotForgeServerLocationFields() &&
+        roomCreateCannotForgeListingGeneration() &&
+        roomCreateCannotForgeCleanupLock() &&
         request.resource.data.get('ownerId', '') == request.auth.uid &&
-        request.resource.data.get('occupancy', 0) > 0 &&
+        roomMonthlyRentIsValid(request.resource.data) &&
+        roomCapacityIsValid(request.resource.data) &&
         request.resource.data.get('status', 'available') == 'available' &&
         request.resource.data.get('currentOccupancy', 0) == 0 &&
         request.resource.data.get('roomId', roomId) == roomId;
@@ -306,6 +532,52 @@ service cloud.firestore {
       // deleteRoomListing callable verifies live owner/admin authority,
       // cancels open requests and removes the room with the Admin SDK.
       allow delete: if false;
+    }
+
+    // A room id stays reserved until the durable cleanup of its deleted
+    // listing has completed. Only the server may write these tombstones.
+    match /roomDeletionTombstones/{roomId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    function liveOwnerOfRoom(roomId) {
+      return request.auth != null &&
+        isLiveOwner() &&
+        get(/databases/$(database)/documents/rooms/$(roomId))
+          .data.get('ownerId', '') == request.auth.uid;
+    }
+
+    // ======================================================================
+    // Private room locations
+    // ======================================================================
+    //
+    // The exact street address and coordinates are stored here, in a
+    // document which the ordinary public room query never returns.
+    //
+    // * the listing owner may read their own exact location;
+    // * a live administrator may read it for support/migration work; and
+    // * an accepted student receives it through `getRoomVisitDetails`, not
+    //   through a direct collection read.
+    //
+    // Clients cannot write this collection. The owner-only callable uses the
+    // Admin SDK and verifies the live room owner inside a transaction.
+    match /roomPrivate/{roomId} {
+      // A missing private document is a normal state during the staged
+      // migration. The owner of the corresponding room must be able to read
+      // that path so the client can fall back to the legacy location. The
+      // listing's live owner id is canonical: a corrupt private ownerId must
+      // not grant a different account access to the exact address.
+      allow get: if isLiveRegisteredAccount() &&
+        (
+          isAdmin() ||
+          liveOwnerOfRoom(roomId)
+        );
+      // The owner-facing client reads one deterministic document at a time.
+      // Collection listing is reserved for administrators so a corrupt
+      // private owner id cannot expose another listing's exact address.
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     // ======================================================================
@@ -467,13 +739,11 @@ service cloud.firestore {
         );
       allow list: if isLiveRegisteredAccount() &&
         request.auth.uid in resource.data.get('participantIds', []);
-      // The caller must be one of exactly two distinct participants.  A
-      // client may not create a group conversation or add a third party.
-      allow create: if isLiveRegisteredAccount() &&
-        isTwoPartyParticipantList(
-          request.resource.data.get('participantIds', [])
-        ) &&
-        request.auth.uid in request.resource.data.get('participantIds', []);
+      // Conversation creation is server-owned. The `openConversation`
+      // callable verifies that the caller is a live student and that the
+      // other participant really is the owner of the supplied room. A client
+      // may therefore not create a conversation with an arbitrary uid.
+      allow create: if false;
 
       // The participant list, the conversation id and the creation time are
       // immutable: a participant may not add a third party to the
@@ -481,6 +751,7 @@ service cloud.firestore {
       // fields the Flutter client maintains (last message, unread counts,
       // timestamps and the optional room link) may change.
       allow update: if isLiveRegisteredAccount() &&
+        resource.data.get('deletionInProgress', false) != true &&
         request.auth.uid in resource.data.get('participantIds', []) &&
         resource.data.get('participantIds', []) ==
           request.resource.data.get('participantIds', []) &&
@@ -511,6 +782,8 @@ service cloud.firestore {
       // may be introduced.
       allow create: if isLiveRegisteredAccount() &&
         exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+        get(/databases/$(database)/documents/conversations/$(conversationId))
+          .data.get('deletionInProgress', false) != true &&
         request.resource.data.keys().hasOnly([
           'conversationId',
           'senderId',
@@ -535,6 +808,17 @@ service cloud.firestore {
         request.resource.data.get('receiverId', '') in
           get(/databases/$(database)/documents/conversations/$(conversationId))
             .data.get('participantIds', []);
+    }
+
+    // ======================================================================
+    // Durable account-deletion jobs
+    // ======================================================================
+    //
+    // These jobs contain the uid while they are pending and are written only
+    // by trusted server code. A client must not be able to enqueue, inspect
+    // or cancel a deletion job.
+    match /accountDeletionJobs/{jobId} {
+      allow read, write: if false;
     }
 
     // ======================================================================

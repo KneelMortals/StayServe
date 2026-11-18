@@ -1,10 +1,10 @@
-import * as admin from 'firebase-admin';
+import * as firestore from 'firebase-admin/firestore';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-const db = admin.firestore();
+const db = firestore.getFirestore();
 
 /**
  * Batched writes for the maintenance jobs.
@@ -36,7 +36,63 @@ export const BATCH_SIZE = 400;
  * The helpers add the cursor and the limit themselves — the query that is
  * returned here must only carry the filters and the order.
  */
-type QueryBuilder = () => admin.firestore.Query;
+type QueryBuilder = () => firestore.Query;
+
+/**
+ * An authorization guard for one privileged batch.
+ *
+ * The guard document is read in the same Firestore transaction as the batch
+ * writes. A demoted or banned administrator therefore cannot pass a
+ * preflight check and still commit a batch: if the guard profile changes
+ * while the transaction is open, Firestore aborts and retries it.
+ */
+export interface BatchWriteGuard {
+  /** The profile document which proves that the caller may write. */
+  ref: firestore.DocumentReference;
+  /** Throws when the live profile is no longer authorized. */
+  assertAuthorized(snapshot: firestore.DocumentSnapshot): void;
+}
+
+/** Commits one guarded deletion batch. */
+async function commitGuardedDeletes(
+  refs: firestore.DocumentReference[],
+  guard?: BatchWriteGuard,
+): Promise<void> {
+  if (!guard) {
+    const batch = db.batch();
+    for (const ref of refs) batch.delete(ref);
+    await batch.commit();
+    return;
+  }
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(guard.ref);
+    guard.assertAuthorized(snapshot);
+    for (const ref of refs) transaction.delete(ref);
+  });
+}
+
+/** Commits one guarded update batch. */
+async function commitGuardedUpdates(
+  docs: firestore.QueryDocumentSnapshot[],
+  update: (
+    doc: firestore.QueryDocumentSnapshot,
+  ) => firestore.UpdateData<firestore.DocumentData>,
+  guard?: BatchWriteGuard,
+): Promise<void> {
+  if (!guard) {
+    const batch = db.batch();
+    for (const doc of docs) batch.update(doc.ref, update(doc));
+    await batch.commit();
+    return;
+  }
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(guard.ref);
+    guard.assertAuthorized(snapshot);
+    for (const doc of docs) transaction.update(doc.ref, update(doc));
+  });
+}
 
 /**
  * Deletes the documents of a query — page by page.
@@ -49,10 +105,13 @@ type QueryBuilder = () => admin.firestore.Query;
  */
 export async function deleteWhere(
   buildQuery: QueryBuilder,
-  shouldDelete?: (doc: admin.firestore.QueryDocumentSnapshot) => boolean,
+  shouldDelete?: (doc: firestore.QueryDocumentSnapshot) => boolean,
+  guard?: BatchWriteGuard,
 ): Promise<number> {
-  return deleteWhereAsync(buildQuery, async (doc) =>
-    shouldDelete ? shouldDelete(doc) : true,
+  return deleteWhereAsync(
+    buildQuery,
+    async (doc) => (shouldDelete ? shouldDelete(doc) : true),
+    guard,
   );
 }
 
@@ -80,11 +139,12 @@ const DECISION_CONCURRENCY = 25;
 export async function deleteWhereAsync(
   buildQuery: QueryBuilder,
   shouldDelete: (
-    doc: admin.firestore.QueryDocumentSnapshot,
+    doc: firestore.QueryDocumentSnapshot,
   ) => Promise<boolean>,
+  guard?: BatchWriteGuard,
 ): Promise<number> {
   let deleted = 0;
-  let cursor: admin.firestore.QueryDocumentSnapshot | undefined;
+  let cursor: firestore.QueryDocumentSnapshot | undefined;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -94,7 +154,7 @@ export async function deleteWhereAsync(
       .get();
     if (snapshot.empty) break;
 
-    const decisions: { ref: admin.firestore.DocumentReference; delete: boolean }[] =
+    const decisions: { ref: firestore.DocumentReference; delete: boolean }[] =
       [];
 
     for (
@@ -117,11 +177,10 @@ export async function deleteWhereAsync(
       .map((decision) => decision.ref);
 
     for (let index = 0; index < refs.length; index += BATCH_SIZE) {
-      const batch = db.batch();
-      for (const ref of refs.slice(index, index + BATCH_SIZE)) {
-        batch.delete(ref);
-      }
-      await batch.commit();
+      await commitGuardedDeletes(
+        refs.slice(index, index + BATCH_SIZE),
+        guard,
+      );
     }
     deleted += refs.length;
 
@@ -143,11 +202,12 @@ export async function deleteWhereAsync(
 export async function updateWhere(
   buildQuery: QueryBuilder,
   update: (
-    doc: admin.firestore.QueryDocumentSnapshot,
-  ) => admin.firestore.UpdateData<admin.firestore.DocumentData>,
+    doc: firestore.QueryDocumentSnapshot,
+  ) => firestore.UpdateData<firestore.DocumentData>,
+  guard?: BatchWriteGuard,
 ): Promise<number> {
   let updated = 0;
-  let cursor: admin.firestore.QueryDocumentSnapshot | undefined;
+  let cursor: firestore.QueryDocumentSnapshot | undefined;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -158,11 +218,11 @@ export async function updateWhere(
     if (snapshot.empty) break;
 
     for (let index = 0; index < snapshot.docs.length; index += BATCH_SIZE) {
-      const batch = db.batch();
-      for (const doc of snapshot.docs.slice(index, index + BATCH_SIZE)) {
-        batch.update(doc.ref, update(doc));
-      }
-      await batch.commit();
+      await commitGuardedUpdates(
+        snapshot.docs.slice(index, index + BATCH_SIZE),
+        update,
+        guard,
+      );
     }
     updated += snapshot.size;
 

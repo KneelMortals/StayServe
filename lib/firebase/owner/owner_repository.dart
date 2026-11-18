@@ -4,13 +4,18 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../../core/constants/app_constants.dart';
 import '../../../core/constants/enums.dart';
 import '../../../core/utils/app_logger.dart';
+import '../../../core/utils/safe_document_parser.dart';
 import '../../../models/join_request_model.dart';
+import '../../../models/owned_room_model.dart';
 import '../../../models/room_model.dart';
+import '../../../models/room_private_location.dart';
 import '../auth/auth_service.dart';
 import '../functions/functions_service.dart';
 import '../storage/storage_service.dart';
+import 'room_image_reconciliation.dart';
 
 final ownerRepositoryProvider = Provider<OwnerRepository>((ref) {
   return OwnerRepository(
@@ -20,6 +25,34 @@ final ownerRepositoryProvider = Provider<OwnerRepository>((ref) {
     storage: ref.watch(storageServiceProvider),
   );
 });
+
+/// The files uploaded for one room edit.
+///
+/// The object paths are tracked in addition to the download URLs because an
+/// upload can succeed while fetching its download URL fails. In that case
+/// there is no URL to delete, but the object path is still known.
+class _RoomImageUpload {
+  final List<String> newlyUploadedUrls;
+  final List<String> newlyUploadedPaths;
+
+  const _RoomImageUpload({
+    required this.newlyUploadedUrls,
+    required this.newlyUploadedPaths,
+  });
+}
+
+/// Reads a room-photo list without trusting its Firestore shape.
+List<String> _safeImageUrls(dynamic value) {
+  if (value is! List) return const <String>[];
+  final urls = <String>[];
+  for (final item in value) {
+    if (item is! String) continue;
+    final url = item.trim();
+    if (url.isEmpty || urls.contains(url)) continue;
+    urls.add(url);
+  }
+  return urls;
+}
 
 /// Data access for the room owner side of the app.
 class OwnerRepository {
@@ -40,7 +73,11 @@ class OwnerRepository {
   String? get _uid => _auth.currentUser?.uid;
 
   /// Rooms listed by the current owner.
-  Stream<List<RoomModel>> watchMyRooms() {
+  ///
+  /// The public listing contains only coarse location data after the privacy
+  /// migration. The owner view joins the server-owned private location back
+  /// in so the edit form can still show and change the exact address.
+  Stream<List<OwnedRoomModel>> watchMyRooms() {
     final uid = _uid;
     if (uid == null) return Stream.value([]);
 
@@ -49,19 +86,60 @@ class OwnerRepository {
         .where('ownerId', isEqualTo: uid)
         .orderBy('createdAt', descending: true)
         .snapshots()
-        .map(
-          (snapshot) => snapshot.docs
-              .map((doc) {
-                // One malformed listing must not break the whole list.
-                try {
-                  return RoomModel.fromJson(doc.data());
-                } catch (_) {
-                  return null;
+        .asyncMap((snapshot) async {
+          final rooms = <OwnedRoomModel>[];
+          for (final doc in snapshot.docs) {
+            RoomModel listing;
+            try {
+              listing = RoomModel.fromJson(doc.data(), documentId: doc.id);
+            } catch (_) {
+              // One malformed listing must not break the whole list.
+              continue;
+            }
+
+            RoomPrivateLocation? privateLocation;
+            try {
+              final privateSnapshot = await _firestore
+                  .collection('roomPrivate')
+                  .doc(doc.id)
+                  .get();
+              if (privateSnapshot.exists) {
+                final candidate = RoomPrivateLocation.fromJson(
+                  privateSnapshot.data() ?? const <String, dynamic>{},
+                );
+                if (candidate.roomId == doc.id && candidate.ownerId == uid) {
+                  privateLocation = candidate;
                 }
-              })
-              .whereType<RoomModel>()
-              .toList(),
-        );
+              }
+            } catch (error) {
+              // A missing private document is a normal state during the
+              // staged migration. Some older deployed rule versions deny
+              // that read; the owner-facing legacy fallback keeps the edit
+              // form usable until the compatible rules are deployed.
+              AppLogger.warning(
+                'Could not read the private room location for ${doc.id}',
+                error: error,
+              );
+            }
+
+            // Only the owner-facing view reads the legacy exact fields, and
+            // it keeps them in the private-location model. The public room
+            // model continues to expose coarse data only.
+            privateLocation ??= RoomPrivateLocation.fromLegacyRoomJson(
+              doc.data(),
+              roomId: doc.id,
+              ownerId: uid,
+            );
+
+            rooms.add(
+              OwnedRoomModel(
+                listing: listing,
+                privateLocation: privateLocation,
+              ),
+            );
+          }
+          return rooms;
+        });
   }
 
   /// Join requests addressed to the current owner's rooms.
@@ -75,9 +153,14 @@ class OwnerRepository {
         .orderBy('createdAt', descending: true)
         .snapshots()
         .map(
-          (snapshot) => snapshot.docs
-              .map((doc) => JoinRequestModel.fromJson(doc.data()))
-              .toList(),
+          (snapshot) => parseDocumentsSafely(
+            snapshot.docs.map((doc) => (id: doc.id, data: doc.data())),
+            (_, data) => JoinRequestModel.fromJson(data),
+            onError: (id, error) => AppLogger.warning(
+              'Could not read the owner join request $id',
+              error: error,
+            ),
+          ),
         );
   }
 
@@ -92,10 +175,48 @@ class OwnerRepository {
         .orderBy('createdAt', descending: true)
         .snapshots()
         .map(
-          (snapshot) => snapshot.docs
-              .map((doc) => CommissionInvoiceModel.fromJson(doc.data()))
-              .toList(),
+          (snapshot) => parseDocumentsSafely(
+            snapshot.docs.map((doc) => (id: doc.id, data: doc.data())),
+            (_, data) => CommissionInvoiceModel.fromJson(data),
+            onError: (id, error) => AppLogger.warning(
+              'Could not read the commission invoice $id',
+              error: error,
+            ),
+          ),
         );
+  }
+
+  /// Writes the exact location to the server-owned private collection.
+  ///
+  /// The callable verifies the live owner and updates the private document
+  /// and the public compatibility fields in one transaction.
+  Future<void> _writePrivateLocation(
+    String roomId,
+    RoomPrivateLocation location,
+  ) async {
+    await _functions.callVoidFunction(
+      'setRoomPrivateLocation',
+      parameters: {'roomId': roomId, ...location.toCallablePayload()},
+      fallbackMessage: 'Could not save the private room location',
+    );
+  }
+
+  RoomPrivateLocation _draftPrivateLocation(
+    RoomDraft draft, {
+    required String roomId,
+    required String ownerId,
+  }) {
+    final location = draft.privateLocation;
+    return RoomPrivateLocation(
+      roomId: roomId,
+      ownerId: ownerId,
+      address: location.address,
+      city: location.city,
+      state: location.state,
+      pincode: location.pincode,
+      latitude: location.latitude,
+      longitude: location.longitude,
+    );
   }
 
   /// Creates a room listing.
@@ -107,17 +228,23 @@ class OwnerRepository {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
 
-    // The Firestore rules only accept a positive capacity. Checking it here
-    // turns a permission error into a message the owner understands.
-    if (draft.room.occupancy <= 0) {
+    // The Firestore rules enforce the same range. Checking it here turns a
+    // permission error into a message the owner understands.
+    if (draft.room.occupancy < 1 || draft.room.occupancy > 20) {
       throw Exception(
-        'The number of people who can live in the room must be at least 1',
+        'The number of people who can live in the room must be between 1 and 20',
       );
+    }
+    if (!draft.room.monthlyRent.isFinite ||
+        draft.room.monthlyRent < 1000 ||
+        draft.room.monthlyRent > 1000000) {
+      throw Exception('The monthly rent must be between ₹1,000 and ₹10,00,000');
     }
 
     final roomId = 'RM-${_uuid.v4()}';
 
-    final imageUrls = await _uploadImages(roomId, draft);
+    final upload = await _uploadImages(roomId, draft);
+    final imageUrls = upload.newlyUploadedUrls;
 
     final document = draft.room.copyWith(
       roomId: roomId,
@@ -135,10 +262,53 @@ class OwnerRepository {
       currentOccupancy: 0,
     );
 
-    await _firestore
-        .collection('rooms')
-        .doc(roomId)
-        .set(document.toCreateJson());
+    var listingRemoved = false;
+    try {
+      // The public document starts with coarse locality data only. The
+      // owner-only callable then stores the exact location privately and,
+      // during the compatibility stage, keeps the legacy public fields in
+      // the same transaction.
+      await _firestore
+          .collection('rooms')
+          .doc(roomId)
+          .set(document.toCreateJson());
+
+      try {
+        await _writePrivateLocation(
+          roomId,
+          _draftPrivateLocation(draft, roomId: roomId, ownerId: uid),
+        );
+      } catch (error) {
+        // A listing without its private counterpart is not a complete
+        // listing. Remove it through the server so the photos and the
+        // request history are cleaned up consistently.
+        try {
+          await _functions.callVoidFunction(
+            'deleteRoomListing',
+            parameters: {'roomId': roomId},
+            fallbackMessage: 'Could not remove the incomplete listing',
+          );
+          listingRemoved = true;
+        } catch (_) {
+          await _rollbackNewUploadsIfUnreferenced(
+            _firestore.collection('rooms').doc(roomId),
+            upload,
+          );
+        }
+        rethrow;
+      }
+    } catch (error) {
+      // A network failure does not prove that the write was not committed.
+      // Reconcile with the room document before deleting an uploaded object:
+      // a committed listing must never be left pointing at deleted photos.
+      if (!listingRemoved) {
+        await _rollbackNewUploadsIfUnreferenced(
+          _firestore.collection('rooms').doc(roomId),
+          upload,
+        );
+      }
+      rethrow;
+    }
     return roomId;
   }
 
@@ -148,55 +318,86 @@ class OwnerRepository {
     if (uid == null) throw Exception('User not logged in');
 
     final roomRef = _firestore.collection('rooms').doc(draft.room.roomId);
-    final snapshot = await roomRef.get();
-    if (!snapshot.exists) throw Exception('Room not found');
-    final data = snapshot.data();
-    if (data?['ownerId'] != uid) {
-      throw Exception('You can only edit your own listings');
-    }
+    final upload = await _uploadImages(draft.room.roomId, draft);
+    final document = draft.room.copyWith(updatedAt: DateTime.now());
 
-    // The tenant counter is server-owned: it is raised by the booking
-    // activation and lowered by the rollback. The capacity therefore may
-    // never be smaller than the number of people who already live there —
-    // the Firestore rules refuse the write, this check explains it.
-    final currentOccupancy = (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
-    if (draft.room.occupancy <= 0) {
-      throw Exception(
-        'The number of people who can live in the room must be at least 1',
+    try {
+      // The exact location is written first. The server stores it privately
+      // and updates the public compatibility fields in the same transaction,
+      // so a failed photo/listing update can never split the address across
+      // two different values.
+      await _writePrivateLocation(
+        draft.room.roomId,
+        _draftPrivateLocation(draft, roomId: draft.room.roomId, ownerId: uid),
       );
+
+      // The image list and the other owner-editable fields are committed in
+      // one transaction. The transaction re-reads the live room, so a photo
+      // added by another device while this form was open is preserved and a
+      // photo which another edit already removed is never restored.
+      await _firestore.runTransaction((transaction) async {
+        final snapshot = await transaction.get(roomRef);
+        if (!snapshot.exists) throw Exception('Room not found');
+
+        final data = snapshot.data();
+        if (data?['ownerId'] != uid) {
+          throw Exception('You can only edit your own listings');
+        }
+
+        // The tenant counter is server-owned: it is raised by the booking
+        // activation and lowered by the rollback. The capacity therefore may
+        // never be smaller than the number of people who already live there.
+        final currentOccupancy =
+            (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
+        if (draft.room.occupancy < 1 || draft.room.occupancy > 20) {
+          throw Exception(
+            'The number of people who can live in the room must be between 1 and 20',
+          );
+        }
+        if (!draft.room.monthlyRent.isFinite ||
+            draft.room.monthlyRent < 1000 ||
+            draft.room.monthlyRent > 1000000) {
+          throw Exception(
+            'The monthly rent must be between ₹1,000 and ₹10,00,000',
+          );
+        }
+        if (draft.room.occupancy < currentOccupancy) {
+          throw Exception(
+            'This room already has $currentOccupancy '
+            '${currentOccupancy == 1 ? 'person' : 'people'} living in it, so '
+            'the capacity cannot be lower than $currentOccupancy.',
+          );
+        }
+
+        final result = reconcileRoomImages(
+          currentImages: _safeImageUrls(data?['images']),
+          originalImages: draft.originalImageUrls,
+          draftImages: draft.room.images,
+          uploadedImages: upload.newlyUploadedUrls,
+        );
+        if (result.images.length > AppConstants.maxImagesPerRoom) {
+          throw Exception(
+            'A room can have at most '
+            '${AppConstants.maxImagesPerRoom} photos.',
+          );
+        }
+
+        final payload = document.toOwnerUpdateJson()
+          ..['images'] = result.images;
+        transaction.update(roomRef, payload);
+      });
+    } catch (error) {
+      // The acknowledgement may have been lost after Firestore committed the
+      // transaction. Reconcile before deleting any newly uploaded object.
+      await _rollbackNewUploadsIfUnreferenced(roomRef, upload);
+      rethrow;
     }
-    if (draft.room.occupancy < currentOccupancy) {
-      throw Exception(
-        'This room already has $currentOccupancy '
-        '${currentOccupancy == 1 ? 'person' : 'people'} living in it, so the '
-        'capacity cannot be lower than $currentOccupancy.',
-      );
-    }
 
-    final imageUrls = await _uploadImages(draft.room.roomId, draft);
-
-    // The photos the owner removed are deleted from the storage as well,
-    // so they do not pile up forever.
-    final removed = draft.room.images
-        .where((url) => !imageUrls.contains(url))
-        .toList();
-    if (removed.isNotEmpty) {
-      try {
-        await _storage.deleteFiles(removed);
-      } catch (e) {
-        AppLogger.warning('Could not delete the removed photos', error: e);
-      }
-    }
-
-    final document = draft.room.copyWith(
-      images: imageUrls,
-      updatedAt: DateTime.now(),
-    );
-
-    // Only the owner-editable fields are written. A full-document `set`
-    // would send the stale `status` / `currentOccupancy` values back and
-    // could overwrite a change the server made in the meantime.
-    await roomRef.update(document.toOwnerUpdateJson());
+    // The Firestore room-update trigger compares the committed image list
+    // with the previous one and writes a durable server-side Storage-cleanup
+    // job for every removed photo. The client deliberately does not delete
+    // those objects: a stale client snapshot must never remove a photo which
+    // a newer edit still references.
   }
 
   /// Uploads the newly picked photos and returns the complete photo list.
@@ -205,32 +406,111 @@ class OwnerRepository {
   /// the owner is part of the path on purpose: the Firebase Storage rules
   /// check it, so a signed-in user can only ever write below their own
   /// folder — nobody can upload into the folder of another owner.
-  Future<List<String>> _uploadImages(String roomId, RoomDraft draft) async {
-    final urls = <String>[...draft.room.images];
+  Future<_RoomImageUpload> _uploadImages(String roomId, RoomDraft draft) async {
+    final newlyUploadedUrls = <String>[];
+    final newlyUploadedPaths = <String>[];
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
 
-    for (final image in draft.newImages) {
-      try {
+    try {
+      for (final image in draft.newImages) {
         final bytes = await _readBytes(image);
-        if (bytes == null) continue;
+        if (bytes == null) {
+          throw Exception('Could not read one of the selected room photos.');
+        }
+
+        if (bytes.isEmpty) {
+          throw Exception(
+            'This photo is still loading. Please wait a moment and try again.',
+          );
+        }
+        if (bytes.length > AppConstants.maxImageSize) {
+          throw Exception(
+            'Each room photo must be smaller than '
+            '${(AppConstants.maxImageSize / (1024 * 1024)).round()} MB.',
+          );
+        }
 
         final fileName =
             '${DateTime.now().millisecondsSinceEpoch}'
             '_${_uuid.v4().substring(0, 8)}.jpg';
+        final objectPath = 'rooms/$uid/$roomId/$fileName';
+
+        // Track the path before starting the upload. The object may be
+        // created even when fetching its download URL fails afterwards.
+        newlyUploadedPaths.add(objectPath);
         final url = await _storage.uploadImage(
           path: 'rooms/$uid/$roomId',
           fileName: fileName,
           bytes: bytes,
         );
-        urls.add(url);
-      } catch (e) {
-        AppLogger.warning('Could not upload a room photo', error: e);
-        rethrow;
+        newlyUploadedUrls.add(url);
       }
+    } catch (error) {
+      // A later upload may fail after earlier files were uploaded. Roll the
+      // partial upload back so the room never keeps orphaned objects.
+      await _deletePathsBestEffort(newlyUploadedPaths);
+      AppLogger.warning('Could not upload a room photo', error: error);
+      rethrow;
     }
 
-    return urls;
+    return _RoomImageUpload(
+      newlyUploadedUrls: newlyUploadedUrls,
+      newlyUploadedPaths: newlyUploadedPaths,
+    );
+  }
+
+  /// Deletes uploaded objects by their known Storage paths.
+  Future<void> _deletePathsBestEffort(List<String> paths) async {
+    if (paths.isEmpty) return;
+    final failed = await _storage.deleteFilesAtPaths(paths);
+    if (failed.isNotEmpty) {
+      AppLogger.warning(
+        'Could not delete ${failed.length} uploaded room photo object(s)',
+        error: failed,
+      );
+    }
+  }
+
+  /// Removes newly uploaded objects only when the room does not reference
+  /// them.
+  ///
+  /// A failed Firestore acknowledgement is ambiguous: the write may have been
+  /// committed even though the client saw an error. Deleting the files in
+  /// that case would leave a committed listing pointing at missing photos.
+  /// When the follow-up read itself fails, the objects are kept because a
+  /// missing photo is worse than a temporarily unreferenced object.
+  Future<void> _rollbackNewUploadsIfUnreferenced(
+    DocumentReference<Map<String, dynamic>> roomRef,
+    _RoomImageUpload upload,
+  ) async {
+    if (upload.newlyUploadedPaths.isEmpty) return;
+
+    final Set<String> referencedUrls;
+    try {
+      final snapshot = await roomRef.get();
+      final currentImages = snapshot.exists
+          ? _safeImageUrls(snapshot.data()?['images'])
+          : const <String>[];
+      referencedUrls = currentImages.toSet();
+    } catch (error) {
+      AppLogger.warning(
+        'Could not verify a failed room edit; uploaded photos were kept',
+        error: error,
+      );
+      return;
+    }
+
+    final unreferencedPaths = <String>[];
+    for (var index = 0; index < upload.newlyUploadedPaths.length; index++) {
+      final url = index < upload.newlyUploadedUrls.length
+          ? upload.newlyUploadedUrls[index]
+          : null;
+      if (url == null || !referencedUrls.contains(url)) {
+        unreferencedPaths.add(upload.newlyUploadedPaths[index]);
+      }
+    }
+    await _deletePathsBestEffort(unreferencedPaths);
   }
 
   /// Reads the bytes of a picked image.
@@ -269,31 +549,14 @@ class OwnerRepository {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
 
-    // Read the image list before the room is removed. The server still owns
-    // and verifies the actual deletion.
-    final roomRef = _firestore.collection('rooms').doc(roomId);
-    final snapshot = await roomRef.get();
-    if (!snapshot.exists) return;
-
+    // The server owns the whole deletion. It removes the Firestore listing
+    // and writes a durable Storage-cleanup job in the same transaction, so
+    // the photos cannot be orphaned when the initiating client goes away.
     await _functions.callVoidFunction(
       'deleteRoomListing',
       parameters: {'roomId': roomId},
       fallbackMessage: 'Could not delete the room',
     );
-
-    // The photos of the room are removed from the storage as well.
-    final images =
-        (snapshot.data()?['images'] as List<dynamic>?)
-            ?.whereType<String>()
-            .toList() ??
-        const <String>[];
-    if (images.isNotEmpty) {
-      try {
-        await _storage.deleteFiles(images);
-      } catch (e) {
-        AppLogger.warning('Could not delete the photos of the room', error: e);
-      }
-    }
   }
 
   /// Approves a join request (owner confirmation step).
@@ -345,7 +608,7 @@ class OwnerRepository {
 
   /// Counts used by the owner dashboard.
   OwnerStats getStats({
-    required List<RoomModel> rooms,
+    required Iterable<OwnedRoomModel> rooms,
     required List<JoinRequestModel> requests,
     required List<CommissionInvoiceModel> invoices,
   }) {
@@ -384,7 +647,7 @@ class OwnerHome {
   final String id;
   final String name;
   final String address;
-  final List<RoomModel> rooms;
+  final List<OwnedRoomModel> rooms;
 
   const OwnerHome({
     required this.id,
@@ -403,8 +666,8 @@ class OwnerHome {
 /// The rooms that were published before the "homes" feature existed do not
 /// have a home id — they are collected under a single "Other listings" group
 /// so that they never disappear from the list.
-List<OwnerHome> groupRoomsByHome(List<RoomModel> rooms) {
-  final grouped = <String, List<RoomModel>>{};
+List<OwnerHome> groupRoomsByHome(Iterable<OwnedRoomModel> rooms) {
+  final grouped = <String, List<OwnedRoomModel>>{};
   for (final room in rooms) {
     grouped.putIfAbsent(room.resolvedHomeId, () => []).add(room);
   }
@@ -413,7 +676,7 @@ List<OwnerHome> groupRoomsByHome(List<RoomModel> rooms) {
     final roomsInHome = entry.value;
     final first = roomsInHome.first;
     final address = roomsInHome
-        .map((r) => r.location.address)
+        .map((r) => r.privateLocation?.address ?? '')
         .firstWhere(
           (a) => a.trim().isNotEmpty,
           orElse: () => first.location.shortAddress,
@@ -439,7 +702,26 @@ class RoomDraft {
   final RoomModel room;
   final List<XFile> newImages;
 
-  const RoomDraft({required this.room, this.newImages = const []});
+  /// The exact location stored in the private collection.
+  ///
+  /// It is separate from the public room payload. The server writes it
+  /// through the owner-only location callable.
+  final RoomPrivateLocation privateLocation;
+
+  /// The photos which were on the listing when the form was opened.
+  ///
+  /// The difference between this list and [RoomModel.images] tells the
+  /// repository which photos the owner explicitly removed. It also lets a
+  /// concurrent edit preserve a photo which was added after this form was
+  /// opened.
+  final List<String> originalImageUrls;
+
+  const RoomDraft({
+    required this.room,
+    required this.privateLocation,
+    this.newImages = const [],
+    this.originalImageUrls = const [],
+  });
 }
 
 /// Aggregated numbers shown on the owner dashboard.

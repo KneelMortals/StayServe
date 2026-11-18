@@ -32,12 +32,7 @@ RoomModel _room({
     description: 'A nice room',
     monthlyRent: 5000,
     securityDeposit: 10000,
-    location: const Location(
-      address: 'Some street',
-      city: 'Bengaluru',
-      state: 'Karnataka',
-      pincode: '560001',
-    ),
+    location: const Location(city: 'Bengaluru', state: 'Karnataka'),
     roomType: RoomType.single,
     furnishing: FurnishingType.unfurnished,
     availableFrom: DateTime(2026),
@@ -81,7 +76,7 @@ void main() {
       'monthlyRent': 5000,
       'location': {'city': 'Bengaluru'},
       'occupancy': 2,
-    });
+    }, documentId: 'RM-legacy');
 
     test('is read as available', () {
       expect(legacy.status, RoomStatus.available);

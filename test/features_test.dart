@@ -141,14 +141,7 @@ void main() {
         description: 'A nice room',
         monthlyRent: 5000,
         securityDeposit: 10000,
-        location: Location(
-          address: 'Some street',
-          city: 'Bengaluru',
-          state: 'Karnataka',
-          pincode: '560001',
-          latitude: latitude,
-          longitude: longitude,
-        ),
+        location: const Location(city: 'Bengaluru', state: 'Karnataka'),
         roomType: RoomType.single,
         furnishing: FurnishingType.unfurnished,
         availableFrom: DateTime(2026),
@@ -161,49 +154,51 @@ void main() {
         ),
         createdAt: DateTime(2026),
         updatedAt: DateTime(2026),
+        latitude: latitude,
+        longitude: longitude,
         homeId: homeId,
         homeName: homeName,
       );
     }
 
-    test('reads the coordinates from the location sub-map', () {
-      final room = RoomModel.fromJson({
-        'roomId': 'RM-1',
-        'ownerId': 'owner-1',
-        'title': 'A room',
-        'description': 'A nice room',
-        'monthlyRent': 5000,
-        'securityDeposit': 10000,
-        'location': {
-          'address': 'Some street',
-          'city': 'Bengaluru',
-          'state': 'Karnataka',
-          'pincode': '560001',
-          'latitude': 12.9716,
-          'longitude': 77.5946,
-        },
-        'roomType': 'single',
-        'furnishing': 'unfurnished',
-        'availableFrom': null,
-        'occupancy': 1,
-        'currentOccupancy': 0,
-        'genderPreference': 'any',
-        'images': <String>[],
-        'status': 'available',
-        'createdAt': null,
-        'updatedAt': null,
-      });
+    test(
+      'reads only a coarse public coordinate from a legacy location map',
+      () {
+        final room = RoomModel.fromJson({
+          'roomId': 'RM-1',
+          'ownerId': 'owner-1',
+          'title': 'A room',
+          'description': 'A nice room',
+          'monthlyRent': 5000,
+          'securityDeposit': 10000,
+          'location': {
+            'address': 'Some street',
+            'city': 'Bengaluru',
+            'state': 'Karnataka',
+            'pincode': '560001',
+            'latitude': 12.9716,
+            'longitude': 77.5946,
+          },
+          'roomType': 'single',
+          'furnishing': 'unfurnished',
+          'availableFrom': null,
+          'occupancy': 1,
+          'currentOccupancy': 0,
+          'genderPreference': 'any',
+          'images': <String>[],
+          'status': 'available',
+          'createdAt': null,
+          'updatedAt': null,
+        }, documentId: 'RM-1');
 
-      expect(room.latitude, 12.9716);
-      expect(room.longitude, 77.5946);
-    });
+        expect(room.latitude, 12.97);
+        expect(room.longitude, 77.59);
+      },
+    );
 
     test('calculates the distance to the user', () {
       final room = build(latitude: 12.9352, longitude: 77.6245);
-      final distance = room.distanceFrom(
-        latitude: 12.9767,
-        longitude: 77.5713,
-      );
+      final distance = room.distanceFrom(latitude: 12.9767, longitude: 77.5713);
       expect(distance, isNotNull);
       expect(distance!, closeTo(7.2, 0.4));
     });
@@ -243,7 +238,7 @@ void main() {
         'status': 'archived',
         'createdAt': null,
         'updatedAt': null,
-      });
+      }, documentId: 'RM-1');
       expect(room.status, RoomStatus.inactive);
       expect(room.isAvailable, isFalse);
     });

@@ -1,9 +1,11 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/index.dart';
+import '../../../../../firebase/student/student_repository.dart';
+import '../../../../../models/room_model.dart';
 import '../../../../../services/user_location_provider.dart';
 import '../providers/student_providers.dart';
 
@@ -11,7 +13,8 @@ class StudentSearchScreen extends ConsumerStatefulWidget {
   const StudentSearchScreen({super.key});
 
   @override
-  ConsumerState<StudentSearchScreen> createState() => _StudentSearchScreenState();
+  ConsumerState<StudentSearchScreen> createState() =>
+      _StudentSearchScreenState();
 }
 
 class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
@@ -52,10 +55,28 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
     });
   }
 
+  /// Loads the next cursor page and appends it to the current result.
+  Future<void> _loadMoreRooms(
+    BuildContext context,
+    WidgetRef ref,
+    List<RoomModel> currentRooms,
+  ) async {
+    final screenContext = context;
+    final knownIds = currentRooms.map((room) => room.roomId).toSet();
+    await ref.read(roomSearchPaginationProvider.notifier).loadMore(knownIds);
+    if (!screenContext.mounted) return;
+
+    final error = ref.read(roomSearchPaginationProvider).valueOrNull?.error;
+    if (error != null && error.isNotEmpty) {
+      screenContext.showErrorSnackBar('Could not load more rooms: $error');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final filters = ref.watch(roomSearchFiltersProvider);
     final roomsAsync = ref.watch(filteredRoomsProvider);
+    final paginationAsync = ref.watch(roomSearchPaginationProvider);
     final location = ref.watch(userLocationProvider);
 
     return Scaffold(
@@ -124,10 +145,34 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
               loading: () => const Center(child: CircularProgressIndicator()),
               error: (error, _) => _ErrorState(
                 message: 'Could not load rooms',
-                onRetry: () => ref.invalidate(filteredRoomsProvider),
+                onRetry: () {
+                  ref.invalidate(filteredRoomsProvider);
+                  ref.invalidate(roomSearchPaginationProvider);
+                },
               ),
-              data: (rooms) {
-                if (rooms.isEmpty) {
+              data: (firstPageRooms) {
+                final pagination = paginationAsync.valueOrNull;
+                final additionalRooms =
+                    pagination?.rooms ?? const <RoomModel>[];
+                final seen = <String>{};
+                final combined = <RoomModel>[];
+                for (final room in [...firstPageRooms, ...additionalRooms]) {
+                  if (!seen.add(room.roomId)) continue;
+                  combined.add(room);
+                }
+                final rooms = StudentRepository.sortRooms(
+                  combined,
+                  filters.sort,
+                  latitude: location?.latitude,
+                  longitude: location?.longitude,
+                );
+
+                // Until the first explicit page request, another page may
+                // still exist. This keeps a selective filter from hiding
+                // deeper matches behind a page which happened to contain
+                // none of them.
+                final canLoadMore = pagination?.hasMore ?? true;
+                if (rooms.isEmpty && !canLoadMore) {
                   return _ErrorState(
                     message: filters.hasActiveFilters
                         ? 'No rooms match your filters.'
@@ -137,16 +182,51 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
                         : null,
                   );
                 }
+
+                final extraItems = canLoadMore ? (rooms.isEmpty ? 2 : 1) : 0;
                 return ListView.builder(
                   padding: const EdgeInsets.all(AppSpacing.md),
-                  itemCount: rooms.length,
+                  itemCount: rooms.length + extraItems,
                   itemBuilder: (context, index) {
-                    final room = rooms[index];
+                    if (rooms.isEmpty && index == 0) {
+                      return const Padding(
+                        padding: EdgeInsets.only(bottom: AppSpacing.md),
+                        child: Center(
+                          child: Text('No rooms in this page yet.'),
+                        ),
+                      );
+                    }
+
+                    final roomIndex = rooms.isEmpty ? index - 1 : index;
+                    if (roomIndex < rooms.length) {
+                      final room = rooms[roomIndex];
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: AppSpacing.md),
+                        child: RoomCard(
+                          room: room,
+                          distanceKm: roomDistanceFromUser(room, location),
+                        ),
+                      );
+                    }
+
+                    final loading = pagination?.isLoadingMore == true;
                     return Padding(
                       padding: const EdgeInsets.only(bottom: AppSpacing.md),
-                      child: RoomCard(
-                        room: room,
-                        distanceKm: roomDistanceFromUser(room, location),
+                      child: FilledButton.tonalIcon(
+                        onPressed: loading
+                            ? null
+                            : () => _loadMoreRooms(context, ref, rooms),
+                        icon: loading
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.expand_more),
+                        label: Text(
+                          loading ? 'Loading more rooms…' : 'Load more rooms',
+                        ),
                       ),
                     );
                   },
@@ -226,8 +306,9 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
             onPressed: () async {
               // The lookup can fail (no permission, GPS off) — the
               // notifier handles that and simply keeps the old location.
-              final location =
-                  await ref.read(userLocationProvider.notifier).refresh();
+              final location = await ref
+                  .read(userLocationProvider.notifier)
+                  .refresh();
               if (!context.mounted) return;
               if (location == null) {
                 context.showErrorSnackBar(
@@ -326,13 +407,18 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
             : filters.copyWith(clearMaxDistanceKm: true),
       ),
       itemBuilder: (context) => [
-        const PopupMenuItem<Object>(value: _anyFilter, child: Text('Any distance')),
+        const PopupMenuItem<Object>(
+          value: _anyFilter,
+          child: Text('Any distance'),
+        ),
         ...AppConstants.distanceOptions
             .where((km) => km != null)
-            .map((km) => PopupMenuItem<Object>(
-                  value: km,
-                  child: Text(AppConstants.distanceOptionLabel(km)),
-                )),
+            .map(
+              (km) => PopupMenuItem<Object>(
+                value: km,
+                child: Text(AppConstants.distanceOptionLabel(km)),
+              ),
+            ),
       ],
       child: Chip(
         avatar: Icon(
@@ -374,7 +460,10 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
     );
   }
 
-  Widget _buildFurnishingFilter(BuildContext context, RoomSearchFilters filters) {
+  Widget _buildFurnishingFilter(
+    BuildContext context,
+    RoomSearchFilters filters,
+  ) {
     return PopupMenuButton<Object>(
       onSelected: (value) => _updateFilters(
         value is FurnishingType
@@ -387,8 +476,7 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
           child: Text('Any furnishing'),
         ),
         ...FurnishingType.values.map(
-          (type) =>
-              PopupMenuItem<Object>(value: type, child: Text(type.label)),
+          (type) => PopupMenuItem<Object>(value: type, child: Text(type.label)),
         ),
       ],
       child: Chip(
@@ -411,10 +499,7 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
           child: Text('Any preference'),
         ),
         ...GenderPreference.values.map(
-          (pref) => PopupMenuItem<Object>(
-            value: pref,
-            child: Text(pref.label),
-          ),
+          (pref) => PopupMenuItem<Object>(value: pref, child: Text(pref.label)),
         ),
       ],
       child: Chip(
@@ -433,9 +518,18 @@ class _StudentSearchScreenState extends ConsumerState<StudentSearchScreen> {
       ),
       itemBuilder: (context) => [
         const PopupMenuItem<Object>(value: _anyFilter, child: Text('Any rent')),
-        const PopupMenuItem<Object>(value: 10000.0, child: Text('Under ₹10,000')),
-        const PopupMenuItem<Object>(value: 15000.0, child: Text('Under ₹15,000')),
-        const PopupMenuItem<Object>(value: 25000.0, child: Text('Under ₹25,000')),
+        const PopupMenuItem<Object>(
+          value: 10000.0,
+          child: Text('Under ₹10,000'),
+        ),
+        const PopupMenuItem<Object>(
+          value: 15000.0,
+          child: Text('Under ₹15,000'),
+        ),
+        const PopupMenuItem<Object>(
+          value: 25000.0,
+          child: Text('Under ₹25,000'),
+        ),
       ],
       child: Chip(
         label: Text(
@@ -479,10 +573,17 @@ class _ErrorState extends StatelessWidget {
           children: [
             Icon(Icons.search_off, size: 64, color: theme.colorScheme.outline),
             const SizedBox(height: AppSpacing.md),
-            Text(message, style: theme.textTheme.bodyLarge, textAlign: TextAlign.center),
+            Text(
+              message,
+              style: theme.textTheme.bodyLarge,
+              textAlign: TextAlign.center,
+            ),
             if (onRetry != null) ...[
               const SizedBox(height: AppSpacing.md),
-              TextButton(onPressed: onRetry, child: const Text('Reset filters')),
+              TextButton(
+                onPressed: onRetry,
+                child: const Text('Reset filters'),
+              ),
             ],
           ],
         ),

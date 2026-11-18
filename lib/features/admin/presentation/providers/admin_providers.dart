@@ -9,29 +9,44 @@ import '../../../../models/join_request_model.dart';
 import '../../../../models/launch_pincode_config.dart';
 import '../../../../models/payment_model.dart';
 
-final adminUsersProvider = StreamProvider.autoDispose.family<List<UserModel>, UserRole?>((ref, roleFilter) {
-  return ref.watch(adminRepositoryProvider).watchAllUsers(roleFilter: roleFilter);
-});
+final adminUsersProvider = StreamProvider.autoDispose
+    .family<List<UserModel>, UserRole?>((ref, roleFilter) {
+      return ref
+          .watch(adminRepositoryProvider)
+          .watchAllUsers(roleFilter: roleFilter);
+    });
 
-final adminRoomsProvider = StreamProvider.autoDispose.family<List<RoomModel>, RoomStatus?>((ref, statusFilter) {
-  return ref.watch(adminRepositoryProvider).watchAllRooms(statusFilter: statusFilter);
-});
+final adminRoomsProvider = StreamProvider.autoDispose
+    .family<List<RoomModel>, RoomStatus?>((ref, statusFilter) {
+      return ref
+          .watch(adminRepositoryProvider)
+          .watchAllRooms(statusFilter: statusFilter);
+    });
 
-final adminJoinRequestsProvider = StreamProvider.autoDispose.family<List<JoinRequestModel>, JoinRequestStatus?>((ref, statusFilter) {
-  return ref.watch(adminRepositoryProvider).watchAllJoinRequests(statusFilter: statusFilter);
-});
+final adminJoinRequestsProvider = StreamProvider.autoDispose
+    .family<List<JoinRequestModel>, JoinRequestStatus?>((ref, statusFilter) {
+      return ref
+          .watch(adminRepositoryProvider)
+          .watchAllJoinRequests(statusFilter: statusFilter);
+    });
 
-final adminInvoicesProvider = StreamProvider.autoDispose.family<List<CommissionInvoiceModel>, InvoiceStatus?>((ref, statusFilter) {
-  return ref.watch(adminRepositoryProvider).watchAllInvoices(statusFilter: statusFilter);
-});
+final adminInvoicesProvider = StreamProvider.autoDispose
+    .family<List<CommissionInvoiceModel>, InvoiceStatus?>((ref, statusFilter) {
+      return ref
+          .watch(adminRepositoryProvider)
+          .watchAllInvoices(statusFilter: statusFilter);
+    });
 
 /// Platform-fee payments, optionally filtered by status.
 ///
 /// The `payments` collection is written exclusively by the payment cloud
 /// functions, so an admin is the only role that can read the whole list.
-final adminPaymentsProvider = StreamProvider.autoDispose.family<List<PaymentModel>, PaymentStatus?>((ref, statusFilter) {
-  return ref.watch(paymentRepositoryProvider).watchPayments(status: statusFilter);
-});
+final adminPaymentsProvider = StreamProvider.autoDispose
+    .family<List<PaymentModel>, PaymentStatus?>((ref, statusFilter) {
+      return ref
+          .watch(paymentRepositoryProvider)
+          .watchPayments(status: statusFilter);
+    });
 
 final adminStatsProvider = StreamProvider.autoDispose<AdminStats>((ref) {
   return ref.watch(adminRepositoryProvider).watchStats();
@@ -43,8 +58,8 @@ final adminStatsProvider = StreamProvider.autoDispose<AdminStats>((ref) {
 /// Only the newest few are read, so the dashboard stays cheap.
 final adminRecentRequestsProvider =
     StreamProvider.autoDispose<List<AdminRecentRequest>>((ref) {
-  return ref.watch(adminRepositoryProvider).watchRecentRequests(limit: 4);
-});
+      return ref.watch(adminRepositoryProvider).watchRecentRequests(limit: 4);
+    });
 
 final adminStatsFutureProvider = FutureProvider<AdminStats>((ref) {
   return ref.watch(adminRepositoryProvider).getStats();
@@ -67,17 +82,21 @@ final adminFeePayerProvider = FutureProvider<String>((ref) {
   return ref.watch(adminRepositoryProvider).getFeePayer();
 });
 
-final adminLaunchPincodeConfigProvider = StreamProvider.autoDispose<LaunchPincodeConfig>((ref) {
-  return ref.watch(adminRepositoryProvider).watchLaunchPincodeConfig();
-});
+final adminLaunchPincodeConfigProvider =
+    StreamProvider.autoDispose<LaunchPincodeConfig>((ref) {
+      return ref.watch(adminRepositoryProvider).watchLaunchPincodeConfig();
+    });
 
-final adminLaunchPincodeConfigFutureProvider = FutureProvider<LaunchPincodeConfig>((ref) {
-  return ref.watch(adminRepositoryProvider).getLaunchPincodeConfig();
-});
+final adminLaunchPincodeConfigFutureProvider =
+    FutureProvider<LaunchPincodeConfig>((ref) {
+      return ref.watch(adminRepositoryProvider).getLaunchPincodeConfig();
+    });
 
-final adminControllerProvider = AsyncNotifierProvider<AdminController, void>(() {
-  return AdminController();
-});
+final adminControllerProvider = AsyncNotifierProvider<AdminController, void>(
+  () {
+    return AdminController();
+  },
+);
 
 /// Runs the admin actions.
 ///
@@ -86,6 +105,12 @@ final adminControllerProvider = AsyncNotifierProvider<AdminController, void>(() 
 /// the errors used to be swallowed, so a failed ban or a failed approval
 /// looked exactly like a successful one.
 class AdminController extends AsyncNotifier<void> {
+  /// The most recent explicit account-deletion outcome.
+  ///
+  /// It is kept separately from the provider's `void` state so the existing
+  /// admin actions keep their simple error-string contract.
+  AccountDeletionResult? lastDeletionResult;
+
   @override
   Future<void> build() async {}
 
@@ -126,13 +151,23 @@ class AdminController extends AsyncNotifier<void> {
   }
 
   Future<String?> deleteUser(String uid) async {
-    final error = await _run(
-      () => ref.read(adminRepositoryProvider).deleteUser(uid),
-    );
-    if (error == null) {
+    state = const AsyncLoading();
+    lastDeletionResult = null;
+    try {
+      final result = await ref
+          .read(adminRepositoryProvider)
+          .deleteUserWithResult(uid);
+      lastDeletionResult = result;
+      state = const AsyncData(null);
       ref.invalidate(adminUsersProvider);
+      return null;
+    } catch (e) {
+      state = AsyncError(e, StackTrace.current);
+      final message = e is Exception
+          ? e.toString().replaceFirst('Exception: ', '').trim()
+          : 'Something went wrong';
+      return message.isEmpty ? 'Something went wrong' : message;
     }
-    return error;
   }
 
   /// Schedules the deletion of an account — with a grace period.
@@ -209,11 +244,13 @@ class AdminController extends AsyncNotifier<void> {
     String? rejectionReason,
   }) async {
     final error = await _run(
-      () => ref.read(adminRepositoryProvider).adminReviewRequest(
-        requestId,
-        approve: approve,
-        rejectionReason: rejectionReason,
-      ),
+      () => ref
+          .read(adminRepositoryProvider)
+          .adminReviewRequest(
+            requestId,
+            approve: approve,
+            rejectionReason: rejectionReason,
+          ),
     );
     if (error == null) {
       ref.invalidate(adminJoinRequestsProvider);
@@ -230,12 +267,14 @@ class AdminController extends AsyncNotifier<void> {
     String? upiTransactionId,
   }) async {
     final error = await _run(
-      () => ref.read(adminRepositoryProvider).markInvoicePaid(
-        invoiceId,
-        paymentReference: paymentReference,
-        paymentMethod: paymentMethod,
-        upiTransactionId: upiTransactionId,
-      ),
+      () => ref
+          .read(adminRepositoryProvider)
+          .markInvoicePaid(
+            invoiceId,
+            paymentReference: paymentReference,
+            paymentMethod: paymentMethod,
+            upiTransactionId: upiTransactionId,
+          ),
     );
     if (error == null) {
       ref.invalidate(adminInvoicesProvider);
@@ -305,7 +344,9 @@ class AdminController extends AsyncNotifier<void> {
   /// Runs one of the server-side maintenance tasks (`cleanNotifications` /
   /// `archiveRooms`).
   Future<String?> runMaintenanceTask(String task) async {
-    return _run(() => ref.read(adminRepositoryProvider).runMaintenanceTask(task));
+    return _run(
+      () => ref.read(adminRepositoryProvider).runMaintenanceTask(task),
+    );
   }
 
   Future<String?> updateLaunchPincodeConfig({
@@ -314,11 +355,13 @@ class AdminController extends AsyncNotifier<void> {
     required String mode,
   }) async {
     final error = await _run(
-      () => ref.read(adminRepositoryProvider).updateLaunchPincodeConfig(
-        enabledPincodes: enabledPincodes,
-        disabledPincodes: disabledPincodes,
-        mode: mode,
-      ),
+      () => ref
+          .read(adminRepositoryProvider)
+          .updateLaunchPincodeConfig(
+            enabledPincodes: enabledPincodes,
+            disabledPincodes: disabledPincodes,
+            mode: mode,
+          ),
     );
     if (error == null) {
       ref.invalidate(adminLaunchPincodeConfigProvider);

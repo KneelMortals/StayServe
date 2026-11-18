@@ -116,10 +116,7 @@ void main() {
     test('a student without an accepted request may not review', () {
       final requests = [
         request(status: JoinRequestStatus.pending),
-        request(
-          requestId: 'JRQ-2',
-          status: JoinRequestStatus.rejected,
-        ),
+        request(requestId: 'JRQ-2', status: JoinRequestStatus.rejected),
       ];
 
       expect(mayReviewRoom(requests, 'RM-1'), isFalse);
@@ -128,10 +125,7 @@ void main() {
     test('a student with an accepted request may review', () {
       final requests = [
         request(status: JoinRequestStatus.pending),
-        request(
-          requestId: 'JRQ-2',
-          status: JoinRequestStatus.ownerConfirmed,
-        ),
+        request(requestId: 'JRQ-2', status: JoinRequestStatus.ownerConfirmed),
       ];
 
       expect(mayReviewRoom(requests, 'RM-1'), isTrue);
@@ -289,26 +283,14 @@ void main() {
     test('a rating out of range is invalid, not the smallest rating', () {
       // A broken document must not drag the average of the room down to a
       // single star — it is left out of the average instead.
-      expect(
-        RoomReviewModel.fromJson('REV-1', const {'rating': 9}).rating,
-        0,
-      );
-      expect(
-        RoomReviewModel.fromJson('REV-1', const {'rating': 0}).rating,
-        0,
-      );
-      expect(
-        RoomReviewModel.fromJson('REV-1', const {'rating': -3}).rating,
-        0,
-      );
+      expect(RoomReviewModel.fromJson('REV-1', const {'rating': 9}).rating, 0);
+      expect(RoomReviewModel.fromJson('REV-1', const {'rating': 0}).rating, 0);
+      expect(RoomReviewModel.fromJson('REV-1', const {'rating': -3}).rating, 0);
       expect(
         RoomReviewModel.fromJson('REV-1', const {'rating': 'five'}).rating,
         0,
       );
-      expect(
-        RoomReviewModel.fromJson('REV-1', const {'rating': 4}).rating,
-        4,
-      );
+      expect(RoomReviewModel.fromJson('REV-1', const {'rating': 4}).rating, 4);
     });
 
     test('the name of the author is never empty', () {

@@ -26,7 +26,7 @@
 
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -36,11 +36,13 @@ import 'package:stayserve/core/routing/app_router.dart';
 import 'package:stayserve/core/routing/back_to_dashboard.dart';
 import 'package:stayserve/features/auth/presentation/providers/auth_provider.dart';
 import 'package:stayserve/features/notifications/presentation/providers/notification_providers.dart';
-import 'package:stayserve/features/owners/presentation/providers/owner_providers.dart' as owner;
+import 'package:stayserve/features/owners/presentation/providers/owner_providers.dart'
+    as owner;
 import 'package:stayserve/firebase/owner/owner_repository.dart';
 import 'package:stayserve/features/students/presentation/providers/student_providers.dart';
 import 'package:stayserve/services/user_location_provider.dart';
 import 'package:stayserve/models/notification_model.dart';
+import 'package:stayserve/models/owned_room_model.dart';
 import 'package:stayserve/firebase/notifications/notifications_repository.dart';
 import 'package:stayserve/models/join_request_model.dart';
 import 'package:stayserve/models/room_model.dart';
@@ -126,26 +128,31 @@ Future<ProviderContainer> _pumpRouter(
       authControllerProvider.overrideWith(() => FakeAuthController()),
       userProfileProvider.overrideWith((ref, id) async => user),
       userLocationProvider.overrideWith(() => FakeUserLocationNotifier()),
-      notificationsRepositoryProvider
-          .overrideWithValue(FakeNotificationsRepository()),
+      notificationsRepositoryProvider.overrideWithValue(
+        FakeNotificationsRepository(),
+      ),
       notificationsProvider.overrideWith(
         (ref) => Stream.value(<NotificationModel>[]),
       ),
-      unreadNotificationCountProvider
-          .overrideWith((ref) => Stream.value(0)),
+      unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
       // The data of the student area — without it the screens would talk to
       // the real Firestore and the test would never finish.
       roomsSearchProvider.overrideWith((ref) => Stream.value(<RoomModel>[])),
       filteredRoomsProvider.overrideWith((ref) => Stream.value(<RoomModel>[])),
       savedRoomsProvider.overrideWith((ref) => Stream.value(<RoomModel>[])),
-      myJoinRequestsProvider
-          .overrideWith((ref) => Stream.value(<JoinRequestModel>[])),
+      myJoinRequestsProvider.overrideWith(
+        (ref) => Stream.value(<JoinRequestModel>[]),
+      ),
       // The data of the owner area.
-      owner.myRoomsProvider.overrideWith((ref) => Stream.value(<RoomModel>[])),
-      owner.myJoinRequestsProvider
-          .overrideWith((ref) => Stream.value(<JoinRequestModel>[])),
-      owner.myInvoicesProvider
-          .overrideWith((ref) => Stream.value(<CommissionInvoiceModel>[])),
+      owner.myRoomsProvider.overrideWith(
+        (ref) => Stream.value(<OwnedRoomModel>[]),
+      ),
+      owner.myJoinRequestsProvider.overrideWith(
+        (ref) => Stream.value(<JoinRequestModel>[]),
+      ),
+      owner.myInvoicesProvider.overrideWith(
+        (ref) => Stream.value(<CommissionInvoiceModel>[]),
+      ),
       owner.ownerStatsProvider.overrideWithValue(
         OwnerStats(
           totalRooms: 0,
@@ -232,7 +239,8 @@ void main() {
         expect(
           closer.platformCanHandleBack,
           isTrue,
-          reason: 'the platform must be told that the back button is '
+          reason:
+              'the platform must be told that the back button is '
               'handled on $section',
         );
         expect(
@@ -243,8 +251,9 @@ void main() {
       });
     }
 
-    testWidgets('on the dashboard it asks before the app closes',
-        (tester) async {
+    testWidgets('on the dashboard it asks before the app closes', (
+      tester,
+    ) async {
       final closer = _AppCloser()..install(tester);
 
       final container = await _pumpRouter(
@@ -262,8 +271,9 @@ void main() {
       expect(find.text('Press back again to leave StayServe'), findsOneWidget);
     });
 
-    testWidgets('on the dashboard a second press closes the app',
-        (tester) async {
+    testWidgets('on the dashboard a second press closes the app', (
+      tester,
+    ) async {
       final closer = _AppCloser()..install(tester);
 
       await _pumpRouter(
@@ -303,11 +313,16 @@ void main() {
 
         await _pressSystemBack(tester);
 
-        expect(closer.popCalls, 0, reason: 'the app must not close on $section');
+        expect(
+          closer.popCalls,
+          0,
+          reason: 'the app must not close on $section',
+        );
         expect(
           closer.platformCanHandleBack,
           isTrue,
-          reason: 'the platform must be told that the back button is '
+          reason:
+              'the platform must be told that the back button is '
               'handled on $section',
         );
         expect(
@@ -342,11 +357,16 @@ void main() {
 
         await _pressSystemBack(tester);
 
-        expect(closer.popCalls, 0, reason: 'the app must not close on $section');
+        expect(
+          closer.popCalls,
+          0,
+          reason: 'the app must not close on $section',
+        );
         expect(
           closer.platformCanHandleBack,
           isTrue,
-          reason: 'the platform must be told that the back button is '
+          reason:
+              'the platform must be told that the back button is '
               'handled on $section',
         );
         expect(

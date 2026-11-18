@@ -1,15 +1,18 @@
-import * as functions from 'firebase-functions';
-import * as admin from 'firebase-admin';
+import * as functions from 'firebase-functions/v1';
+import { callableHttps } from './appCheck';
+import * as firestore from 'firebase-admin/firestore';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-import { displayNameOf, findOwnerAcceptedRequest } from './bookingAccess';
-import { assertActiveAccount } from './accounts';
+import {
+  OWNER_ACCEPTED_STATUSES,
+  canBookAsStudent,
+} from './bookingAccess';
 import { notify } from './notifications';
 
-const db = admin.firestore();
+const db = firestore.getFirestore();
 
 /**
  * Reviews.
@@ -44,7 +47,7 @@ function reviewIdFor(roomId: string, studentId: string): string {
 /**
  * Writes (or replaces) the review of the current student for a room.
  */
-export const submitRoomReview = functions.https.onCall(async (data, context) => {
+export const submitRoomReview = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -53,8 +56,6 @@ export const submitRoomReview = functions.https.onCall(async (data, context) => 
   const roomId = String(data?.roomId || '').trim();
   const comment = String(data?.comment || '').trim();
   const rating = Number(data?.rating);
-
-  await assertActiveAccount(uid);
 
   if (!roomId) {
     throw new functions.https.HttpsError('invalid-argument', 'Missing room');
@@ -72,62 +73,97 @@ export const submitRoomReview = functions.https.onCall(async (data, context) => 
     );
   }
 
-  const roomSnapshot = await db.collection('rooms').doc(roomId).get();
-  if (!roomSnapshot.exists) {
-    throw new functions.https.HttpsError('not-found', 'That room no longer exists');
-  }
-  const room = roomSnapshot.data() as Record<string, any>;
-  const ownerId = String(room.ownerId || '');
-
-  // ---------------------------------------------------------------------
-  // The rule of the feature: the owner has to have accepted the request.
-  // ---------------------------------------------------------------------
-  const accepted = await findOwnerAcceptedRequest(uid, roomId);
-  if (!accepted) {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'You can only review a room after the owner accepts your request',
-    );
-  }
-
-  const studentName = await displayNameOf(uid);
   const reviewId = reviewIdFor(roomId, uid);
   const reviewRef = db.collection('roomReviews').doc(reviewId);
-  const existing = await reviewRef.get();
 
-  const review = {
-    reviewId,
-    roomId,
-    studentId: uid,
-    ownerId,
-    // -------------------------------------------------------------------
-    // The id of the booking request is **not** part of the public review.
-    //
-    // Every signed-in user may read the reviews of a room — that is the
-    // point of a review. The internal id of the booking request is none of
-    // their business, though: it is the internal bookkeeping of the
-    // booking and it would tell them who booked which room.
-    //
-    // The server does not need it either — the gate of the feature is
-    // checked again with `findOwnerAcceptedRequest` every time the review
-    // is written or removed.
-    // -------------------------------------------------------------------
-    rating,
-    comment,
-    studentName,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
+  // The live student profile, the room, the accepted request and the
+  // existing review are read in the same transaction as the write. A
+  // cancellation or an account-deletion fence which commits first therefore
+  // cannot be raced by a late review.
+  const { ownerId, studentName } = await db.runTransaction(async (transaction) => {
+    const studentSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    if (
+      !canBookAsStudent({
+        exists: studentSnapshot.exists,
+        registrationCompleted: studentSnapshot.get('registrationCompleted'),
+        isActive: studentSnapshot.get('isActive'),
+        role: studentSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Only an active student account can review a room.',
+      );
+    }
 
-  if (existing.exists) {
-    // The `createdAt` of the first review is kept — it is the date the
-    // student first reviewed the room.
-    await reviewRef.update(review);
-  } else {
-    await reviewRef.set({
-      ...review,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  }
+    const roomSnapshot = await transaction.get(
+      db.collection('rooms').doc(roomId),
+    );
+    if (!roomSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That room no longer exists',
+      );
+    }
+    const roomOwnerId = String(roomSnapshot.get('ownerId') || '').trim();
+    const roomListingGeneration = String(
+      roomSnapshot.get('listingGeneration') || '',
+    ).trim();
+
+    const acceptedSnapshot = await transaction.get(
+      db
+        .collection('joinRequests')
+        .where('roomId', '==', roomId)
+        .where('studentId', '==', uid)
+        .where('status', 'in', OWNER_ACCEPTED_STATUSES)
+        .limit(1),
+    );
+    if (acceptedSnapshot.empty) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only review a room after the owner accepts your request',
+      );
+    }
+
+    const existing = await transaction.get(reviewRef);
+    const profileName = String(studentSnapshot.get('name') || '').trim();
+    const profileEmail = String(studentSnapshot.get('email') || '').trim();
+    const resolvedName =
+      profileName || (profileEmail ? profileEmail.split('@')[0] : 'A student');
+
+    const review = {
+      reviewId,
+      roomId,
+      studentId: uid,
+      ownerId: roomOwnerId,
+      listingGeneration: roomListingGeneration,
+      // The internal booking-request id is deliberately not published.
+      rating,
+      comment,
+      studentName: resolvedName,
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (existing.exists) {
+      if (String(existing.get('studentId') || '') !== uid) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'You can only change your own review.',
+        );
+      }
+      // The `createdAt` of the first review is kept.
+      transaction.update(reviewRef, review);
+    } else {
+      transaction.set(reviewRef, {
+        ...review,
+        createdAt: firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    return { ownerId: roomOwnerId, studentName: resolvedName };
+  });
 
   // ---------------------------------------------------------------------
   // The owner is told about it.
@@ -153,7 +189,7 @@ export const submitRoomReview = functions.https.onCall(async (data, context) => 
  * student who walked away from the booking may not take their review with
  * them, because the review is about the room they were allowed to book.
  */
-export const deleteRoomReview = functions.https.onCall(async (data, context) => {
+export const deleteRoomReview = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -164,23 +200,58 @@ export const deleteRoomReview = functions.https.onCall(async (data, context) => 
     throw new functions.https.HttpsError('invalid-argument', 'Missing room');
   }
 
-  await assertActiveAccount(uid);
-
-  const accepted = await findOwnerAcceptedRequest(uid, roomId);
-  if (!accepted) {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'You can only change a review while your request for the room is accepted',
-    );
-  }
-
   const reviewId = reviewIdFor(roomId, uid);
   const reviewRef = db.collection('roomReviews').doc(reviewId);
-  const existing = await reviewRef.get();
-  if (!existing.exists) {
-    throw new functions.https.HttpsError('not-found', 'You have not reviewed this room');
-  }
 
-  await reviewRef.delete();
+  await db.runTransaction(async (transaction) => {
+    const studentSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    if (
+      !canBookAsStudent({
+        exists: studentSnapshot.exists,
+        registrationCompleted: studentSnapshot.get('registrationCompleted'),
+        isActive: studentSnapshot.get('isActive'),
+        role: studentSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Only an active student account can change a review.',
+      );
+    }
+
+    const acceptedSnapshot = await transaction.get(
+      db
+        .collection('joinRequests')
+        .where('roomId', '==', roomId)
+        .where('studentId', '==', uid)
+        .where('status', 'in', OWNER_ACCEPTED_STATUSES)
+        .limit(1),
+    );
+    if (acceptedSnapshot.empty) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only change a review while your request for the room is accepted',
+      );
+    }
+
+    const existing = await transaction.get(reviewRef);
+    if (!existing.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'You have not reviewed this room',
+      );
+    }
+    if (String(existing.get('studentId') || '') !== uid) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'You can only delete your own review.',
+      );
+    }
+
+    transaction.delete(reviewRef);
+  });
+
   return { success: true };
 });

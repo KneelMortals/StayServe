@@ -1,11 +1,17 @@
-import * as admin from 'firebase-admin';
-import * as functions from 'firebase-functions';
+import * as firestore from 'firebase-admin/firestore';
+import * as functions from 'firebase-functions/v1';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-const db = admin.firestore();
+import { hasValidBookingParties } from './bookingAccess';
+import {
+  isValidMonthlyRent,
+  readRoomCapacityState,
+} from './roomValidation';
+
+const db = firestore.getFirestore();
 
 /**
  * Booking activation.
@@ -44,9 +50,38 @@ export function isActiveBookingStatus(status: string): boolean {
  * the last state in which the platform fee may be paid. A legacy active
  * record is also rolled back to `studentConfirmed`; only the payment
  * verification path is allowed to release its occupancy.
+ *
+ * `null` means that the request is terminal (or in an unknown state) and
+ * must not be changed. A rejected payment may never resurrect a cancelled
+ * or declined booking.
  */
-export function bookingStatusAfterRejectedPayment(status: string): string {
-  return status === 'ownerConfirmed' ? 'ownerConfirmed' : 'studentConfirmed';
+export function bookingStatusAfterRejectedPayment(
+  status: string,
+  wasAlreadyActive = false,
+): string | null {
+  if (wasAlreadyActive && isActiveBookingStatus(status)) {
+    return 'studentConfirmed';
+  }
+  if (status === 'studentConfirmed' || status === 'ownerConfirmed') {
+    return status;
+  }
+  return null;
+}
+
+/**
+ * The status a rejected payment may write to its request.
+ *
+ * `bookingMayChange` is false when the payment identities, booking parties
+ * or room ownership do not agree. In that case only the payment record may
+ * be rejected; the request must not be rewritten from unrelated data.
+ */
+export function rejectedPaymentBookingStatus(
+  status: string,
+  wasAlreadyActive: boolean,
+  bookingMayChange: boolean,
+): string | null {
+  if (!bookingMayChange) return null;
+  return bookingStatusAfterRejectedPayment(status, wasAlreadyActive);
 }
 
 /** The payment details recorded by `submitPayment`. */
@@ -55,6 +90,7 @@ export interface PaymentSubmissionDetails {
   studentId: string;
   ownerId: string;
   roomId: string;
+  monthlyRent: number;
   amount: number;
   feePercentage: number;
   reference: string;
@@ -102,6 +138,7 @@ export function buildPaymentSubmissionRequestUpdates(
 ): Record<string, any> {
   return {
     advancePaid: false,
+    monthlyRentAtJoin: details.monthlyRent,
     advanceAmount: details.amount,
     advancePaymentReference: details.feeWaived ? null : details.reference,
     advancePaymentMethod: details.feeWaived ? null : details.method,
@@ -144,7 +181,7 @@ export interface ActivationOptions {
   /** The UPI transaction id. */
   advanceUpiTransactionId?: string | null;
   /** When the payment was made — `null` leaves the old value alone. */
-  paidAt?: admin.firestore.FieldValue | null;
+  paidAt?: firestore.FieldValue | null;
 }
 
 /**
@@ -187,13 +224,13 @@ export function roomStatusAfterOccupancyChange(
  */
 export interface BookingWriter {
   set(
-    ref: admin.firestore.DocumentReference,
-    data: admin.firestore.DocumentData,
-    options?: admin.firestore.SetOptions,
+    ref: firestore.DocumentReference,
+    data: firestore.DocumentData,
+    options?: firestore.SetOptions,
   ): void;
   update(
-    ref: admin.firestore.DocumentReference,
-    data: admin.firestore.UpdateData<admin.firestore.DocumentData>,
+    ref: firestore.DocumentReference,
+    data: firestore.UpdateData<firestore.DocumentData>,
   ): void;
 }
 
@@ -228,12 +265,29 @@ export async function addBookingActivation(
   writer: BookingWriter,
   request: ActivatableRequest,
   options: ActivationOptions,
-  roomSnapshot?: admin.firestore.DocumentSnapshot | null,
-  invoiceSnapshot?: admin.firestore.DocumentSnapshot | null,
+  roomSnapshot?: firestore.DocumentSnapshot | null,
+  invoiceSnapshot?: firestore.DocumentSnapshot | null,
 ): Promise<ActivationResult> {
+  if (!isValidMonthlyRent(request.monthlyRentAtJoin)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The agreed rent for this booking is not valid',
+    );
+  }
+  if (
+    !Number.isFinite(options.commissionPercentage) ||
+    options.commissionPercentage < 0 ||
+    options.commissionPercentage > 100
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The booking commission percentage is not valid',
+    );
+  }
+
   const invoiceId = `${INVOICE_PREFIX}${request.requestId}`;
   const commissionAmount = commissionFor(
-    Number(request.monthlyRentAtJoin || 0),
+    request.monthlyRentAtJoin,
     options.commissionPercentage,
   );
 
@@ -265,21 +319,28 @@ export async function addBookingActivation(
   }
 
   const roomData = room.data() || {};
-  const occupancy = Number(roomData.occupancy || 1);
-  const currentOccupancy = Number(roomData.currentOccupancy || 0);
+  const ownerId = String(request.ownerId || '');
+  if (!hasValidBookingParties(request)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This booking does not have a valid student tenant.',
+    );
+  }
+  if (String(roomData.ownerId || '') !== ownerId) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The room owner does not match this booking request.',
+    );
+  }
 
-  if (!Number.isFinite(occupancy) || occupancy <= 0) {
+  const capacityState = readRoomCapacityState(roomData);
+  if (!capacityState) {
     throw new functions.https.HttpsError(
       'failed-precondition',
-      'That room has an invalid capacity',
+      'That room has an invalid capacity or occupancy',
     );
   }
-  if (!Number.isFinite(currentOccupancy) || currentOccupancy < 0) {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'That room has an invalid occupancy',
-    );
-  }
+  const { capacity: occupancy, currentOccupancy } = capacityState;
 
   // `admin_reviewed` is the legacy spelling of the active state. It is
   // treated as active as well, so repairing an old document cannot count
@@ -313,12 +374,12 @@ export async function addBookingActivation(
         ownerId: request.ownerId,
         tenantId: request.studentId,
         joinRequestId: request.requestId,
-        monthlyRent: Number(request.monthlyRentAtJoin || 0),
+        monthlyRent: request.monthlyRentAtJoin,
         commissionPercentage: options.commissionPercentage,
         commissionAmount,
         status: 'pending',
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
       },
     );
   }
@@ -328,7 +389,7 @@ export async function addBookingActivation(
   // -----------------------------------------------------------------------
   const requestUpdates: Record<string, any> = {
     status: 'adminReviewed',
-    adminReviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+    adminReviewedAt: firestore.FieldValue.serverTimestamp(),
     invoiceId,
     advancePaid: options.advancePaid,
     advanceAmount: options.advanceAmount,
@@ -338,7 +399,7 @@ export async function addBookingActivation(
     advancePaymentStatus: options.advancePaymentStatus,
     platformCutTaken: options.platformCutTaken,
     commissionPercentageAtJoin: options.commissionPercentage,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: firestore.FieldValue.serverTimestamp(),
   };
   if (options.paidAt !== undefined) {
     requestUpdates.advancePaidAt = options.paidAt;
@@ -360,7 +421,7 @@ export async function addBookingActivation(
         occupancy,
         newOccupancy,
       ),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
     });
   }
 

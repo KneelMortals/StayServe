@@ -1,6 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
 
 import '../../../core/constants/enums.dart';
 import '../../../core/utils/app_logger.dart';
@@ -18,6 +20,8 @@ final conversationRepositoryProvider = Provider<ConversationRepository>((ref) {
 
 /// Data access for conversations and their messages.
 class ConversationRepository {
+  static const Uuid _uuid = Uuid();
+
   final FirebaseFirestore _firestore;
   final FirebaseAuth _auth;
   final FunctionsService _functions;
@@ -40,10 +44,12 @@ class ConversationRepository {
         .where('participantIds', arrayContains: uid)
         .orderBy('updatedAt', descending: true)
         .snapshots()
-        .map((snapshot) => snapshot.docs
-            .map((doc) => _parseConversation(doc))
-            .whereType<ConversationModel>()
-            .toList());
+        .map(
+          (snapshot) => snapshot.docs
+              .map((doc) => _parseConversation(doc))
+              .whereType<ConversationModel>()
+              .toList(),
+        );
   }
 
   /// Messages inside a conversation, oldest first.
@@ -54,10 +60,12 @@ class ConversationRepository {
         .collection('messages')
         .orderBy('createdAt', descending: false)
         .snapshots()
-        .map((snapshot) => snapshot.docs
-            .map((doc) => _parseMessage(doc))
-            .whereType<MessageModel>()
-            .toList());
+        .map(
+          (snapshot) => snapshot.docs
+              .map((doc) => _parseMessage(doc))
+              .whereType<MessageModel>()
+              .toList(),
+        );
   }
 
   /// Sends a message inside a conversation.
@@ -72,7 +80,10 @@ class ConversationRepository {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
 
-    final messageId = 'MSG-${DateTime.now().millisecondsSinceEpoch}';
+    // Message ids are random rather than timestamp-only. Two devices can
+    // send in the same millisecond, and a timestamp id made one of those
+    // messages overwrite the other.
+    final messageId = 'MSG-${_uuid.v4()}';
     final now = DateTime.now();
 
     final message = MessageModel(
@@ -87,24 +98,13 @@ class ConversationRepository {
       imageUrl: imageUrl,
     );
 
-    final conversationRef =
-        _firestore.collection('conversations').doc(conversationId);
+    final conversationRef = _firestore
+        .collection('conversations')
+        .doc(conversationId);
 
-    // A conversation that does not exist yet is created first, with both
-    // parties fixed. Afterwards the participant list can never change (the
-    // security rules forbid it).
-    final existingConversation = await conversationRef.get();
-    if (!existingConversation.exists) {
-      await conversationRef.set({
-        'conversationId': conversationId,
-        'participantIds': [uid, receiverId],
-        'lastMessage': '',
-        'lastMessageAt': FieldValue.serverTimestamp(),
-        'createdAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-        'unreadCount': <String, dynamic>{},
-      });
-    }
+    // Conversation creation is server-owned. The server verifies the room
+    // and its owner before it creates the participant list, so this client
+    // can only send into a conversation which already exists.
 
     // The message and the conversation counters are written in one
     // transaction, so the unread counter can never drift away from the
@@ -114,8 +114,9 @@ class ConversationRepository {
       final existing = snapshot.data();
 
       final participants =
-          (existing?['participantIds'] as List<dynamic>?)?.whereType<String>() ??
-              const <String>[];
+          (existing?['participantIds'] as List<dynamic>?)
+              ?.whereType<String>() ??
+          const <String>[];
       if (!participants.contains(uid)) {
         throw Exception('You are not part of this conversation');
       }
@@ -165,9 +166,7 @@ class ConversationRepository {
         parameters: {
           'userId': receiverId,
           'type': 'newMessage',
-          'title': 'New message',
-          'body': content,
-          'data': {'conversationId': conversationId},
+          'data': {'conversationId': conversationId, 'messageId': messageId},
         },
       );
     } catch (e) {
@@ -204,31 +203,33 @@ class ConversationRepository {
     }
   }
 
-  /// Starts (or reuses) a conversation between two users.
+  /// Starts (or reuses) a verified conversation with a room owner.
   Future<String> openConversation(String otherUserId, {String? roomId}) async {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
-
-    final participants = [uid, otherUserId]..sort();
-    final conversationId = participants.join('_');
-
-    final ref = _firestore.collection('conversations').doc(conversationId);
-    final snapshot = await ref.get();
-
-    if (!snapshot.exists) {
-      await ref.set({
-        'conversationId': conversationId,
-        'participantIds': participants,
-        'lastMessage': '',
-        'lastMessageAt': FieldValue.serverTimestamp(),
-        'createdAt': FieldValue.serverTimestamp(),
-        'updatedAt': FieldValue.serverTimestamp(),
-        'roomId': roomId,
-        'unreadCount': <String, dynamic>{},
-      });
+    if (roomId == null || roomId.trim().isEmpty) {
+      throw Exception('The room is required to open a conversation.');
     }
 
-    return conversationId;
+    try {
+      final result = await _functions.callFunction(
+        'openConversation',
+        parameters: {'otherUserId': otherUserId, 'roomId': roomId},
+      );
+      final data = Map<String, dynamic>.from(result.data as Map);
+      final conversationId = data['conversationId'];
+      if (conversationId is! String || conversationId.isEmpty) {
+        throw Exception('The server did not return a conversation id.');
+      }
+      return conversationId;
+    } on FirebaseFunctionsException catch (error) {
+      final message = error.message?.trim();
+      throw Exception(
+        message == null || message.isEmpty
+            ? 'Could not open the conversation'
+            : message,
+      );
+    }
   }
 
   /// The uid of the other participant of a conversation.
@@ -264,14 +265,19 @@ class ConversationRepository {
     }
   }
 
-  ConversationModel? _parseConversation(DocumentSnapshot<Map<String, dynamic>> doc) {
+  ConversationModel? _parseConversation(
+    DocumentSnapshot<Map<String, dynamic>> doc,
+  ) {
     final data = doc.data();
     if (data == null) return null;
     try {
       return ConversationModel.fromJson({
         ...data,
         'conversationId': doc.id,
-        'participants': (data['participantIds'] as List<dynamic>? ?? data['participants'] as List<dynamic>? ?? const []),
+        'participants':
+            (data['participantIds'] as List<dynamic>? ??
+            data['participants'] as List<dynamic>? ??
+            const []),
         'lastMessage': data['lastMessage'] ?? '',
         'lastMessageAt': data['lastMessageAt'],
         'unreadCount': _asIntMap(data['unreadCount']),
@@ -308,7 +314,9 @@ class ConversationRepository {
 
   Map<String, int> _asIntMap(dynamic value) {
     if (value is Map) {
-      return value.map((key, val) => MapEntry(key.toString(), (val as num).toInt()));
+      return value.map(
+        (key, val) => MapEntry(key.toString(), (val as num).toInt()),
+      );
     }
     return {};
   }

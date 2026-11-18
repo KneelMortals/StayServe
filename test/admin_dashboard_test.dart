@@ -11,7 +11,7 @@
 // ("Admin dashboard loaded", "Commission settings", …) that never changed
 // and told the admin nothing.
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -119,8 +119,9 @@ Future<void> _pumpDashboard(
     ProviderScope(
       overrides: [
         adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
-        adminRecentRequestsProvider
-            .overrideWith((ref) => Stream.value(recent ?? _recent)),
+        adminRecentRequestsProvider.overrideWith(
+          (ref) => Stream.value(recent ?? _recent),
+        ),
         unreadNotificationCountProvider.overrideWith((ref) => Stream.value(3)),
       ],
       child: MaterialApp.router(
@@ -181,8 +182,9 @@ void main() {
     expect(find.textContaining('Vikram Singh'), findsOneWidget);
   });
 
-  testWidgets('the recent activity shows the room and the state',
-      (tester) async {
+  testWidgets('the recent activity shows the room and the state', (
+    tester,
+  ) async {
     await _pumpDashboard(tester);
     await _scrollToBottom(tester);
 
@@ -194,8 +196,9 @@ void main() {
     expect(find.text('Rejected'), findsOneWidget);
   });
 
-  testWidgets('the recent activity explains itself when there is none',
-      (tester) async {
+  testWidgets('the recent activity explains itself when there is none', (
+    tester,
+  ) async {
     await _pumpDashboard(tester, recent: const []);
     await _scrollToBottom(tester);
 
@@ -215,8 +218,9 @@ void main() {
     expect(find.text('Users'), findsWidgets);
   });
 
-  testWidgets('the dashboard has no overflow on a narrow phone',
-      (tester) async {
+  testWidgets('the dashboard has no overflow on a narrow phone', (
+    tester,
+  ) async {
     await tester.binding.setSurfaceSize(const Size(320, 1400));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
@@ -235,10 +239,12 @@ void main() {
       ProviderScope(
         overrides: [
           adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
-          adminRecentRequestsProvider
-              .overrideWith((ref) => Stream.value(_recent)),
-          unreadNotificationCountProvider
-              .overrideWith((ref) => Stream.value(3)),
+          adminRecentRequestsProvider.overrideWith(
+            (ref) => Stream.value(_recent),
+          ),
+          unreadNotificationCountProvider.overrideWith(
+            (ref) => Stream.value(3),
+          ),
         ],
         child: MaterialApp.router(
           routerConfig: router,

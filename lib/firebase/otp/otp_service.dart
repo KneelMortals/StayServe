@@ -9,10 +9,13 @@ enum OtpChannel { email, mobile }
 extension OtpChannelX on OtpChannel {
   String get wireValue => name;
 
-  String get label => this == OtpChannel.email ? 'email address' : 'mobile number';
+  String get label =>
+      this == OtpChannel.email ? 'email address' : 'mobile number';
 
   static OtpChannel fromWire(String value) {
-    return value == OtpChannel.mobile.name ? OtpChannel.mobile : OtpChannel.email;
+    return value == OtpChannel.mobile.name
+        ? OtpChannel.mobile
+        : OtpChannel.email;
   }
 }
 
@@ -118,10 +121,17 @@ class OtpService {
   }
 
   /// Claims the role for the signed-in user once their email is verified.
-  Future<void> registerUserRole({required String role}) async {
+  ///
+  /// The [challenge] is the one-time proof returned by [verifyOtp]. The
+  /// server consumes it atomically with the role claim, so a stale or reused
+  /// verification cannot permanently lock the account's role.
+  Future<void> registerUserRole({
+    required String role,
+    required String challenge,
+  }) async {
     await _functions.callFunction(
       'registerUserRole',
-      parameters: {'role': role},
+      parameters: {'role': role, 'challenge': challenge.trim()},
     );
   }
 
@@ -138,7 +148,7 @@ class OtpService {
   /// disabled on the server it is not verified at all; when phone
   /// verification is switched on the server requires a verified number and
   /// rejects this call without one.
-  Future<void> completeRegistration({
+  Future<String> completeRegistration({
     required String name,
     required String role,
     required String challenge,
@@ -147,7 +157,7 @@ class OtpService {
     String? pincode,
   }) async {
     final trimmedPhone = phone?.trim() ?? '';
-    await _functions.callFunction(
+    final result = await _functions.callFunction(
       'completeRegistration',
       parameters: {
         'name': name.trim(),
@@ -158,5 +168,8 @@ class OtpService {
         'pincode': pincode,
       },
     );
+
+    final data = Map<String, dynamic>.from(result.data as Map);
+    return data['role']?.toString() ?? role;
   }
 }

@@ -36,6 +36,7 @@ const TOKENS = {
   bootstrapMissingMarker: jwt({ sub: 'student-bootstrap-missing', user_id: 'student-bootstrap-missing', role: 'student' }),
   bootstrapOldProfile: jwt({ sub: 'student-bootstrap-old', user_id: 'student-bootstrap-old', role: 'student' }),
   bootstrapInactive: jwt({ sub: 'student-bootstrap-inactive', user_id: 'student-bootstrap-inactive', role: 'student' }),
+  bootstrapRoleClaimed: jwt({ sub: 'student-bootstrap-role-claimed', user_id: 'student-bootstrap-role-claimed', role: 'student' }),
   owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner' }),
   admin: jwt({ sub: 'admin1', user_id: 'admin1', role: 'admin', admin: true }),
   // A stale/forged admin claim without a live admin profile must not work.
@@ -121,6 +122,16 @@ function check(label, actual, expectedOk) {
   }
 }
 
+function checkCondition(label, condition) {
+  if (condition) {
+    pass++;
+    console.log(`  PASS  ${label}`);
+  } else {
+    fail++;
+    console.log(`  FAIL  ${label}`);
+  }
+}
+
 function updateMask(fields) {
   return Object.keys(fields)
     .map((field) => `updateMask.fieldPaths=${encodeURIComponent(field)}`)
@@ -163,6 +174,16 @@ function double(value) {
 
 function array(values) {
   return { arrayValue: { values: values.map(string) } };
+}
+
+function mixedArray(values) {
+  return {
+    arrayValue: {
+      values: values.map((value) =>
+        typeof value === 'string' ? string(value) : integer(value),
+      ),
+    },
+  };
 }
 
 function map(values) {
@@ -218,6 +239,7 @@ async function seedRoom(id = 'room1', ownerId = 'owner1') {
       genderPreference: string('any'),
       images: array([]),
       status: string('available'),
+      listingGeneration: string(`server-generation-${id}`),
       createdAt: timestamp(),
       updatedAt: timestamp(),
       latitude: double(12.9716),
@@ -241,6 +263,11 @@ async function seed() {
       legacyCutoff: timestamp(cutoff.toISOString()),
     },
   });
+  // The exact-location compatibility switch starts closed. The staged
+  // migration may open it temporarily while old app versions are retired.
+  await call('owner', 'PATCH', '/system/locationPrivacy', {
+    fields: { allowClientExactLocationWrites: bool(false) },
+  });
 
   await seedUser('student1');
   await seedUser('student2');
@@ -260,6 +287,65 @@ async function seed() {
   });
 
   await seedRoom();
+  await seedRoom('room-private-missing');
+  await seedRoom('room-private-mismatch');
+  await seedRoom('room-deleting');
+
+  // The server reserves a deleted room id until its old Storage objects and
+  // reviews have really been removed. The client cannot write the tombstone,
+  // but its existence must block a new listing with the same id.
+  await call('owner', 'PATCH', '/roomDeletionTombstones/room-reserved', {
+    fields: {
+      type: string('roomDeletionTombstone'),
+      roomId: string('room-reserved'),
+      ownerId: string('owner1'),
+      listingGeneration: string('server-generation-old'),
+      deletionOperationId: string('operation-old'),
+      createdAt: timestamp(),
+    },
+  });
+  await call('owner', 'PATCH', '/roomDeletionTombstones/room-admin-tombstone', {
+    fields: {
+      type: string('roomDeletionTombstone'),
+      roomId: string('room-admin-tombstone'),
+      ownerId: string('owner1'),
+      listingGeneration: string('server-generation-old'),
+      deletionOperationId: string('operation-old'),
+      createdAt: timestamp(),
+    },
+  });
+  await call(
+    'owner',
+    'PATCH',
+    '/rooms/room-deleting?updateMask.fieldPaths=deletionInProgress',
+    {
+      fields: { deletionInProgress: bool(true) },
+    },
+  );
+  await create('owner', 'roomPrivate', 'room1', {
+    roomId: string('room1'),
+    ownerId: string('owner1'),
+    address: string('Test Street'),
+    city: string('Bengaluru'),
+    state: string('Karnataka'),
+    pincode: string('560001'),
+    latitude: double(12.9716),
+    longitude: double(77.5946),
+    updatedAt: timestamp(),
+  });
+  await create('owner', 'roomPrivate', 'room-private-mismatch', {
+    roomId: string('room-private-mismatch'),
+    // Deliberately corrupt. The public listing owner is canonical and the
+    // account named here must not gain access to the exact location.
+    ownerId: string('someoneelse'),
+    address: string('Mismatched Owner Street'),
+    city: string('Bengaluru'),
+    state: string('Karnataka'),
+    pincode: string('560001'),
+    latitude: double(12.9716),
+    longitude: double(77.5946),
+    updatedAt: timestamp(),
+  });
 
   // This room has two server-owned occupants.  It is used to verify that
   // an owner cannot reduce the advertised capacity below that count.
@@ -377,6 +463,15 @@ async function seed() {
       createdAt: timestamp(),
       updatedAt: timestamp(),
       unreadCount: map({ student1: integer(0), owner1: integer(0) }),
+    },
+  });
+  await call('owner', 'PATCH', '/conversations/conv-deleting', {
+    fields: {
+      conversationId: string('conv-deleting'),
+      participantIds: array(['student1', 'owner1']),
+      createdAt: timestamp(),
+      updatedAt: timestamp(),
+      deletionInProgress: bool(true),
     },
   });
   await call('owner', 'PATCH', '/conversations/conv1/messages/msg1', {
@@ -557,6 +652,18 @@ async function main() {
     true,
   );
   check(
+    'a client cannot mark its own role as already claimed',
+    await create(TOKENS.bootstrapRoleClaimed, 'users', 'student-bootstrap-role-claimed', {
+      uid: string('student-bootstrap-role-claimed'),
+      name: string('Student'),
+      role: string('student'),
+      roleClaimed: bool(true),
+      isActive: bool(true),
+      registrationCompleted: bool(false),
+    }),
+    false,
+  );
+  check(
     'student can bootstrap without the marker but it is not a live account',
     await create(TOKENS.bootstrapMissingMarker, 'users', 'student-bootstrap-missing', {
       uid: string('student-bootstrap-missing'),
@@ -616,6 +723,13 @@ async function main() {
   check(
     'student cannot promote their own profile to admin',
     await update(TOKENS.student, 'users', 'student1', { role: string('admin') }),
+    false,
+  );
+  check(
+    'student cannot mark their own role as already claimed',
+    await update(TOKENS.student, 'users', 'student1', {
+      roleClaimed: bool(true),
+    }),
     false,
   );
   await call('owner', 'PATCH', '/users/student1?updateMask.fieldPaths=registrationCompleted', {
@@ -711,11 +825,34 @@ async function main() {
 
   console.log('\n--- rooms: live owner, immutable ownership, server-owned state ---');
   check(
+    'an anonymous caller cannot read a room',
+    await callAnon('GET', '/rooms/room1'),
+    false,
+  );
+  check(
+    'an anonymous caller cannot list rooms',
+    await callAnon('GET', '/rooms'),
+    false,
+  );
+  check(
+    'a live student can read a room and its image URLs',
+    await call(TOKENS.student, 'GET', '/rooms/room1'),
+    true,
+  );
+  check(
+    'a signed-in stranger cannot edit another owner room',
+    await update(TOKENS.stranger, 'rooms', 'room1', {
+      title: string('Hijacked room'),
+    }),
+    false,
+  );
+  check(
     'live owner can create a room without server-owned state fields',
     await create(TOKENS.owner, 'rooms', 'owner-room', {
       roomId: string('owner-room'),
       ownerId: string('owner1'),
       title: string('New room'),
+      monthlyRent: double(10000),
       occupancy: integer(2),
       createdAt: timestamp(),
     }),
@@ -727,12 +864,253 @@ async function main() {
       roomId: string('owner-room-with-state'),
       ownerId: string('owner1'),
       title: string('New room with state'),
+      monthlyRent: double(10000),
       occupancy: integer(2),
       status: string('available'),
       currentOccupancy: integer(0),
       createdAt: timestamp(),
     }),
     true,
+  );
+  check(
+    'live owner cannot create a room with a forged photo-cleanup lock',
+    await create(TOKENS.owner, 'rooms', 'owner-room-forged-cleanup-lock', {
+      roomId: string('owner-room-forged-cleanup-lock'),
+      ownerId: string('owner1'),
+      title: string('Forged cleanup lock room'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      photoCleanupLock: map({
+        token: string('forged-lock'),
+        expiresAt: timestamp(),
+      }),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a room with a forged listing generation',
+    await create(TOKENS.owner, 'rooms', 'owner-room-forged-generation', {
+      roomId: string('owner-room-forged-generation'),
+      ownerId: string('owner1'),
+      title: string('Forged generation room'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      listingGeneration: string('client-chosen-generation'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot change the server-owned listing generation',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      listingGeneration: string('replacement-generation'),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a listing which reuses a deleted room id',
+    await create(TOKENS.owner, 'rooms', 'room-reserved', {
+      roomId: string('room-reserved'),
+      ownerId: string('owner1'),
+      title: string('Reused reserved room id'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot edit a listing while its deletion marker is active',
+    await update(TOKENS.owner, 'rooms', 'room-deleting', {
+      title: string('Edit during deletion'),
+    }),
+    false,
+  );
+
+  // Once the durable cleanup has removed the server-owned tombstone, the id
+  // may be used by a new listing generation.
+  await call('owner', 'DELETE', '/roomDeletionTombstones/room-reserved');
+  check(
+    'the room id can be reused after its cleanup tombstone is removed',
+    await create(TOKENS.owner, 'rooms', 'room-reserved', {
+      roomId: string('room-reserved'),
+      ownerId: string('owner1'),
+      title: string('Reused room after cleanup'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+
+  check(
+    'live owner can create a room with coarse public location data',
+    await create(TOKENS.owner, 'rooms', 'owner-room-coarse-location', {
+      roomId: string('owner-room-coarse-location'),
+      ownerId: string('owner1'),
+      title: string('Coarse location room'),
+      monthlyRent: double(10000),
+      location: map({
+        city: string('Bengaluru'),
+        state: string('Karnataka'),
+      }),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+  check(
+    'live owner cannot create a room with a string location',
+    await create(TOKENS.owner, 'rooms', 'owner-room-string-location', {
+      roomId: string('owner-room-string-location'),
+      ownerId: string('owner1'),
+      title: string('String location room'),
+      location: string('42 Exact Street, Bengaluru 560001'),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a room with a numeric location',
+    await create(TOKENS.owner, 'rooms', 'owner-room-number-location', {
+      roomId: string('owner-room-number-location'),
+      ownerId: string('owner1'),
+      title: string('Numeric location room'),
+      location: double(12.9716),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a room with a null location',
+    await create(TOKENS.owner, 'rooms', 'owner-room-null-location', {
+      roomId: string('owner-room-null-location'),
+      ownerId: string('owner1'),
+      title: string('Null location room'),
+      location: { nullValue: null },
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a room with an exact public address',
+    await create(TOKENS.owner, 'rooms', 'owner-room-exact-location', {
+      roomId: string('owner-room-exact-location'),
+      ownerId: string('owner1'),
+      title: string('Exact location room'),
+      location: map({
+        address: string('12 Exact Street'),
+        city: string('Bengaluru'),
+        state: string('Karnataka'),
+        pincode: string('560001'),
+      }),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+
+  // Old app versions may still write the exact location during the
+  // compatibility window. The server-owned switch is the only way to allow
+  // that write, and clients cannot read or change the switch themselves.
+  await update('owner', 'system', 'locationPrivacy', {
+    allowClientExactLocationWrites: bool(true),
+  });
+  check(
+    'the transitional switch permits a legacy exact-location create',
+    await create(TOKENS.owner, 'rooms', 'owner-room-legacy-location', {
+      roomId: string('owner-room-legacy-location'),
+      ownerId: string('owner1'),
+      title: string('Legacy exact location room'),
+      monthlyRent: double(10000),
+      location: map({
+        address: string('12 Exact Street'),
+        city: string('Bengaluru'),
+        state: string('Karnataka'),
+        pincode: string('560001'),
+      }),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+  check(
+    'the transitional switch still rejects a non-map public location',
+    await create(TOKENS.owner, 'rooms', 'owner-room-legacy-string-location', {
+      roomId: string('owner-room-legacy-string-location'),
+      ownerId: string('owner1'),
+      title: string('Legacy string location room'),
+      location: string('42 Exact Street, Bengaluru 560001'),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+
+  // The durable finalization latch is stronger than the transitional switch.
+  // Even if a stale operator or deployment tries to reopen the switch, a
+  // legacy exact-field create must remain rejected after finalization.
+  await update('owner', 'system', 'locationPrivacy', {
+    allowClientExactLocationWrites: bool(true),
+    finalized: bool(true),
+  });
+  check(
+    'the finalization latch rejects a legacy exact-location create',
+    await create(TOKENS.owner, 'rooms', 'owner-room-latched-location', {
+      roomId: string('owner-room-latched-location'),
+      ownerId: string('owner1'),
+      title: string('Latched exact location room'),
+      location: map({
+        address: string('12 Exact Street'),
+        city: string('Bengaluru'),
+        state: string('Karnataka'),
+        pincode: string('560001'),
+      }),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+
+  await update('owner', 'system', 'locationPrivacy', {
+    allowClientExactLocationWrites: bool(false),
+    finalized: bool(false),
+  });
+  check(
+    'closing the transitional switch rejects exact-location creates again',
+    await create(TOKENS.owner, 'rooms', 'owner-room-exact-location-2', {
+      roomId: string('owner-room-exact-location-2'),
+      ownerId: string('owner1'),
+      title: string('Rejected exact location room'),
+      location: map({
+        address: string('12 Exact Street'),
+        city: string('Bengaluru'),
+        state: string('Karnataka'),
+        pincode: string('560001'),
+      }),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a room with a malformed image list',
+    await create(TOKENS.owner, 'rooms', 'owner-room-invalid-images', {
+      roomId: string('owner-room-invalid-images'),
+      ownerId: string('owner1'),
+      title: string('New room with invalid images'),
+      occupancy: integer(2),
+      images: mixedArray([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom.jpg?alt=media&token=abc',
+        42,
+      ]),
+      createdAt: timestamp(),
+    }),
+    false,
   );
   check(
     'owner cannot create a room that already has tenants',
@@ -782,6 +1160,79 @@ async function main() {
     false,
   );
   check(
+    'owner cannot create a room without a monthly rent',
+    await create(TOKENS.owner, 'rooms', 'missing-rent-room', {
+      roomId: string('missing-rent-room'),
+      ownerId: string('owner1'),
+      title: string('Missing rent'),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'owner cannot create a room with a rent below the lower limit',
+    await create(TOKENS.owner, 'rooms', 'low-rent-room', {
+      roomId: string('low-rent-room'),
+      ownerId: string('owner1'),
+      title: string('Low rent'),
+      monthlyRent: double(999),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'owner cannot create a room with a numeric-string rent',
+    await create(TOKENS.owner, 'rooms', 'string-rent-room', {
+      roomId: string('string-rent-room'),
+      ownerId: string('owner1'),
+      title: string('String rent'),
+      monthlyRent: string('5000'),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'owner cannot create a room with a fractional capacity',
+    await create(TOKENS.owner, 'rooms', 'fractional-capacity-room', {
+      roomId: string('fractional-capacity-room'),
+      ownerId: string('owner1'),
+      title: string('Fractional capacity'),
+      monthlyRent: double(5000),
+      occupancy: double(1.5),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'owner cannot create a room with a capacity above the limit',
+    await create(TOKENS.owner, 'rooms', 'oversized-capacity-room', {
+      roomId: string('oversized-capacity-room'),
+      ownerId: string('owner1'),
+      title: string('Oversized capacity'),
+      monthlyRent: double(5000),
+      occupancy: integer(21),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'owner cannot change a valid rent to an invalid value',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      monthlyRent: double(1000001),
+    }),
+    false,
+  );
+  check(
+    'owner cannot change a valid capacity to a fractional value',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      occupancy: double(1.5),
+    }),
+    false,
+  );
+  check(
     'a live student cannot create a room',
     await create(TOKENS.student, 'rooms', 'student-room', {
       roomId: string('student-room'),
@@ -822,12 +1273,72 @@ async function main() {
       monthlyRent: double(12000),
       securityDeposit: double(6000),
       amenities: array(['Wi-Fi', 'Power backup']),
-      images: array(['https://example.test/room.jpg']),
+      images: array([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom.jpg?alt=media&token=abc',
+      ]),
       occupancy: integer(3),
       homeName: string('Updated home'),
       updatedAt: timestamp(),
     }),
     true,
+  );
+  check(
+    'owner cannot replace the public room location directly',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      location: map({
+        city: string('Bengaluru'),
+        state: string('Karnataka'),
+      }),
+    }),
+    false,
+  );
+  check(
+    'owner cannot forge a server-owned public geo cell',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      geoCell: string('12.97,77.59'),
+    }),
+    false,
+  );
+  check(
+    'owner can publish a list of room image URLs',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: array([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom-1.jpg?alt=media&token=one',
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom-2.jpg?alt=media&token=two',
+        'https://storage.googleapis.com/demo.appspot.com/rooms/owner1/room1/room-3.jpg',
+      ]),
+    }),
+    true,
+  );
+  check(
+    'owner cannot publish an image URL from an unrelated host',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: array(['https://tracker.example/room.jpg']),
+    }),
+    false,
+  );
+  check(
+    'owner cannot publish a malformed room image list',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: mixedArray([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom.jpg?alt=media&token=abc',
+        42,
+      ]),
+    }),
+    false,
+  );
+  check(
+    'owner cannot publish more than ten room images',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: array(
+        Array.from(
+          { length: 11 },
+          (_, index) =>
+            `https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2F${index}.jpg?alt=media&token=${index}`,
+        ),
+      ),
+    }),
+    false,
   );
   check(
     'owner cannot change currentOccupancy',
@@ -894,6 +1405,127 @@ async function main() {
       occupancy: integer(3),
     }),
     true,
+  );
+
+  await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=role', {
+    fields: { role: string('student') },
+  });
+  check(
+    'an owner demoted to student cannot keep editing with an old token',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      title: string('Stale owner write'),
+    }),
+    false,
+  );
+  await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=role', {
+    fields: { role: string('owner') },
+  });
+
+  await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=isActive', {
+    fields: { isActive: bool(false) },
+  });
+  check(
+    'an inactive owner cannot edit a room',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      title: string('Inactive owner write'),
+    }),
+    false,
+  );
+  await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=isActive', {
+    fields: { isActive: bool(true) },
+  });
+
+  console.log('\n--- private room locations are owner/admin-readable and server-written ---');
+  check(
+    'the listing owner can read their own private location',
+    await readAllowed(TOKENS.owner, '/roomPrivate/room1'),
+    true,
+  );
+  check(
+    'the listing owner can read a missing private location during migration',
+    await readAllowed(TOKENS.owner, '/roomPrivate/room-private-missing'),
+    true,
+  );
+  check(
+    'the listing owner can recover a private location with a corrupt owner id',
+    await readAllowed(TOKENS.owner, '/roomPrivate/room-private-mismatch'),
+    true,
+  );
+  check(
+    'a corrupt private owner id does not grant another account access',
+    await readAllowed(TOKENS.stranger, '/roomPrivate/room-private-mismatch'),
+    false,
+  );
+  check(
+    'a student cannot read a missing private location directly',
+    await readAllowed(TOKENS.student, '/roomPrivate/room-private-missing'),
+    false,
+  );
+  check(
+    'a client cannot list the private-location collection',
+    await call(TOKENS.owner, 'GET', '/roomPrivate'),
+    false,
+  );
+  check(
+    'a corrupt private owner id does not grant collection access',
+    await call(TOKENS.stranger, 'GET', '/roomPrivate'),
+    false,
+  );
+  check(
+    'a live administrator can list private locations for support work',
+    await call(TOKENS.admin, 'GET', '/roomPrivate'),
+    true,
+  );
+  check(
+    'a live administrator can read a private location for support work',
+    await readAllowed(TOKENS.admin, '/roomPrivate/room1'),
+    true,
+  );
+  check(
+    'a student cannot read a private room location directly',
+    await readAllowed(TOKENS.student, '/roomPrivate/room1'),
+    false,
+  );
+  check(
+    'a signed-in stranger cannot read a private room location',
+    await readAllowed(TOKENS.stranger, '/roomPrivate/room1'),
+    false,
+  );
+  check(
+    'the listing owner cannot write the private location directly',
+    await update(TOKENS.owner, 'roomPrivate', 'room1', {
+      address: string('Client-written address'),
+    }),
+    false,
+  );
+  check(
+    'an administrator cannot write the private location directly',
+    await update(TOKENS.admin, 'roomPrivate', 'room1', {
+      address: string('Client-written address'),
+    }),
+    false,
+  );
+  check(
+    'a client cannot create a private room location',
+    await create(TOKENS.owner, 'roomPrivate', 'client-room-private', {
+      roomId: string('client-room-private'),
+      ownerId: string('owner1'),
+      address: string('Client-written address'),
+      city: string('Bengaluru'),
+      state: string('Karnataka'),
+      pincode: string('560001'),
+    }),
+    false,
+  );
+  check(
+    'a client cannot delete a private room location',
+    await call(TOKENS.owner, 'DELETE', '/roomPrivate/room1'),
+    false,
+  );
+  check(
+    'clients cannot read the exact-location compatibility switch',
+    await readAllowed(TOKENS.student, '/system/locationPrivacy'),
+    false,
   );
 
   console.log('\n--- notifications are server-owned except read bookkeeping ---');
@@ -982,6 +1614,26 @@ async function main() {
     true,
   );
   check(
+    'a participant cannot send a message while the conversation is being deleted',
+    await create(TOKENS.student, 'conversations/conv-deleting/messages', 'msg-late', {
+      messageId: string('msg-late'),
+      conversationId: string('conv-deleting'),
+      senderId: string('student1'),
+      receiverId: string('owner1'),
+      content: string('Too late'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot update a conversation while it is being deleted',
+    await update(TOKENS.owner, 'conversations', 'conv-deleting', {
+      lastMessage: string('Still here'),
+    }),
+    false,
+  );
+  check(
     'a sender cannot forge the receiver of a message',
     await create(TOKENS.student, 'conversations/conv1/messages', 'msg-forged-receiver', {
       messageId: string('msg-forged-receiver'),
@@ -1041,14 +1693,14 @@ async function main() {
     false,
   );
   check(
-    'a client can create a legitimate two-party conversation',
+    'a client cannot create even a plausible conversation (the server owns creation)',
     await create(TOKENS.student, 'conversations', 'conv-legit', {
       conversationId: string('conv-legit'),
       participantIds: array(['student1', 'owner1']),
       lastMessage: string(''),
       createdAt: timestamp(),
     }),
-    true,
+    false,
   );
   check(
     'a participant cannot add a third party to an existing conversation',
@@ -1081,6 +1733,42 @@ async function main() {
     'student cannot update a join request',
     await update(TOKENS.student, 'joinRequests', 'JRQ-TEST-1', {
       status: string('cancelled'),
+    }),
+    false,
+  );
+  check(
+    'owner cannot create a join request',
+    await create(TOKENS.owner, 'joinRequests', 'JRQ-OWNER-CLIENT', {
+      requestId: string('JRQ-OWNER-CLIENT'),
+      roomId: string('room1'),
+      studentId: string('student1'),
+      ownerId: string('owner1'),
+      status: string('pending'),
+    }),
+    false,
+  );
+  check(
+    'admin cannot create a join request',
+    await create(TOKENS.admin, 'joinRequests', 'JRQ-ADMIN-CLIENT', {
+      requestId: string('JRQ-ADMIN-CLIENT'),
+      roomId: string('room1'),
+      studentId: string('student1'),
+      ownerId: string('owner1'),
+      status: string('pending'),
+    }),
+    false,
+  );
+  check(
+    'owner cannot update a join request',
+    await update(TOKENS.owner, 'joinRequests', 'JRQ-TEST-1', {
+      status: string('rejected'),
+    }),
+    false,
+  );
+  check(
+    'admin cannot update a join request',
+    await update(TOKENS.admin, 'joinRequests', 'JRQ-TEST-1', {
+      status: string('rejected'),
     }),
     false,
   );
@@ -1209,6 +1897,108 @@ async function main() {
     await call(TOKENS.stranger, 'GET', '/joinRequests/JRQ-TEST-1'),
     false,
   );
+
+  // The relationship helpers use the caller's live role, not only the role
+  // copied into an already-issued token.
+  await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=role', {
+    fields: { role: string('student') },
+  });
+  check(
+    'a demoted owner cannot read owner-side join-request data',
+    await call(TOKENS.owner, 'GET', '/joinRequests/JRQ-TEST-1'),
+    false,
+  );
+  await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=role', {
+    fields: { role: string('owner') },
+  });
+
+  await call('owner', 'PATCH', '/users/student1?updateMask.fieldPaths=role', {
+    fields: { role: string('owner') },
+  });
+  check(
+    'a demoted student cannot read tenant-side join-request data',
+    await call(TOKENS.student, 'GET', '/joinRequests/JRQ-TEST-1'),
+    false,
+  );
+  await call('owner', 'PATCH', '/users/student1?updateMask.fieldPaths=role', {
+    fields: { role: string('student') },
+  });
+
+  check(
+    'a client cannot create a room-deletion tombstone',
+    await create(TOKENS.owner, 'roomDeletionTombstones', 'client-tombstone', {
+      roomId: string('client-tombstone'),
+      ownerId: string('owner1'),
+    }),
+    false,
+  );
+  check(
+    'a client cannot update a room-deletion tombstone',
+    await update(TOKENS.owner, 'roomDeletionTombstones', 'room-admin-tombstone', {
+      listingGeneration: string('client-generation'),
+    }),
+    false,
+  );
+  check(
+    'a client cannot delete a room-deletion tombstone',
+    await call(
+      TOKENS.owner,
+      'DELETE',
+      '/roomDeletionTombstones/room-admin-tombstone',
+    ),
+    false,
+  );
+  check(
+    'a live administrator can read a room-deletion tombstone',
+    await call(TOKENS.admin, 'GET', '/roomDeletionTombstones/room-admin-tombstone'),
+    true,
+  );
+  check(
+    'a client cannot read a role-claim publication job',
+    await call(TOKENS.student, 'GET', '/roleClaimJobs/student1'),
+    false,
+  );
+  check(
+    'a client admin cannot write a role-claim publication job',
+    await create(TOKENS.admin, 'roleClaimJobs', 'client-role-job', {
+      uid: string('student1'),
+      type: string('roleClaimPublication'),
+      status: string('pending'),
+    }),
+    false,
+  );
+  check(
+    'a client cannot read server-owned cleanup jobs',
+    await call(TOKENS.student, 'GET', '/cleanupJobs/job-1'),
+    false,
+  );
+  check(
+    'a client admin cannot read server-owned cleanup jobs',
+    await call(TOKENS.admin, 'GET', '/cleanupJobs/job-1'),
+    false,
+  );
+  check(
+    'a client cannot read an account-deletion job',
+    await call(TOKENS.student, 'GET', '/accountDeletionJobs/job-1'),
+    false,
+  );
+  const accountDeletionJobWrite = await create(
+    TOKENS.admin,
+    'accountDeletionJobs',
+    'job-1',
+    {
+      uid: string('student1'),
+      status: string('pending'),
+    },
+  );
+  checkCondition(
+    'a client admin cannot write an account-deletion job',
+    accountDeletionJobWrite.status === 403 &&
+      String(accountDeletionJobWrite.body?.error?.status || '').includes(
+        'PERMISSION_DENIED',
+      ),
+  );
+
   check(
     'student can list their own notifications with the app query',
     await filteredList(TOKENS.student, 'notifications', 'userId', 'student1'),

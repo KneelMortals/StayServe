@@ -62,3 +62,4 @@ app.*.map.json
 !/functions/.env.example
 /android/build/
 devtools_options.yaml
+node_modules

@@ -1,18 +1,40 @@
-import * as functions from 'firebase-functions';
-import * as admin from 'firebase-admin';
+import * as functions from 'firebase-functions/v1';
+import { callableHttps } from './appCheck';
+import * as firestore from 'firebase-admin/firestore';
 import * as crypto from 'crypto';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-import { areNotificationsEnabled, platformFeeFor, resolveAgreedTerms, resolveFeePayer, resolveFeePercentage, PLATFORM_UPI_NAME, PLATFORM_UPI_VPA } from './platform';
-import { paymentAlreadyMade } from './bookingAccess';
+import {
+  areNotificationsEnabled,
+  platformFeeFor,
+  resolveAgreedTerms,
+  resolveAgreedTermsFromData,
+  PLATFORM_UPI_NAME,
+  PLATFORM_UPI_VPA,
+} from './platform';
+import {
+  canActAsRoomOwner,
+  canBookAsStudent,
+  hasValidBookingParties,
+  paymentAlreadyMade,
+} from './bookingAccess';
 import { isActiveBookingStatus } from './bookings';
+import {
+  decideRoomBookingEligibility,
+  isValidMonthlyRent,
+  roomBookingRejectionMessage,
+} from './roomValidation';
 import { assertActiveAccount } from './accounts';
-import { notify as pushNotification, pushToDevice } from './notifications';
+import {
+  notificationRecipientAllows,
+  notify as pushNotification,
+  pushToDevice,
+} from './notifications';
 
-const db = admin.firestore();
+const db = firestore.getFirestore();
 
 /**
  * Booking requests (join requests).
@@ -78,7 +100,7 @@ async function notify(
  * The room is read on the server, so the owner and the rent are the ones the
  * owner actually published. The client cannot negotiate them.
  */
-export const createJoinRequest = functions.https.onCall(async (data, context) => {
+export const createJoinRequest = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -89,9 +111,8 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
     throw new functions.https.HttpsError('invalid-argument', 'Missing room');
   }
 
-  await assertActiveAccount(uid);
-
   const roomRef = db.collection('rooms').doc(roomId);
+  const studentRef = db.collection('users').doc(uid);
 
   // Only one open request per student and room.
   const existing = await db
@@ -122,9 +143,6 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
       'You already live in this room',
     );
   }
-
-  const percentage = await resolveFeePercentage();
-  const payer = await resolveFeePayer();
 
   // ---------------------------------------------------------------------
   // The id of the request.
@@ -162,8 +180,29 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
   let createdOwnerId = '';
   let createdRoomTitle = '';
   let createdMonthlyRent = 0;
+  let percentage = 0;
+  let payer: 'student' | 'owner' = 'owner';
 
   await db.runTransaction(async (transaction) => {
+    // The student's live profile is read in the same transaction as the
+    // request. This is the authoritative student-only check: a role change
+    // and a booking request cannot both commit from contradictory profile
+    // versions.
+    const studentSnapshot = await transaction.get(studentRef);
+    if (
+      !canBookAsStudent({
+        exists: studentSnapshot.exists,
+        registrationCompleted: studentSnapshot.get('registrationCompleted'),
+        isActive: studentSnapshot.get('isActive'),
+        role: studentSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Only active student accounts can book rooms.',
+      );
+    }
+
     // The room is read **inside** the transaction that creates the request.
     // A room deletion marks the listing inactive in the same way, so the two
     // operations cannot race: either the request is created first and the
@@ -178,7 +217,7 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
     }
 
     const room = roomSnapshot.data() as Record<string, any>;
-    const ownerId = String(room.ownerId || '');
+    const ownerId = String(room.ownerId || '').trim();
     if (!ownerId) {
       throw new functions.https.HttpsError(
         'failed-precondition',
@@ -192,25 +231,54 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
       );
     }
 
-    const roomStatus = String(room.status || 'available');
-    const isAvailable =
-      room.isAvailable !== false &&
-      roomStatus === 'available' &&
-      room.deletionInProgress !== true;
-    if (!isAvailable) {
+    // The owner profile is read in the same transaction as the request. A
+    // demoted, banned or deleting owner therefore cannot gain a new request
+    // after their live authority was removed.
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(ownerId),
+    );
+    if (
+      !canActAsRoomOwner({
+        exists: ownerSnapshot.exists,
+        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+        isActive: ownerSnapshot.get('isActive'),
+        role: ownerSnapshot.get('role'),
+      })
+    ) {
       throw new functions.https.HttpsError(
-        'failed-precondition',
-        'That room is not available',
+        'permission-denied',
+        'This room is not available for booking.',
       );
     }
 
-    const monthlyRent = Number(room.monthlyRent || 0);
-    if (!monthlyRent || monthlyRent <= 0) {
+    const eligibility = decideRoomBookingEligibility(room, ownerId);
+    if (!eligibility.allowed) {
       throw new functions.https.HttpsError(
         'failed-precondition',
-        'The rent for this room is not set',
+        roomBookingRejectionMessage(eligibility.reason),
       );
     }
+
+    const monthlyRent = room.monthlyRent;
+    if (!isValidMonthlyRent(monthlyRent)) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The rent for this room is not valid',
+      );
+    }
+
+    // Both fee terms come from one settings snapshot. A percentage and a
+    // payer from two different configuration versions can never be written
+    // to the same request.
+    const settingsSnapshot = await transaction.get(
+      db.collection('settings').doc('platform'),
+    );
+    const agreedTerms = resolveAgreedTermsFromData(
+      {},
+      settingsSnapshot.data() as Record<string, any> | undefined,
+    );
+    percentage = agreedTerms.percentage;
+    payer = agreedTerms.payer;
 
     const lockSnapshot = await transaction.get(lockRef);
 
@@ -243,7 +311,7 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
       studentId: uid,
       roomId,
       requestId,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
     });
 
     transaction.create(db.collection('joinRequests').doc(requestId), {
@@ -252,8 +320,8 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
       studentId: uid,
       ownerId,
       status: 'pending',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
       monthlyRentAtJoin: monthlyRent,
       commissionPercentageAtJoin: percentage,
       // The platform takes its cut **once**, on the first payment of this
@@ -346,7 +414,7 @@ export const createJoinRequest = functions.https.onCall(async (data, context) =>
  * though the student had walked away. With the transaction one of the two
  * wins and the other one is refused.
  */
-export const respondToJoinRequest = functions.https.onCall(async (data, context) => {
+export const respondToJoinRequest = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -384,6 +452,27 @@ export const respondToJoinRequest = functions.https.onCall(async (data, context)
       );
     }
 
+    // The caller's live owner role is read in the same transaction as the
+    // request. A role change therefore cannot race with an approval: either
+    // the approval sees the old owner role and commits first, or the role
+    // change commits first and the approval is refused.
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    if (
+      !canActAsRoomOwner({
+        exists: ownerSnapshot.exists,
+        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+        isActive: ownerSnapshot.get('isActive'),
+        role: ownerSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Only a live owner account can approve or decline this request.',
+      );
+    }
+
     const status = String(request.status || '');
     if (approve) {
       if (status !== 'pending') {
@@ -409,16 +498,79 @@ export const respondToJoinRequest = functions.https.onCall(async (data, context)
       );
     }
 
+    if (approve) {
+      if (!hasValidBookingParties(request)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This request does not have a valid student tenant.',
+        );
+      }
+      const studentId = String(request.studentId || '');
+      const roomId = String(request.roomId || '').trim();
+      if (!isValidMonthlyRent(request.monthlyRentAtJoin)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The agreed rent for this request is not valid.',
+        );
+      }
+
+      const tenantSnapshot = await transaction.get(
+        db.collection('users').doc(studentId),
+      );
+      if (
+        !canBookAsStudent({
+          exists: tenantSnapshot.exists,
+          registrationCompleted: tenantSnapshot.get('registrationCompleted'),
+          isActive: tenantSnapshot.get('isActive'),
+          role: tenantSnapshot.get('role'),
+        })
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'The student can no longer book this room.',
+        );
+      }
+
+      // The listing is revalidated in the approval transaction. A request
+      // which was created while the room was available cannot be approved
+      // after the owner took it off the market or filled its last slot.
+      if (!roomId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This request does not identify a room.',
+        );
+      }
+      const roomSnapshot = await transaction.get(
+        db.collection('rooms').doc(roomId),
+      );
+      if (!roomSnapshot.exists) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'That room no longer exists',
+        );
+      }
+      const eligibility = decideRoomBookingEligibility(
+        roomSnapshot.data() as Record<string, any>,
+        String(request.ownerId || '').trim(),
+      );
+      if (!eligibility.allowed) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          roomBookingRejectionMessage(eligibility.reason),
+        );
+      }
+    }
+
     const updates: Record<string, any> = {
       status: approve ? 'ownerConfirmed' : 'rejected',
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
     };
 
     if (approve) {
-      updates.ownerConfirmedAt = admin.firestore.FieldValue.serverTimestamp();
+      updates.ownerConfirmedAt = firestore.FieldValue.serverTimestamp();
     } else {
       updates.rejectionReason = reason;
-      updates.rejectedAt = admin.firestore.FieldValue.serverTimestamp();
+      updates.rejectedAt = firestore.FieldValue.serverTimestamp();
     }
 
     transaction.update(ref, updates);
@@ -479,7 +631,7 @@ export const respondToJoinRequest = functions.https.onCall(async (data, context)
  * request — so a cancellation that happens at the same moment cannot be
  * overwritten by this confirmation.
  */
-export const confirmJoinAsStudent = functions.https.onCall(async (data, context) => {
+export const confirmJoinAsStudent = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -511,6 +663,31 @@ export const confirmJoinAsStudent = functions.https.onCall(async (data, context)
         'This booking request belongs to somebody else',
       );
     }
+
+    if (!hasValidBookingParties(request)) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This request does not have a valid student tenant.',
+      );
+    }
+
+    const tenantSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    if (
+      !canBookAsStudent({
+        exists: tenantSnapshot.exists,
+        registrationCompleted: tenantSnapshot.get('registrationCompleted'),
+        isActive: tenantSnapshot.get('isActive'),
+        role: tenantSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Only active student accounts can confirm bookings.',
+      );
+    }
+
     if (String(request.status || '') !== 'ownerConfirmed') {
       throw new functions.https.HttpsError(
         'failed-precondition',
@@ -518,10 +695,59 @@ export const confirmJoinAsStudent = functions.https.onCall(async (data, context)
       );
     }
 
+    const ownerId = String(request.ownerId || '').trim();
+    const roomId = String(request.roomId || '').trim();
+    if (!ownerId || !roomId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This request does not identify a complete booking.',
+      );
+    }
+
+    // Both the owner profile and the listing are checked in the same
+    // transaction as the confirmation. A deleted owner, a demoted owner or
+    // an unavailable room cannot become payable through a stale request.
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(ownerId),
+    );
+    if (
+      !canActAsRoomOwner({
+        exists: ownerSnapshot.exists,
+        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+        isActive: ownerSnapshot.get('isActive'),
+        role: ownerSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The room owner can no longer accept this booking.',
+      );
+    }
+
+    const roomSnapshot = await transaction.get(
+      db.collection('rooms').doc(roomId),
+    );
+    if (!roomSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'That room no longer exists',
+      );
+    }
+    const eligibility = decideRoomBookingEligibility(
+      roomSnapshot.data() as Record<string, any>,
+      ownerId,
+    );
+    if (!eligibility.allowed) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        roomBookingRejectionMessage(eligibility.reason),
+      );
+    }
+
     transaction.update(ref, {
       status: 'studentConfirmed',
-      studentConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      studentConfirmedAt: firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
     });
 
     return request;
@@ -562,7 +788,7 @@ export const confirmJoinAsStudent = functions.https.onCall(async (data, context)
  * that was recorded — the room would keep the slot and the platform would
  * have taken the money for a booking that does not exist.
  */
-export const cancelJoinRequest = functions.https.onCall(async (data, context) => {
+export const cancelJoinRequest = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -596,6 +822,37 @@ export const cancelJoinRequest = functions.https.onCall(async (data, context) =>
       throw new functions.https.HttpsError(
         'permission-denied',
         'This booking request belongs to somebody else',
+      );
+    }
+
+    // Each party has to keep the live role for the side of the booking it
+    // is cancelling. In particular, an owner whose role was changed may not
+    // cancel an owner-side request with an old token. The profile is read in
+    // this transaction so a concurrent role change is serialized with the
+    // cancellation.
+    const callerSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    const callerIsOwner = data.ownerId === uid;
+    const callerMayCancel = callerIsOwner
+      ? canActAsRoomOwner({
+          exists: callerSnapshot.exists,
+          registrationCompleted: callerSnapshot.get('registrationCompleted'),
+          isActive: callerSnapshot.get('isActive'),
+          role: callerSnapshot.get('role'),
+        })
+      : canBookAsStudent({
+          exists: callerSnapshot.exists,
+          registrationCompleted: callerSnapshot.get('registrationCompleted'),
+          isActive: callerSnapshot.get('isActive'),
+          role: callerSnapshot.get('role'),
+        });
+    if (!callerMayCancel) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        callerIsOwner
+          ? 'Only a live owner account can cancel an owner-side booking.'
+          : 'Only a live student account can cancel a student-side booking.',
       );
     }
 
@@ -636,10 +893,10 @@ export const cancelJoinRequest = functions.https.onCall(async (data, context) =>
 
     transaction.update(ref, {
       status: 'cancelled',
-      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      cancelledAt: firestore.FieldValue.serverTimestamp(),
       cancelledBy: uid,
       cancellationReason: reason,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
     });
 
     return data;
@@ -674,45 +931,176 @@ export const cancelJoinRequest = functions.https.onCall(async (data, context) =>
 });
 
 /**
- * Whether two users really are the two parties of a booking.
- *
- * The chat notification may only be sent to somebody who is on the other
- * side of a **booking** with the sender. Without this check a user could
- * create a conversation with any other user (the rules allow a user to
- * create a conversation they are part of) and then push a notification with
- * a title and a body of their own choosing into the list of that user — and
- * onto their phone.
+ * Whether two users are the two parties of a booking inside a transaction.
  */
-async function hasBookingRelationship(
+async function hasBookingRelationshipInTransaction(
+  transaction: firestore.Transaction,
   a: string,
   b: string,
 ): Promise<boolean> {
-  const asStudent = await db
-    .collection('joinRequests')
-    .where('studentId', '==', a)
-    .where('ownerId', '==', b)
-    .limit(1)
-    .get();
+  const asStudent = await transaction.get(
+    db
+      .collection('joinRequests')
+      .where('studentId', '==', a)
+      .where('ownerId', '==', b)
+      .limit(1),
+  );
   if (!asStudent.empty) return true;
 
-  const asOwner = await db
-    .collection('joinRequests')
-    .where('studentId', '==', b)
-    .where('ownerId', '==', a)
-    .limit(1)
-    .get();
+  const asOwner = await transaction.get(
+    db
+      .collection('joinRequests')
+      .where('studentId', '==', b)
+      .where('ownerId', '==', a)
+      .limit(1),
+  );
   return !asOwner.empty;
 }
 
 /**
- * Writes a notification for another user.
+ * Opens a verified student-to-owner conversation for a room.
  *
- * The only kind of notification a client may push is a chat message, and
- * only to somebody who really is the other participant of that very
- * conversation. Everything else (payment updates, request updates) is
- * written by the server itself.
+ * Conversation creation is server-owned. The client cannot put an arbitrary
+ * uid into a new participant list and start a conversation with it. The
+ * other participant must really be the owner of the room which the student
+ * is viewing.
  */
-export const notifyUser = functions.https.onCall(async (data, context) => {
+export const openConversation = callableHttps.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
+  }
+
+  const uid = context.auth.uid;
+  const otherUserId = String(data?.otherUserId || '').trim();
+  const roomId = String(data?.roomId || '').trim();
+  if (!otherUserId || !roomId) {
+    throw new functions.https.HttpsError(
+      'invalid-argument',
+      'Missing conversation participant or room',
+    );
+  }
+  if (otherUserId === uid) {
+    throw new functions.https.HttpsError(
+      'invalid-argument',
+      'You cannot start a conversation with yourself',
+    );
+  }
+
+  await assertActiveAccount(uid);
+
+  const participants = [uid, otherUserId].sort();
+  const conversationId = participants.join('_');
+  const conversationRef = db.collection('conversations').doc(conversationId);
+  const roomRef = db.collection('rooms').doc(roomId);
+  const userRef = db.collection('users').doc(uid);
+
+  await db.runTransaction(async (transaction) => {
+    const roomSnapshot = await transaction.get(roomRef);
+    const userSnapshot = await transaction.get(userRef);
+
+    if (!roomSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That room no longer exists',
+      );
+    }
+    if (
+      !canBookAsStudent({
+        exists: userSnapshot.exists,
+        registrationCompleted: userSnapshot.get('registrationCompleted'),
+        isActive: userSnapshot.get('isActive'),
+        role: userSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Only a live student account can start a room conversation.',
+      );
+    }
+
+    const roomOwnerId = String(roomSnapshot.get('ownerId') || '').trim();
+    if (!roomOwnerId || roomOwnerId !== otherUserId) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'A room conversation may only be opened with the owner of that room.',
+      );
+    }
+
+    // The owner must still be a live owner. This also closes the account
+    // deletion race: the deletion fence marks the profile inactive before the
+    // conversation cleanup starts, so no new conversation with that account
+    // can appear after the cleanup scan.
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(roomOwnerId),
+    );
+    if (
+      !canActAsRoomOwner({
+        exists: ownerSnapshot.exists,
+        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+        isActive: ownerSnapshot.get('isActive'),
+        role: ownerSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The owner account is not available for a conversation.',
+      );
+    }
+
+    const conversationSnapshot = await transaction.get(conversationRef);
+    if (conversationSnapshot.get('deletionInProgress') === true) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This conversation is being closed.',
+      );
+    }
+
+    if (conversationSnapshot.exists) {
+      const existing = Array.from(
+        new Set(
+          (conversationSnapshot.get('participantIds') || []) as string[],
+        ),
+      ).sort();
+      if (
+        existing.length !== 2 ||
+        existing[0] !== participants[0] ||
+        existing[1] !== participants[1]
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This conversation belongs to different participants.',
+        );
+      }
+      return;
+    }
+
+    transaction.set(conversationRef, {
+      conversationId,
+      participantIds: participants,
+      roomId,
+      createdByServer: true,
+      lastMessage: '',
+      lastMessageAt: firestore.FieldValue.serverTimestamp(),
+      createdAt: firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+      unreadCount: {},
+    });
+  });
+
+  return { success: true, conversationId };
+});
+
+/**
+ * Writes the notification for one chat message.
+ *
+ * A client may not choose notification text or create an arbitrary number
+ * of notifications. It names the exact message which it just sent; the
+ * server reads that message, verifies its sender and recipient, derives the
+ * title and body from the stored content, and writes one deterministic
+ * notification. Calling the function again for the same message is
+ * idempotent.
+ */
+export const notifyUser = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -720,13 +1108,9 @@ export const notifyUser = functions.https.onCall(async (data, context) => {
   const uid = context.auth.uid;
   const recipientId = String(data?.userId || '').trim();
   const type = String(data?.type || '').trim();
-  const title = String(data?.title || '').trim();
-  const body = String(data?.body || '').trim();
   const payload = (data?.data && typeof data.data === 'object'
     ? data.data
     : {}) as Record<string, unknown>;
-
-  await assertActiveAccount(uid);
 
   if (!recipientId) {
     throw new functions.https.HttpsError('invalid-argument', 'Missing recipient');
@@ -743,75 +1127,179 @@ export const notifyUser = functions.https.onCall(async (data, context) => {
       'Only chat notifications may be sent by a client',
     );
   }
-  if (!title || title.length > 120 || !body || body.length > 1000) {
-    throw new functions.https.HttpsError('invalid-argument', 'Invalid message');
-  }
 
   const conversationId = String(payload.conversationId || '').trim();
-  if (!conversationId) {
-    throw new functions.https.HttpsError('invalid-argument', 'Missing conversation');
-  }
-
-  const conversationSnapshot = await db
-    .collection('conversations')
-    .doc(conversationId)
-    .get();
-  if (!conversationSnapshot.exists) {
-    throw new functions.https.HttpsError('not-found', 'Unknown conversation');
-  }
-
-  const participants = (conversationSnapshot.get('participantIds') ||
-    []) as string[];
-  const uniqueParticipants = Array.from(new Set(participants));
-  const otherParticipant =
-    uniqueParticipants.length === 2
-      ? uniqueParticipants.find((participant) => participant !== uid)
-      : undefined;
-
-  if (
-    uniqueParticipants.length !== 2 ||
-    !uniqueParticipants.includes(uid) ||
-    otherParticipant !== recipientId
-  ) {
+  const messageId = String(payload.messageId || '').trim();
+  if (!conversationId || !messageId) {
     throw new functions.https.HttpsError(
-      'permission-denied',
-      'You can only notify the other participant of a conversation',
+      'invalid-argument',
+      'Missing chat message',
     );
   }
-
-  // The conversation alone is not enough: the user may **create** a
-  // conversation with anybody (the rules allow that), so the two parties
-  // have to be the two sides of a real booking as well.
-  if (!(await hasBookingRelationship(uid, recipientId))) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'You can only message somebody you have a booking with',
-    );
+  if (conversationId.length > 512 || messageId.length > 512) {
+    throw new functions.https.HttpsError('invalid-argument', 'Invalid chat message');
   }
 
-  await db.collection('notifications').add({
-    userId: recipientId,
-    title,
-    body,
-    type,
-    data: { conversationId },
-    read: false,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  // The deterministic id makes the notification idempotent. One sent
+  // message can therefore create at most one notification, no matter how
+  // often the client retries the callable.
+  const notificationId = `chat-${crypto
+    .createHash('sha256')
+    .update(`${conversationId}:${messageId}`)
+    .digest('hex')}`;
+  const notificationRef = db.collection('notifications').doc(notificationId);
+
+  const notification = await db.runTransaction(async (transaction) => {
+    // The live actor, recipient, conversation, exact message and existing
+    // notification are checked in one transaction. A ban, deletion fence or
+    // conversation cleanup which commits first therefore rejects the late
+    // notification.
+    const actorSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    if (
+      !actorSnapshot.exists ||
+      actorSnapshot.get('registrationCompleted') !== true ||
+      actorSnapshot.get('isActive') !== true
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'This account is not allowed to send notifications.',
+      );
+    }
+
+    const recipientSnapshot = await transaction.get(
+      db.collection('users').doc(recipientId),
+    );
+    if (!notificationRecipientAllows(recipientSnapshot, type)) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The recipient is no longer available for notifications.',
+      );
+    }
+
+    const conversationSnapshot = await transaction.get(
+      db.collection('conversations').doc(conversationId),
+    );
+    if (!conversationSnapshot.exists) {
+      throw new functions.https.HttpsError('not-found', 'Unknown conversation');
+    }
+    if (conversationSnapshot.get('deletionInProgress') === true) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This conversation is being closed.',
+      );
+    }
+
+    const participants = (conversationSnapshot.get('participantIds') ||
+      []) as string[];
+    const uniqueParticipants = Array.from(new Set(participants));
+    const otherParticipant =
+      uniqueParticipants.length === 2
+        ? uniqueParticipants.find((participant) => participant !== uid)
+        : undefined;
+
+    if (
+      uniqueParticipants.length !== 2 ||
+      !uniqueParticipants.includes(uid) ||
+      otherParticipant !== recipientId
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'You can only notify the other participant of a conversation',
+      );
+    }
+
+    // New conversations are created by the server after it verifies the room
+    // and its owner. Legacy conversations do not carry that marker, so their
+    // parties still have to be the two sides of a real booking.
+    const serverVerifiedConversation =
+      conversationSnapshot.get('createdByServer') === true;
+    if (
+      !serverVerifiedConversation &&
+      !(await hasBookingRelationshipInTransaction(
+        transaction,
+        uid,
+        recipientId,
+      ))
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'You can only message the other participant of an authorized conversation.',
+      );
+    }
+
+    const messageSnapshot = await transaction.get(
+      db
+        .collection('conversations')
+        .doc(conversationId)
+        .collection('messages')
+        .doc(messageId),
+    );
+    if (!messageSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That chat message no longer exists',
+      );
+    }
+
+    const message = messageSnapshot.data() as Record<string, any>;
+    if (
+      String(message.senderId || '') !== uid ||
+      String(message.receiverId || '') !== recipientId ||
+      String(message.conversationId || '') !== conversationId
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'You can only notify somebody about a message which you sent to them.',
+      );
+    }
+
+    const existingNotification = await transaction.get(notificationRef);
+    if (existingNotification.exists) {
+      return { created: false, title: '', body: '' };
+    }
+
+    // The notification text is derived from the stored message. The client
+    // cannot replace it with arbitrary text or use the callable as a general
+    // notification sender.
+    const messageType = String(message.type || 'text').trim().toLowerCase();
+    const storedContent = String(message.content || '').trim();
+    let title = 'New message';
+    let body = storedContent;
+    if (messageType === 'image') {
+      title = 'New photo';
+      if (!body) body = 'A photo was sent.';
+    } else if (messageType === 'contactshare') {
+      title = 'New contact';
+      if (!body) body = 'A contact was shared.';
+    }
+    if (!body) body = 'A new message was sent.';
+    if (body.length > 1000) body = `${body.substring(0, 999)}…`;
+
+    transaction.set(notificationRef, {
+      userId: recipientId,
+      title,
+      body,
+      type,
+      data: { conversationId, messageId },
+      read: false,
+      createdAt: firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { created: true, title, body };
   });
 
-  // The message is also **pushed** to the device.
-  //
-  // The callable used to write the in-app notification only: the recipient
-  // saw the message in the app, but nothing happened when the app was
-  // closed — no push, no sound, nothing. The push is safe here: the
-  // function has just checked that the recipient really is the other
-  // participant of this very conversation.
-  await pushToDevice(
-    recipientId,
-    title,
-    body.length > 1000 ? `${body.substring(0, 1000)}…` : body,
-    { conversationId, type },
-  );
+  // The message is also **pushed** to the device. The push happens only
+  // when the one deterministic in-app notification was really created.
+  if (notification.created) {
+    await pushToDevice(
+      recipientId,
+      notification.title,
+      notification.body,
+      { conversationId, messageId, type },
+    );
+  }
 
-  return { success: true };
+  return { success: true, created: notification.created };
 });

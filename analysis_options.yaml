@@ -12,6 +12,8 @@ include: package:flutter_lints/flutter.yaml
 analyzer:
   exclude:
     - build/**
+    - node_modules/**
+    - functions/node_modules/**
     - "**/*.g.dart"
     - "**/*.freezed.dart"
     - ios/Pods/**

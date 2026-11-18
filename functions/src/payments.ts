@@ -1,5 +1,6 @@
-import * as functions from 'firebase-functions';
-import * as admin from 'firebase-admin';
+import * as functions from 'firebase-functions/v1';
+import { callableHttps } from './appCheck';
+import * as firestore from 'firebase-admin/firestore';
 import * as crypto from 'crypto';
 
 // Creates the default Firebase app before this module opens Firestore —
@@ -11,14 +12,15 @@ import {
   PLATFORM_UPI_NAME,
   PLATFORM_UPI_VPA,
   areNotificationsEnabled,
+  isValidFeePercentage,
   platformFeeFor,
-  resolveAgreedTerms,
+  resolveAgreedTermsFromData,
   resolveFeePayer,
   resolveFeePercentage,
 } from './platform';
 import {
   addBookingActivation,
-  bookingStatusAfterRejectedPayment,
+  rejectedPaymentBookingStatus,
   buildPaymentSubmissionRecord,
   buildPaymentSubmissionRequestUpdates,
   commissionFor,
@@ -27,10 +29,25 @@ import {
   INVOICE_PREFIX,
   ActivatableRequest,
 } from './bookings';
-import { assertActiveAccount, assertLiveAdmin } from './accounts';
+import {
+  assertActiveAccount,
+  assertLiveAdmin,
+  canActAsAdmin,
+} from './accounts';
+import {
+  canActAsRoomOwner,
+  canBookAsStudent,
+  hasValidBookingParties,
+  paymentMatchesBookingRequest,
+} from './bookingAccess';
+import {
+  decideRoomBookingEligibility,
+  isValidMonthlyRent,
+  roomBookingRejectionMessage,
+} from './roomValidation';
 import { notify } from './notifications';
 
-const db = admin.firestore();
+const db = firestore.getFirestore();
 
 /**
  * Platform-fee payments.
@@ -59,6 +76,15 @@ const db = admin.firestore();
 
 const VALID_METHODS = ['upi', 'bank_transfer', 'card'];
 
+/**
+ * Parses a numeric Firestore value without accepting `null` or an empty
+ * string as zero. Money and percentage fields are integrity-sensitive: a
+ * missing value must be rejected rather than silently treated as a waiver.
+ */
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 export { PLATFORM_FEE_PERCENTAGE, platformFeeFor, resolveFeePercentage };
 
 /**
@@ -77,21 +103,10 @@ export { PLATFORM_FEE_PERCENTAGE, platformFeeFor, resolveFeePercentage };
  * of a room while a request is waiting, and then the UPI intent, the
  * payment record and the invoice would ask for three different amounts.
  */
-async function resolveMonthlyRent(request: Record<string, any>): Promise<number> {
-  const agreed = Number(request.monthlyRentAtJoin || 0);
-  if (agreed > 0) return agreed;
-
-  const roomId = String(request.roomId || '');
-  if (roomId) {
-    try {
-      const roomSnapshot = await db.collection('rooms').doc(roomId).get();
-      const roomRent = Number(roomSnapshot.get('monthlyRent') || 0);
-      if (roomRent > 0) return roomRent;
-    } catch (error) {
-      console.error('Failed to read the room rent:', error);
-    }
-  }
-  return agreed;
+function monthlyRentFromData(request: Record<string, any>): number {
+  return isValidMonthlyRent(request.monthlyRentAtJoin)
+    ? request.monthlyRentAtJoin
+    : 0;
 }
 
 /**
@@ -194,18 +209,6 @@ async function notifyUser(
   await notify(userId, title, body, type, data);
 }
 
-async function loadJoinRequest(requestId: string) {
-  const ref = db.collection('joinRequests').doc(requestId);
-  const snapshot = await ref.get();
-  if (!snapshot.exists) {
-    throw new functions.https.HttpsError(
-      'not-found',
-      'That booking request no longer exists',
-    );
-  }
-  return { ref, snapshot, data: snapshot.data() as Record<string, any> };
-}
-
 /**
  * Builds the UPI intent for a booking.
  *
@@ -231,164 +234,233 @@ async function loadJoinRequest(requestId: string) {
  * the **student** gets it. The other side only sees an explanation of who
  * has to pay.
  */
-export const createUpiPayment = functions.https.onCall(async (data, context) => {
+export const createUpiPayment = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
 
-  const requestId = String(data?.joinRequestId || '');
+  const callerUid = context.auth.uid;
+  const requestId = String(data?.joinRequestId || '').trim();
   if (!requestId) {
     throw new functions.https.HttpsError('invalid-argument', 'Missing booking request');
   }
 
-  await assertActiveAccount(context.auth.uid);
+  await assertActiveAccount(callerUid);
 
-  const { data: request } = await loadJoinRequest(requestId);
+  const requestRef = db.collection('joinRequests').doc(requestId);
 
-  const isStudent = request.studentId === context.auth.uid;
-  const isOwner = request.ownerId === context.auth.uid;
-  if (!isStudent && !isOwner) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'This booking request belongs to somebody else',
+  // The request, both live party profiles and the room are read from one
+  // transaction snapshot. A role change, an account-deletion fence or a
+  // listing-status change therefore cannot race with the creation of a
+  // payable UPI intent.
+  return db.runTransaction(async (transaction) => {
+    const requestSnapshot = await transaction.get(requestRef);
+    if (!requestSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That booking request no longer exists',
+      );
+    }
+
+    const request = requestSnapshot.data() as Record<string, any>;
+    const studentId = String(request.studentId || '').trim();
+    const ownerId = String(request.ownerId || '').trim();
+    const roomId = String(request.roomId || '').trim();
+
+    if (!hasValidBookingParties(request) || !roomId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This request does not identify a valid booking.',
+      );
+    }
+
+    const isStudent = studentId === callerUid;
+    const isOwner = ownerId === callerUid;
+    if (!isStudent && !isOwner) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'This booking request belongs to somebody else',
+      );
+    }
+
+    const studentSnapshot = await transaction.get(
+      db.collection('users').doc(studentId),
     );
-  }
-
-  // ---------------------------------------------------------------------
-  // The cut has already been taken — this booking has been paid for once.
-  //
-  // From now on everything goes straight from the student to the room
-  // owner; the platform does not take a percentage of the rent any more.
-  //
-  // This is checked **before** the status, so a stale client gets the
-  // explanation instead of a confusing "the owner has to approve your
-  // request" error for a booking that is already active.
-  // ---------------------------------------------------------------------
-  if (request.platformCutTaken === true) {
-    return {
-      alreadySettled: true,
-      youPay: false,
-      studentPays: false,
-      payer: 'none',
-      amount: 0,
-      feePercentage: 0,
-      payeeVpa: PLATFORM_UPI_VPA,
-      payeeName: PLATFORM_UPI_NAME,
-      transactionRef: '',
-      uri: '',
-      message:
-        'The platform fee for this booking has already been paid. The rent ' +
-        'is settled directly with the room owner.',
-    };
-  }
-
-  const status = String(request.status || '');
-  if (status !== 'studentConfirmed') {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'The student has to confirm the request before you can pay',
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(ownerId),
     );
-  }
 
-  const monthlyRent = await resolveMonthlyRent(request);
-  if (!monthlyRent || monthlyRent <= 0) {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'The rent for this request is not set',
+    if (
+      !canBookAsStudent({
+        exists: studentSnapshot.exists,
+        registrationCompleted: studentSnapshot.get('registrationCompleted'),
+        isActive: studentSnapshot.get('isActive'),
+        role: studentSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The student can no longer pay for this booking.',
+      );
+    }
+    if (
+      !canActAsRoomOwner({
+        exists: ownerSnapshot.exists,
+        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+        isActive: ownerSnapshot.get('isActive'),
+        role: ownerSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The room owner can no longer take payment for this booking.',
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // The cut has already been taken — this booking has been paid for once.
+    // From now on everything goes straight from the student to the room
+    // owner. This acknowledgement remains available even if the listing has
+    // since been taken off the market.
+    // ---------------------------------------------------------------------
+    if (request.platformCutTaken === true) {
+      return {
+        alreadySettled: true,
+        youPay: false,
+        studentPays: false,
+        payer: 'none',
+        amount: 0,
+        feePercentage: 0,
+        payeeVpa: PLATFORM_UPI_VPA,
+        payeeName: PLATFORM_UPI_NAME,
+        transactionRef: '',
+        uri: '',
+        message:
+          'The platform fee for this booking has already been paid. The rent ' +
+          'is settled directly with the room owner.',
+      };
+    }
+
+    const status = String(request.status || '');
+    if (status !== 'studentConfirmed') {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The student has to confirm the request before you can pay',
+      );
+    }
+
+    const roomRef = db.collection('rooms').doc(roomId);
+    const roomSnapshot = await transaction.get(roomRef);
+    if (!roomSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'That room no longer exists',
+      );
+    }
+
+    const room = roomSnapshot.data() as Record<string, any>;
+    const eligibility = decideRoomBookingEligibility(room, ownerId);
+    if (!eligibility.allowed) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        roomBookingRejectionMessage(eligibility.reason),
+      );
+    }
+
+    const monthlyRent = monthlyRentFromData(request);
+    if (!monthlyRent) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The agreed rent for this request is not valid',
+      );
+    }
+
+    // The amount is derived from the rent that was agreed when the request
+    // was made — never from the current room rent or from client input.
+    const snapshotPercentage = request.commissionPercentageAtJoin;
+    const snapshotPayer = String(request.platformFeePayer || '');
+    const needsSettings =
+      !isValidFeePercentage(snapshotPercentage) ||
+      (snapshotPayer !== 'student' && snapshotPayer !== 'owner');
+    const settingsSnapshot = needsSettings
+      ? await transaction.get(db.collection('settings').doc('platform'))
+      : null;
+    const { percentage, payer } = resolveAgreedTermsFromData(
+      request,
+      settingsSnapshot
+        ? (settingsSnapshot.data() as Record<string, any> | undefined)
+        : undefined,
     );
-  }
+    const amount = platformFeeFor(monthlyRent, percentage);
 
-  // The amount is derived from the rent that was agreed when the request was
-  // made — never from anything the client sent, and never from a rent the
-  // owner may have changed in the meantime.
-  const { percentage, payer } = await resolveAgreedTerms(request);
-  const amount = platformFeeFor(monthlyRent, percentage);
+    // A zero percentage is the only waived fee. A positive percentage which
+    // rounds to zero is rejected by `platformFeeFor` instead of silently
+    // becoming a free booking.
+    if (percentage === 0) {
+      return {
+        alreadySettled: false,
+        feeWaived: true,
+        youPay: false,
+        studentPays: false,
+        payer: 'none',
+        amount: 0,
+        feePercentage: percentage,
+        payeeVpa: PLATFORM_UPI_VPA,
+        payeeName: PLATFORM_UPI_NAME,
+        transactionRef: '',
+        uri: '',
+        message:
+          'No platform fee is due for this booking. Submit it for admin ' +
+          'verification without a transaction reference.',
+      };
+    }
 
-  // ---------------------------------------------------------------------
-  // The fee is **waived** — the admin has set the percentage to 0 %.
-  //
-  // There is nothing to pay, so there is no UPI intent and no transaction
-  // reference either: the booking can be submitted for admin verification
-  // without a payment. The old code still asked for a UPI link of ₹0 and
-  // then demanded a reference of at least four characters — a booking that
-  // could never be completed.
-  // ---------------------------------------------------------------------
-  if (amount <= 0) {
+    const callerPays = payer === 'owner' ? isOwner : isStudent;
+    if (!callerPays) {
+      return {
+        alreadySettled: false,
+        youPay: false,
+        studentPays: payer === 'student',
+        payer,
+        amount,
+        feePercentage: percentage,
+        payeeVpa: PLATFORM_UPI_VPA,
+        payeeName: PLATFORM_UPI_NAME,
+        transactionRef: '',
+        uri: '',
+        message:
+          payer === 'owner'
+            ? `The ${percentage}% StayServe platform fee ` +
+              `(₹${amount}) is paid by the room owner. You only pay the rent ` +
+              'directly with the owner.'
+            : `The ${percentage}% StayServe platform fee ` +
+              `(₹${amount}) is paid by the student. You only pay the rent ` +
+              'directly with the student.',
+      };
+    }
+
+    const transactionRef = `SS${requestId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}`;
+
     return {
       alreadySettled: false,
-      feeWaived: true,
-      youPay: false,
-      studentPays: false,
-      payer: 'none',
-      amount: 0,
-      feePercentage: percentage,
-      payeeVpa: PLATFORM_UPI_VPA,
-      payeeName: PLATFORM_UPI_NAME,
-      transactionRef: '',
-      uri: '',
-      message:
-        'No platform fee is due for this booking. Submit it for admin ' +
-        'verification without a transaction reference.',
-    };
-  }
-
-  // ---------------------------------------------------------------------
-  // Does *this* caller have to pay?
-  //
-  // The setting names the party that settles the fee. The owner and the
-  // student each get the pay option on their own side — the sheet shows
-  // the real UPI button to the party that has to pay and only an
-  // explanation to the other one.
-  // ---------------------------------------------------------------------
-  const callerPays = payer === 'owner' ? isOwner : isStudent;
-
-  if (!callerPays) {
-    return {
-      alreadySettled: false,
-      youPay: false,
+      youPay: true,
       studentPays: payer === 'student',
       payer,
+      uri: buildUpiUri({
+        payeeVpa: PLATFORM_UPI_VPA,
+        payeeName: PLATFORM_UPI_NAME,
+        amount,
+        transactionRef,
+        transactionNote: `StayServe fee ${requestId}`,
+      }),
       amount,
       feePercentage: percentage,
       payeeVpa: PLATFORM_UPI_VPA,
       payeeName: PLATFORM_UPI_NAME,
-      transactionRef: '',
-      uri: '',
-      message:
-        payer === 'owner'
-          ? `The ${percentage}% StayServe platform fee ` +
-            `(₹${amount}) is paid by the room owner. You only pay the rent ` +
-            'directly to the owner.'
-          : `The ${percentage}% StayServe platform fee ` +
-            `(₹${amount}) is paid by the student. You only pay the rent ` +
-            'directly to the student.',
-    };
-  }
-
-  const transactionRef = `SS${requestId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}`;
-
-  return {
-    alreadySettled: false,
-    youPay: true,
-    studentPays: payer === 'student',
-    payer,
-    uri: buildUpiUri({
-      payeeVpa: PLATFORM_UPI_VPA,
-      payeeName: PLATFORM_UPI_NAME,
-      amount,
       transactionRef,
-      // The note has to stay **below 50 characters** — the UPI apps refuse
-      // everything that is longer. The whole request id does not fit next
-      // to the explanation, so only the id itself is used.
-      transactionNote: `StayServe fee ${requestId}`,
-    }),
-    amount,
-    feePercentage: percentage,
-    payeeVpa: PLATFORM_UPI_VPA,
-    payeeName: PLATFORM_UPI_NAME,
-    transactionRef,
-    message: '',
-  };
+      message: '',
+    };
+  });
 });
 
 /**
@@ -402,11 +474,12 @@ export const createUpiPayment = functions.https.onCall(async (data, context) => 
  *
  * A rejection by the admin restores the payable state — see [verifyPayment].
  */
-export const submitPayment = functions.https.onCall(async (data, context) => {
+export const submitPayment = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
 
+  const callerUid = context.auth.uid;
   const requestId = String(data?.requestId || '');
   const reference = String(data?.reference || '').trim();
   const method = String(data?.method || 'upi');
@@ -418,126 +491,24 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError('invalid-argument', 'Unsupported payment method');
   }
 
-  const { ref, data: request } = await loadJoinRequest(requestId);
+  await assertActiveAccount(callerUid);
 
-  await assertActiveAccount(context.auth.uid);
-
-  // ---------------------------------------------------------------------
-  // Who has to settle the platform fee?
-  //
-  // The party is the one that was agreed when the request was made — the
-  // admin can switch the setting, but a booking that is already waiting for
-  // its payment keeps the terms it was made with.
-  // ---------------------------------------------------------------------
-  const { percentage, payer } = await resolveAgreedTerms(request);
-  const isStudent = request.studentId === context.auth.uid;
-  const isOwner = request.ownerId === context.auth.uid;
-
-  // ---------------------------------------------------------------------
-  // A **waived** fee (0 %) needs no money and no transaction reference.
-  //
-  // The reference is only checked when there is something to pay — with a
-  // waived fee there is no UPI transfer, so there is no reference to enter.
-  // ---------------------------------------------------------------------
-  const feeWaived = percentage === 0;
-  if (!feeWaived && reference.length < 4) {
-    throw new functions.https.HttpsError(
-      'invalid-argument',
-      'Enter the transaction reference from your UPI app',
-    );
-  }
-
-  // With a waived fee nobody has to pay, so both parties may confirm the
-  // booking.
-  if (!feeWaived && payer === 'owner' && !isOwner) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'The platform fee for this booking is paid by the room owner',
-    );
-  }
-  if (!feeWaived && payer === 'student' && !isStudent) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'The platform fee for this booking is paid by the student',
-    );
-  }
-
-  if (request.status !== 'studentConfirmed') {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'The student has to confirm the request before you can pay',
-    );
-  }
-
-  // The cut is taken only once — a second payment for the same booking is
-  // never accepted.
-  if (request.platformCutTaken === true) {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'The platform fee for this booking has already been paid',
-    );
-  }
-
+  const ref = db.collection('joinRequests').doc(requestId);
   const paymentRef = db.collection('payments').doc(requestId);
-
-  // ---------------------------------------------------------------------
-  // A transaction reference may only be used **once**.
-  //
-  // The check used to be a plain query ("has anybody else used this
-  // reference?"). That check has a race: two different bookings can submit
-  // the *same* reference at the same moment, and both queries run before
-  // either payment is written — so both bookings would be activated with one
-  // and the same UPI transaction.
-  //
-  // The reference is therefore locked by a **deterministic document**: the
-  // id of the lock is the hash of the reference, and the document is
-  // *created* inside the transaction. Firestore guarantees that only one
-  // transaction can create a document with a given id — the second one
-  // fails and is retried, and then it finds the lock and refuses the
-  // payment.
-  // ---------------------------------------------------------------------
-  const referenceKey = crypto
-    .createHash('sha256')
-    .update(
-      feeWaived
-        ? `waived:${requestId}`
-        : reference.toLowerCase(),
-    )
-    .digest('hex');
-  const referenceLockRef = db.collection('paymentReferences').doc(referenceKey);
-
-  const monthlyRent = await resolveMonthlyRent(request);
-  const amount = platformFeeFor(monthlyRent, percentage);
-  const submissionDetails = {
-    requestId,
-    studentId: request.studentId,
-    ownerId: request.ownerId,
-    roomId: request.roomId,
-    amount,
-    feePercentage: percentage,
-    reference,
-    method,
-    payer,
-    feeWaived,
-    payeeVpa: PLATFORM_UPI_VPA,
-  };
 
   // ---------------------------------------------------------------------
   // Everything happens in **one** transaction, so the payment record and the
   // request can never drift apart.
   //
-  // A transaction (and not a plain batch) is what makes the payment safe
-  // against a cancellation that happens at the very same moment: the
-  // transaction re-reads the request, and it fails if somebody else changed
-  // it in the meantime.
+  // The terms, identities, rent and amount are all derived from the request
+  // snapshot read by this transaction. A preliminary read outside the
+  // transaction may be stale by the time the payment is committed; using it
+  // could record an old amount, payer or tenant in the payment document.
   // ---------------------------------------------------------------------
-  await db.runTransaction(async (transaction) => {
+  const submissionDetails = await db.runTransaction(async (transaction) => {
     // Every read happens before the first write — a transaction may not read
     // a document it has already written.
     const requestSnapshot = await transaction.get(ref);
-    const paymentSnapshot = await transaction.get(paymentRef);
-    const referenceLockSnapshot = await transaction.get(referenceLockRef);
-
     if (!requestSnapshot.exists) {
       throw new functions.https.HttpsError(
         'not-found',
@@ -547,6 +518,167 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
 
     const fresh = requestSnapshot.data() as Record<string, any>;
     const freshStatus = String(fresh.status || '');
+    const studentId = String(fresh.studentId || '');
+    const ownerId = String(fresh.ownerId || '');
+    const roomId = String(fresh.roomId || '');
+
+    if (!hasValidBookingParties(fresh)) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This request does not have a valid student tenant.',
+      );
+    }
+    if (!roomId.trim()) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This request does not identify a room.',
+      );
+    }
+
+    const tenantSnapshot = await transaction.get(
+      db.collection('users').doc(studentId),
+    );
+    if (
+      !canBookAsStudent({
+        exists: tenantSnapshot.exists,
+        registrationCompleted: tenantSnapshot.get('registrationCompleted'),
+        isActive: tenantSnapshot.get('isActive'),
+        role: tenantSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The student can no longer pay for this booking.',
+      );
+    }
+
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(ownerId),
+    );
+    if (
+      !canActAsRoomOwner({
+        exists: ownerSnapshot.exists,
+        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+        isActive: ownerSnapshot.get('isActive'),
+        role: ownerSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The room owner can no longer take payment for this booking.',
+      );
+    }
+
+    const paymentSnapshot = await transaction.get(paymentRef);
+    if (paymentSnapshot.exists) {
+      const existingPaymentStatus = String(
+        paymentSnapshot.get('status') || '',
+      );
+      if (existingPaymentStatus === 'verified') {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This payment has already been verified',
+        );
+      }
+      if (existingPaymentStatus === 'submitted') {
+        // A submitted reference is the payment which the administrator is
+        // about to review. A second submission must never overwrite its
+        // amount, payer or reference: the first evidence has to remain the
+        // evidence which is verified or rejected.
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'A payment has already been submitted for this request and is waiting for verification.',
+        );
+      }
+    }
+
+    // Legacy requests may not contain the agreed terms. Read the live
+    // settings inside the same transaction so the fallback cannot drift
+    // between the read and the commit. A complete request snapshot needs no
+    // settings read at all.
+    const snapshotPercentage = finiteNumber(fresh.commissionPercentageAtJoin);
+    const snapshotPayer = String(fresh.platformFeePayer || '');
+    const needsSettings =
+      !isValidFeePercentage(snapshotPercentage) ||
+      (snapshotPayer !== 'student' && snapshotPayer !== 'owner');
+    const settingsSnapshot = needsSettings
+      ? await transaction.get(db.collection('settings').doc('platform'))
+      : null;
+    const { percentage, payer } = resolveAgreedTermsFromData(
+      fresh,
+      settingsSnapshot
+        ? (settingsSnapshot.data() as Record<string, any> | undefined)
+        : undefined,
+    );
+
+    // The room is always part of the same transaction snapshot. A listing
+    // which was taken off the market, deleted or filled after the request
+    // was created must not accept a new payment.
+    const roomSnapshot = await transaction.get(
+      db.collection('rooms').doc(roomId),
+    );
+    if (!roomSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'That room no longer exists',
+      );
+    }
+    const room = roomSnapshot.data() as Record<string, any>;
+    const eligibility = decideRoomBookingEligibility(room, ownerId);
+    if (!eligibility.allowed) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        roomBookingRejectionMessage(eligibility.reason),
+      );
+    }
+
+    // The agreed rent is the only canonical source of the payable amount.
+    // A legacy request without a valid rent snapshot fails closed instead
+    // of silently charging the current room price.
+    const monthlyRent = monthlyRentFromData(fresh);
+    if (!monthlyRent) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The agreed rent for this request is not valid',
+      );
+    }
+    const amount = platformFeeFor(monthlyRent, percentage);
+    const feeWaived = percentage === 0;
+
+    // Every booking decision belongs to one of its two parties. This check
+    // also applies when the platform fee is waived: a waived booking still
+    // activates a real tenancy, so an unrelated account must never be able to
+    // submit it for verification.
+    const isStudent = studentId === callerUid;
+    const isOwner = ownerId === callerUid;
+    if (!isStudent && !isOwner) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'This booking request belongs to somebody else',
+      );
+    }
+
+    // A waived fee needs no money and no transaction reference. Every other
+    // payment needs a reference and may only be submitted by the agreed
+    // payer.
+    if (!feeWaived && reference.length < 4) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Enter the transaction reference from your UPI app',
+      );
+    }
+    if (!feeWaived && payer === 'owner' && !isOwner) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The platform fee for this booking is paid by the room owner',
+      );
+    }
+    if (!feeWaived && payer === 'student' && !isStudent) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The platform fee for this booking is paid by the student',
+      );
+    }
 
     // The student has to confirm the booking before a payment is recorded.
     // The owner confirmation alone is not a tenancy and must not activate a
@@ -569,15 +701,23 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
       );
     }
 
-    if (paymentSnapshot.exists && paymentSnapshot.get('status') === 'verified') {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'This payment has already been verified',
-      );
-    }
-
-    // The reference may only be used once — the lock document makes that
-    // check atomic (see the comment above).
+    // -------------------------------------------------------------------
+    // A transaction reference may only be used **once**.
+    //
+    // The reference is locked by a deterministic document which is created
+    // inside this transaction. Firestore guarantees that only one
+    // transaction can create a document with a given id.
+    // -------------------------------------------------------------------
+    const referenceKey = crypto
+      .createHash('sha256')
+      .update(
+        feeWaived
+          ? `waived:${requestId}`
+          : reference.toLowerCase(),
+      )
+      .digest('hex');
+    const referenceLockRef = db.collection('paymentReferences').doc(referenceKey);
+    const referenceLockSnapshot = await transaction.get(referenceLockRef);
     if (referenceLockSnapshot.exists) {
       const lockedBy = String(referenceLockSnapshot.get('requestId') || '');
       if (lockedBy !== requestId) {
@@ -590,9 +730,24 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
       transaction.create(referenceLockRef, {
         requestId,
         reference: feeWaived ? 'waived' : reference,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: firestore.FieldValue.serverTimestamp(),
       });
     }
+
+    const details = {
+      requestId,
+      studentId,
+      ownerId,
+      roomId,
+      monthlyRent,
+      amount,
+      feePercentage: percentage,
+      reference,
+      method,
+      payer,
+      feeWaived,
+      payeeVpa: PLATFORM_UPI_VPA,
+    };
 
     // The payment record is only a **submission**. It is deliberately kept
     // in the `submitted` state; an admin has to verify it before the
@@ -600,8 +755,8 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
     transaction.set(
       paymentRef,
       {
-        ...buildPaymentSubmissionRecord(submissionDetails),
-        submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...buildPaymentSubmissionRecord(details),
+        submittedAt: firestore.FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
@@ -610,13 +765,24 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
     // no occupancy is changed and the request does not become active. The
     // activation belongs to `verifyPayment` alone.
     transaction.update(ref, {
-      ...buildPaymentSubmissionRequestUpdates(submissionDetails),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...buildPaymentSubmissionRequestUpdates(details),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
     });
+
+    return details;
   });
 
+  const {
+    amount,
+    feeWaived,
+    payer,
+    feePercentage: percentage,
+    roomId,
+    studentId,
+    ownerId,
+  } = submissionDetails;
   const who = payer === 'owner' ? 'The room owner' : 'The student';
-  const other = payer === 'owner' ? request.studentId : request.ownerId;
+  const other = payer === 'owner' ? studentId : ownerId;
 
   // ---------------------------------------------------------------------
   // Both sides are told that the payment is waiting for verification.
@@ -633,7 +799,7 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
       : `Your ₹${amount} platform fee for request ${requestId} was recorded. ` +
         'It is waiting for verification.',
     'invoicePaid',
-    { requestId, roomId: request.roomId, amount: String(amount) },
+    { requestId, roomId, amount: String(amount) },
   );
 
   await notifyUser(
@@ -645,7 +811,7 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
       : `The ${percentage}% StayServe platform fee (₹${amount}) was submitted by ` +
         `${who.toLowerCase()}. The booking is waiting for verification.`,
     'invoicePaid',
-    { requestId, roomId: request.roomId, amount: String(amount) },
+    { requestId, roomId, amount: String(amount) },
   );
 
   return {
@@ -666,7 +832,7 @@ export const submitPayment = functions.https.onCall(async (data, context) => {
  *
  * This is the only place where `advancePaid` is set to `true`.
  */
-export const verifyPayment = functions.https.onCall(async (data, context) => {
+export const verifyPayment = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError('unauthenticated', 'Please sign in first');
   }
@@ -703,6 +869,26 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
   // refused: only one of them may commit.
   // ---------------------------------------------------------------------
   const { request, amount, activated } = await db.runTransaction(async (transaction) => {
+    // The caller's live administrator role is checked in the same
+    // transaction as the payment decision. A concurrent demotion or ban
+    // therefore serializes with this verification.
+    const adminSnapshot = await transaction.get(
+      db.collection('users').doc(adminUid),
+    );
+    if (
+      !canActAsAdmin({
+        exists: adminSnapshot.exists,
+        registrationCompleted: adminSnapshot.get('registrationCompleted'),
+        isActive: adminSnapshot.get('isActive'),
+        role: adminSnapshot.get('role'),
+      })
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'Admin access required',
+      );
+    }
+
     const paymentSnapshot = await transaction.get(paymentRef);
     if (!paymentSnapshot.exists) {
       throw new functions.https.HttpsError(
@@ -732,23 +918,142 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
         'That booking request no longer exists',
       );
     }
-    const request = requestSnapshot.data() as Record<string, any>;
+    // The document id is the authoritative request id. Older requests did
+    // not always store the same value in their `requestId` field; using the
+    // document id prevents an activation from writing to `INV-undefined` or
+    // addressing the wrong join-request document.
+    const request: Record<string, any> = Object.assign(
+      {},
+      requestSnapshot.data() as Record<string, any>,
+      { requestId },
+    );
     const requestStatus = String(request.status || '');
     const wasAlreadyActive = isActiveBookingStatus(requestStatus);
+    const studentId = String(request.studentId || '');
+    const ownerId = String(request.ownerId || '');
     const roomId = String(request.roomId || '');
-    const roomRef = db.collection('rooms').doc(roomId);
+
+    const roomRef = roomId
+      ? db.collection('rooms').doc(roomId)
+      : null;
 
     // Every read happens before the first write — a transaction may not read
     // a document it has already written.
-    const roomSnapshot = await transaction.get(roomRef);
+    const roomSnapshot = roomRef
+      ? await transaction.get(roomRef)
+      : null;
     const invoiceSnapshot = await transaction.get(invoiceRef);
-    const paymentAmount = Number(payment.amount || 0);
-    const commissionPercentage =
+    const parsedPaymentAmount = finiteNumber(payment.amount);
+    const commissionValue =
       request.commissionPercentageAtJoin !== undefined
-        ? Number(request.commissionPercentageAtJoin)
-        : Number(payment.feePercentage || 0);
+        ? finiteNumber(request.commissionPercentageAtJoin)
+        : finiteNumber(payment.feePercentage);
+    // A malformed payment must still be rejectable. These safe values are
+    // used only for the rejection notification; approval validates the raw
+    // values below and refuses to activate the booking.
+    const paymentAmount =
+      parsedPaymentAmount !== null && parsedPaymentAmount >= 0
+        ? parsedPaymentAmount
+        : 0;
+    const commissionPercentage =
+      commissionValue !== null && isValidFeePercentage(commissionValue)
+        ? commissionValue
+        : 0;
+    const paymentMatchesRequest = paymentMatchesBookingRequest(
+      payment,
+      request,
+      requestId,
+    );
 
     if (approve) {
+      if (parsedPaymentAmount === null || parsedPaymentAmount < 0) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The submitted payment amount is not valid.',
+        );
+      }
+      if (commissionValue === null || !isValidFeePercentage(commissionValue)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The booking commission percentage is not valid.',
+        );
+      }
+      const agreedRent = request.monthlyRentAtJoin;
+      if (!isValidMonthlyRent(agreedRent)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The agreed rent for this booking is not valid.',
+        );
+      }
+      const expectedAmount = platformFeeFor(agreedRent, commissionValue);
+      if (parsedPaymentAmount !== expectedAmount) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The submitted payment amount does not match this booking request.',
+        );
+      }
+      if (!hasValidBookingParties(request)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This request does not have a valid student tenant.',
+        );
+      }
+      if (!roomId || !roomSnapshot) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This request does not identify a room.',
+        );
+      }
+      if (!paymentMatchesRequest) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The payment does not match this booking request.',
+        );
+      }
+
+      // The live student requirement applies only when this decision would
+      // activate a new tenancy. An already-active legacy record is merely
+      // acknowledged idempotently: it does not occupy another slot, and a
+      // banned tenant must not prevent an admin from repairing that record.
+      if (!wasAlreadyActive) {
+        const tenantSnapshot = await transaction.get(
+          db.collection('users').doc(studentId),
+        );
+        if (
+          !canBookAsStudent({
+            exists: tenantSnapshot.exists,
+            registrationCompleted: tenantSnapshot.get('registrationCompleted'),
+            isActive: tenantSnapshot.get('isActive'),
+            role: tenantSnapshot.get('role'),
+          })
+        ) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'The student can no longer occupy this room.',
+          );
+        }
+
+        // The owner profile is read in the same transaction as the
+        // activation. An owner whose account is being deleted cannot have a
+        // new tenancy committed under their listing.
+        const ownerSnapshot = await transaction.get(
+          db.collection('users').doc(ownerId),
+        );
+        if (
+          !canActAsRoomOwner({
+            exists: ownerSnapshot.exists,
+            registrationCompleted: ownerSnapshot.get('registrationCompleted'),
+            isActive: ownerSnapshot.get('isActive'),
+            role: ownerSnapshot.get('role'),
+          })
+        ) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'The room owner can no longer activate this booking.',
+          );
+        }
+      }
+
       // Only a confirmed, non-active booking may be activated. An already
       // active legacy record is idempotent, but it must not be counted a
       // second time.
@@ -757,6 +1062,24 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
           'failed-precondition',
           'The student has to confirm the request before the payment can be verified',
         );
+      }
+
+      if (!wasAlreadyActive) {
+        if (!roomSnapshot.exists) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'That room no longer exists',
+          );
+        }
+
+        const roomData = roomSnapshot.data() || {};
+        const eligibility = decideRoomBookingEligibility(roomData, ownerId);
+        if (!eligibility.allowed) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            roomBookingRejectionMessage(eligibility.reason),
+          );
+        }
       }
 
       // The activation is the **only** place where a booking becomes a
@@ -780,7 +1103,7 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
             paymentAmount > 0 ? payment.reference || null : null,
           paidAt:
             paymentAmount > 0
-              ? admin.firestore.FieldValue.serverTimestamp()
+              ? firestore.FieldValue.serverTimestamp()
               : undefined,
         },
         roomSnapshot,
@@ -798,7 +1121,7 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
         paymentRef,
         {
           status,
-          verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+          verifiedAt: firestore.FieldValue.serverTimestamp(),
           verifiedBy: adminUid,
           note,
         },
@@ -811,44 +1134,69 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
     // -------------------------------------------------------------------
     // The money did **not** arrive.
     //
-    // A submitted payment was never allowed to activate a booking, so a
-    // rejection normally has no occupancy to release. Legacy records that
-    // were activated by the old submit path are handled explicitly: only
-    // those records decrement the counter.
+    // The payment record is always rejected, even when its identities are
+    // malformed: an invalid payment has to remain rejectable. The booking
+    // itself is changed only when the payment belongs to it and the request
+    // is in a state from which payment may be submitted. A cancelled or
+    // declined request is terminal and must never be resurrected here.
     // -------------------------------------------------------------------
     transaction.set(
       paymentRef,
       {
         status,
-        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        verifiedAt: firestore.FieldValue.serverTimestamp(),
         verifiedBy: adminUid,
         note,
       },
       { merge: true },
     );
 
-    transaction.update(requestRef, {
-      status: bookingStatusAfterRejectedPayment(requestStatus),
-      advancePaid: false,
-      advancePaymentStatus: status,
-      advancePaidAt: null,
-      platformCutTaken: false,
-      invoiceId: wasAlreadyActive ? null : request.invoiceId || null,
-      advancePaymentReference: null,
-      advancePaymentMethod: null,
-      advanceUpiTransactionId: null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    const validParties = hasValidBookingParties(request);
+    const roomOwnerMatches =
+      !wasAlreadyActive ||
+      !!(
+        roomSnapshot &&
+        roomSnapshot.exists &&
+        String(roomSnapshot.data()?.ownerId || '') === ownerId
+      );
+    const canChangeRequest =
+      paymentMatchesRequest && validParties && roomOwnerMatches;
+    const nextStatus = rejectedPaymentBookingStatus(
+      requestStatus,
+      wasAlreadyActive,
+      canChangeRequest,
+    );
+    const rollsBackActiveBooking = nextStatus !== null && wasAlreadyActive;
 
-    if (invoiceSnapshot && invoiceSnapshot.exists) {
-      transaction.update(invoiceRef, {
-        status: 'cancelled',
-        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    if (nextStatus !== null) {
+      transaction.update(requestRef, {
+        status: nextStatus,
+        advancePaid: false,
+        advancePaymentStatus: status,
+        advancePaidAt: null,
+        platformCutTaken: false,
+        invoiceId: wasAlreadyActive ? null : request.invoiceId || null,
+        advancePaymentReference: null,
+        advancePaymentMethod: null,
+        advanceUpiTransactionId: null,
+        updatedAt: firestore.FieldValue.serverTimestamp(),
       });
+
+      if (invoiceSnapshot && invoiceSnapshot.exists) {
+        transaction.update(invoiceRef, {
+          status: 'cancelled',
+          cancelledAt: firestore.FieldValue.serverTimestamp(),
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        });
+      }
     }
 
-    if (wasAlreadyActive && roomSnapshot && roomSnapshot.exists) {
+    if (
+      rollsBackActiveBooking &&
+      roomRef &&
+      roomSnapshot &&
+      roomSnapshot.exists
+    ) {
       const data = roomSnapshot.data() || {};
       const current = Number(data.currentOccupancy || 0);
       const occupancy = Number(data.occupancy || 1);
@@ -860,7 +1208,7 @@ export const verifyPayment = functions.https.onCall(async (data, context) => {
           occupancy,
           newOccupancy,
         ),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
       });
     }
 

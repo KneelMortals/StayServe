@@ -18,6 +18,7 @@
 //   node tools/production_rules_check.mjs
 
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import nodeFs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,6 +27,7 @@ const KEY = 'AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM';
 const PROJ = 'myfirstapp-fa30f52b';
 const BASE = `https://firestore.googleapis.com/v1/projects/${PROJ}/databases/(default)/documents`;
 const AUTH = `https://identitytoolkit.googleapis.com/v1`;
+const FUNCTIONS = `https://us-central1-${PROJ}.cloudfunctions.net`;
 
 const EMAIL = `rules.check.${Date.now()}@example.com`;
 const PASSWORD = 'TmpCheck!2026x';
@@ -56,6 +58,22 @@ async function auth(path, body) {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  return { status: res.status, json };
+}
+
+/** A callable request with the throw-away account's ID token. */
+async function callable(name, data = {}) {
+  const res = await fetch(`${FUNCTIONS}/${name}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ data }),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text.slice(0, 120) }; }
   return { status: res.status, json };
 }
 
@@ -239,6 +257,13 @@ async function seedNotification() {
 
 async function cleanup() {
   console.log('\n--- cleanup ---');
+  // Delete the two real listings through the same server-owned path the app
+  // uses. This also removes their private locations and the room-id
+  // tombstones. The direct deletes below are only a defensive fallback.
+  for (const roomId of [`${uid}-rulecheck`, `${uid}-rulecheck-initial`]) {
+    const r = await callable('deleteRoomListing', { roomId });
+    console.log(`  deleted listing ${roomId} -> HTTP ${r.status}`);
+  }
   for (const path of [
     `/notifications/${uid}-rulecheck`,
     `/notifications/${uid}-client`,
@@ -246,7 +271,11 @@ async function cleanup() {
     `/payments/${uid}-rulecheck`,
     `/commissionInvoices/INV-${uid}-rulecheck`,
     `/rooms/${uid}-rulecheck`,
+    `/roomPrivate/${uid}-rulecheck`,
+    `/roomDeletionTombstones/${uid}-rulecheck`,
     `/rooms/${uid}-rulecheck-initial`,
+    `/roomPrivate/${uid}-rulecheck-initial`,
+    `/roomDeletionTombstones/${uid}-rulecheck-initial`,
     `/rooms/${uid}-rulecheck-status`,
     `/rooms/${uid}-rulecheck-occupied`,
     `/joinRequests/${uid}-rulecheck`,
@@ -257,6 +286,32 @@ async function cleanup() {
   }
   const d = await auth('/accounts:delete', { idToken: token });
   console.log(`  deleted auth account -> HTTP ${d.status}`);
+
+  // The Auth deletion trigger keeps an anonymized, completed job tombstone.
+  // It is useful for a real deletion audit, but it is also a test artifact
+  // here, so wait until the trigger has completed and remove that one job.
+  const jobId = `account-deletion-${crypto
+    .createHash('sha256')
+    .update(uid.trim())
+    .digest('hex')}`;
+  let completed = false;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const job = await adminFs('GET', `/accountDeletionJobs/${jobId}`);
+    if (
+      job.status === 200 &&
+      job.json?.fields?.status?.stringValue === 'completed'
+    ) {
+      completed = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  if (completed) {
+    const removed = await adminFs('DELETE', `/accountDeletionJobs/${jobId}`);
+    console.log(`  deleted completed account-deletion job -> HTTP ${removed.status}`);
+  } else {
+    console.warn('  the completed account-deletion job was not observed');
+  }
 }
 
 async function main() {
@@ -373,7 +428,7 @@ async function main() {
     },
     orderBy: [{ field: { fieldPath: 'submittedAt' }, direction: 'DESCENDING' }],
   });
-  check('a student may list their own payments (filtered)', ownPayments.status === 200,
+  check('an owner may not list student-side payments', denied(ownPayments),
     `HTTP ${ownPayments.status}`);
   const otherPayments = await runQuery({
     from: [{ collectionId: 'payments' }],
@@ -475,6 +530,14 @@ async function main() {
       ownerId: { stringValue: uid },
       monthlyRent: { doubleValue: 10000 },
       occupancy: { integerValue: '2' },
+      location: {
+        mapValue: {
+          fields: {
+            city: { stringValue: 'Bengaluru' },
+            state: { stringValue: 'Karnataka' },
+          },
+        },
+      },
     },
   });
   check('an owner may create their own room (without the server-owned fields)',
@@ -488,10 +551,43 @@ async function main() {
       occupancy: { integerValue: '2' },
       status: { stringValue: 'available' },
       currentOccupancy: { integerValue: '0' },
+      location: {
+        mapValue: {
+          fields: {
+            city: { stringValue: 'Bengaluru' },
+            state: { stringValue: 'Karnataka' },
+          },
+        },
+      },
     },
   });
   check('an owner may send the initial server-owned state on create',
     createRoomWithInitialState.status === 200, `HTTP ${createRoomWithInitialState.status}`);
+  const privateLocation = await callable('setRoomPrivateLocation', {
+    roomId,
+    address: '42 Rules Check Lane',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  check('the owner may store the exact location privately',
+    privateLocation.status === 200 && privateLocation.json?.result?.success === true,
+    `HTTP ${privateLocation.status}`);
+  const privateLocationForInitial = await callable('setRoomPrivateLocation', {
+    roomId: `${roomId}-initial`,
+    address: '42 Rules Check Lane',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  check('every created listing has a private location counterpart',
+    privateLocationForInitial.status === 200 &&
+      privateLocationForInitial.json?.result?.success === true,
+    `HTTP ${privateLocationForInitial.status}`);
   const createRoomWithStatus = await fs('PATCH', `/rooms/${roomId}-status`, {
     fields: {
       roomId: { stringValue: `${roomId}-status` },
@@ -500,6 +596,14 @@ async function main() {
       monthlyRent: { doubleValue: 10000 },
       occupancy: { integerValue: '2' },
       status: { stringValue: 'occupied' },
+      location: {
+        mapValue: {
+          fields: {
+            city: { stringValue: 'Bengaluru' },
+            state: { stringValue: 'Karnataka' },
+          },
+        },
+      },
     },
   });
   check('an owner may NOT create a room that is already occupied',

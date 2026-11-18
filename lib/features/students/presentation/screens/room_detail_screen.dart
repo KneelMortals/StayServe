@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -46,6 +46,16 @@ class _RoomDetailContent extends ConsumerStatefulWidget {
 class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
   bool _isSaved = false;
 
+  /// The gallery of the room photos.
+  ///
+  /// The listing may contain up to [AppConstants.maxImagesPerRoom] photos.
+  /// A single hero image used to be rendered here, which made every photo
+  /// except the first one invisible to students. The page view now shows
+  /// every uploaded photo and the thumbnail strip below it makes all of
+  /// them directly reachable.
+  final PageController _imagePageController = PageController();
+  int _currentImageIndex = 0;
+
   /// The request that was sent from this screen.
   ///
   /// The stream of the requests needs a moment to deliver the new request.
@@ -62,6 +72,32 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
   void initState() {
     super.initState();
     _loadSavedState();
+  }
+
+  @override
+  void didUpdateWidget(covariant _RoomDetailContent oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    // The owner may add or remove photos while the student is looking at
+    // the listing. Keep the gallery on a valid image after that update.
+    if (widget.room.images.isEmpty) {
+      _currentImageIndex = 0;
+      return;
+    }
+    if (_currentImageIndex >= widget.room.images.length) {
+      _currentImageIndex = 0;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _imagePageController.hasClients) {
+          _imagePageController.jumpToPage(0);
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _imagePageController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadSavedState() async {
@@ -122,6 +158,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     final room = widget.room;
     final isAvailable = room.isAvailable;
     final currentUser = ref.watch(currentUserProvider);
+    final currentUserRole = ref.watch(currentUserRoleProvider);
     final location = ref.watch(userLocationProvider);
     final distanceKm = roomDistanceFromUser(room, location);
 
@@ -132,7 +169,8 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     // it they only see the rough area (the city), after it they can see
     // where the room is and how to get there.
     // -------------------------------------------------------------------
-    final requests = ref.watch(myJoinRequestsProvider).valueOrNull ??
+    final requests =
+        ref.watch(myJoinRequestsProvider).valueOrNull ??
         const <JoinRequestModel>[];
     final isAccepted = ownerAcceptedRequestFor(requests, room.roomId);
 
@@ -148,6 +186,8 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       body: CustomScrollView(
         slivers: [
           _buildAppBar(context, room),
+          if (room.images.length > 1)
+            SliverToBoxAdapter(child: _buildImageThumbnails(context, room)),
           SliverToBoxAdapter(
             child: Padding(
               padding: const EdgeInsets.all(AppSpacing.md),
@@ -166,6 +206,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
                     context,
                     room,
                     currentUser,
+                    currentUserRole,
                     isAvailable,
                     isAccepted,
                     activeRequest,
@@ -186,28 +227,179 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       actions: [
         IconButton(
           tooltip: _isSaved ? 'Remove from saved' : 'Save room',
-          icon: Icon(
-            _isSaved ? Icons.bookmark : Icons.bookmark_border,
-          ),
+          icon: Icon(_isSaved ? Icons.bookmark : Icons.bookmark_border),
           onPressed: _toggleSaved,
         ),
       ],
       flexibleSpace: FlexibleSpaceBar(
-        background: room.hasImages
-            ? Image.network(
-                room.primaryImage,
-                fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Container(
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                  child: const Center(child: Icon(Icons.image, size: 80)),
-                ),
-              )
-            : Container(
-                color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                child: const Center(child: Icon(Icons.image, size: 80)),
-              ),
+        background: _buildImageGallery(context, room),
       ),
     );
+  }
+
+  /// The large, swipeable gallery of every photo uploaded for the room.
+  Widget _buildImageGallery(BuildContext context, RoomModel room) {
+    if (!room.hasImages) {
+      return Container(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        child: const Center(child: Icon(Icons.image, size: 80)),
+      );
+    }
+
+    final safeIndex = _currentImageIndex.clamp(0, room.images.length - 1);
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        PageView.builder(
+          controller: _imagePageController,
+          itemCount: room.images.length,
+          onPageChanged: (index) {
+            if (!mounted) return;
+            setState(() => _currentImageIndex = index);
+          },
+          itemBuilder: (context, index) {
+            return AppImage(
+              key: ValueKey('room-gallery-image-${room.images[index]}'),
+              imageUrl: room.images[index],
+              fit: BoxFit.cover,
+              placeholder: Container(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                child: const Center(child: CircularProgressIndicator()),
+              ),
+              errorWidget: Container(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                child: const Center(
+                  child: Icon(Icons.image_not_supported, size: 64),
+                ),
+              ),
+            );
+          },
+        ),
+        if (room.images.length > 1)
+          Positioned(
+            right: AppSpacing.md,
+            bottom: AppSpacing.md,
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm,
+                vertical: AppSpacing.xs,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.65),
+                borderRadius: BorderRadius.circular(AppBorderRadius.full),
+              ),
+              child: Text(
+                '${safeIndex + 1} / ${room.images.length}',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// A strip with one thumbnail for every uploaded photo.
+  ///
+  /// It makes the complete set of photos visible at a glance instead of
+  /// hiding the additional photos behind an undiscoverable gesture.
+  Widget _buildImageThumbnails(BuildContext context, RoomModel room) {
+    final theme = Theme.of(context);
+    final selectedIndex = _currentImageIndex.clamp(0, room.images.length - 1);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.md,
+        AppSpacing.sm,
+        AppSpacing.md,
+        0,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('Photos', style: theme.textTheme.titleMedium),
+              const Spacer(),
+              Text(
+                '${selectedIndex + 1} of ${room.images.length}',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          SizedBox(
+            height: 68,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: room.images.length,
+              separatorBuilder: (_, __) => const SizedBox(width: AppSpacing.sm),
+              itemBuilder: (context, index) {
+                final selected = index == selectedIndex;
+                return Semantics(
+                  button: true,
+                  selected: selected,
+                  label: 'Room photo ${index + 1} of ${room.images.length}',
+                  child: InkWell(
+                    key: ValueKey(
+                      'room-gallery-thumbnail-${room.images[index]}',
+                    ),
+                    onTap: () => _selectImage(index),
+                    borderRadius: BorderRadius.circular(AppBorderRadius.sm),
+                    child: Container(
+                      width: 84,
+                      padding: EdgeInsets.all(selected ? 2 : 0),
+                      decoration: BoxDecoration(
+                        border: selected
+                            ? Border.all(
+                                color: theme.colorScheme.primary,
+                                width: 2,
+                              )
+                            : null,
+                        borderRadius: BorderRadius.circular(AppBorderRadius.sm),
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(AppBorderRadius.xs),
+                        child: AppImage(
+                          imageUrl: room.images[index],
+                          fit: BoxFit.cover,
+                          placeholder: Container(
+                            color: theme.colorScheme.surfaceContainerHighest,
+                            child: const Icon(Icons.image_outlined),
+                          ),
+                          errorWidget: Container(
+                            color: theme.colorScheme.surfaceContainerHighest,
+                            child: const Icon(Icons.image_not_supported),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _selectImage(int index) async {
+    if (index < 0 || index >= widget.room.images.length) return;
+
+    setState(() => _currentImageIndex = index);
+    if (_imagePageController.hasClients) {
+      await _imagePageController.animateToPage(
+        index,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
   }
 
   Widget _buildRoomInfo(
@@ -224,12 +416,25 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
         const SizedBox(height: AppSpacing.sm),
         Row(
           children: [
-            Icon(Icons.location_on, size: 16, color: theme.colorScheme.onSurfaceVariant),
+            Icon(
+              Icons.location_on,
+              size: 16,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
             const SizedBox(width: AppSpacing.xs),
-            Expanded(child: Text(room.location.shortAddress, style: theme.textTheme.bodyMedium)),
+            Expanded(
+              child: Text(
+                room.location.shortAddress,
+                style: theme.textTheme.bodyMedium,
+              ),
+            ),
             if (distanceKm != null) ...[
               const SizedBox(width: AppSpacing.sm),
-              Icon(Icons.near_me_outlined, size: 16, color: theme.colorScheme.primary),
+              Icon(
+                Icons.near_me_outlined,
+                size: 16,
+                color: theme.colorScheme.primary,
+              ),
               const SizedBox(width: AppSpacing.xs),
               Text(
                 DistanceUtils.formatDistance(distanceKm),
@@ -251,12 +456,13 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
         if (isAccepted) ...[
           const SizedBox(height: AppSpacing.xs),
           Text(
-            room.location.fullAddress,
+            'The exact address is available from Visit details.',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
+              fontStyle: FontStyle.italic,
             ),
           ),
-        ] else if (room.location.address.trim().isNotEmpty) ...[
+        ] else ...[
           const SizedBox(height: AppSpacing.xs),
           Text(
             'The exact address is shown once the owner accepts your request.',
@@ -271,22 +477,23 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
           children: [
             Text(
               AppFormatters.formatCurrency(room.monthlyRent),
-              style: theme.textTheme.headlineMedium?.copyWith(color: theme.colorScheme.primary),
+              style: theme.textTheme.headlineMedium?.copyWith(
+                color: theme.colorScheme.primary,
+              ),
             ),
             const SizedBox(width: AppSpacing.md),
             Text(
               'Deposit: ${AppFormatters.formatCurrency(room.securityDeposit)}',
-              style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
         const SizedBox(height: AppSpacing.lg),
         Text('Description', style: theme.textTheme.titleLarge),
         const SizedBox(height: AppSpacing.sm),
-        Text(
-          room.description,
-          style: theme.textTheme.bodyMedium,
-        ),
+        Text(room.description, style: theme.textTheme.bodyMedium),
         const SizedBox(height: AppSpacing.lg),
         Wrap(
           spacing: AppSpacing.sm,
@@ -294,25 +501,45 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
           children: [
             _InfoChip(label: room.roomType.label, icon: Icons.person),
             _InfoChip(label: room.furnishing.label, icon: Icons.chair),
-            _InfoChip(label: 'Available from ${_formatDate(room.availableFrom)}', icon: Icons.calendar_today),
-            _InfoChip(label: room.genderPreference.label, icon: room.genderPreference == GenderPreference.male ? Icons.male : room.genderPreference == GenderPreference.female ? Icons.female : Icons.transgender),
+            _InfoChip(
+              label: 'Available from ${_formatDate(room.availableFrom)}',
+              icon: Icons.calendar_today,
+            ),
+            _InfoChip(
+              label: room.genderPreference.label,
+              icon: room.genderPreference == GenderPreference.male
+                  ? Icons.male
+                  : room.genderPreference == GenderPreference.female
+                  ? Icons.female
+                  : Icons.transgender,
+            ),
           ],
         ),
         const SizedBox(height: AppSpacing.md),
         Row(
           children: [
-            Text('${room.availableSlots} / ${room.occupancy} slots available', style: theme.textTheme.bodyMedium),
+            Text(
+              '${room.availableSlots} / ${room.occupancy} slots available',
+              style: theme.textTheme.bodyMedium,
+            ),
             const Spacer(),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm,
+                vertical: AppSpacing.xs,
+              ),
               decoration: BoxDecoration(
-                color: room.status == RoomStatus.available ? Colors.green.withValues(alpha: 0.1) : Colors.orange.withValues(alpha: 0.1),
+                color: room.status == RoomStatus.available
+                    ? Colors.green.withValues(alpha: 0.1)
+                    : Colors.orange.withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(AppBorderRadius.full),
               ),
               child: Text(
                 room.status.label,
                 style: theme.textTheme.labelSmall?.copyWith(
-                  color: room.status == RoomStatus.available ? Colors.green : Colors.orange,
+                  color: room.status == RoomStatus.available
+                      ? Colors.green
+                      : Colors.orange,
                 ),
               ),
             ),
@@ -367,7 +594,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
                     summary.count == 0
                         ? 'No reviews yet — be the first one'
                         : 'Read all ${summary.count} review'
-                            '${summary.count == 1 ? '' : 's'}',
+                              '${summary.count == 1 ? '' : 's'}',
                     style: theme.textTheme.bodyMedium,
                   ),
                 ),
@@ -394,10 +621,18 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
         Wrap(
           spacing: AppSpacing.sm,
           runSpacing: AppSpacing.sm,
-          children: room.amenities.map((a) => Chip(
-            label: Text(a),
-            avatar: Icon(Icons.check_circle, size: 16, color: theme.colorScheme.primary),
-          )).toList(),
+          children: room.amenities
+              .map(
+                (a) => Chip(
+                  label: Text(a),
+                  avatar: Icon(
+                    Icons.check_circle,
+                    size: 16,
+                    color: theme.colorScheme.primary,
+                  ),
+                ),
+              )
+              .toList(),
         ),
       ],
     );
@@ -482,6 +717,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     BuildContext context,
     RoomModel room,
     User? currentUser,
+    UserRole? currentUserRole,
     bool isAvailable,
     bool isAccepted,
     JoinRequestModel? activeRequest,
@@ -536,6 +772,73 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     }
 
     // -------------------------------------------------------------------
+    // Only students may become tenants.
+    //
+    // The live role is read from the Firestore profile. While that profile
+    // is still loading the action is hidden (fail closed), and an owner or
+    // admin never gets a booking button — not even for somebody else's
+    // listing. The callable function repeats this check on the server.
+    // -------------------------------------------------------------------
+    if (currentUserRole == null) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(AppSpacing.md),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(AppBorderRadius.lg),
+        ),
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Text(
+                'Checking your booking access…',
+                style: theme.textTheme.bodyMedium,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (currentUserRole != UserRole.student) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(AppSpacing.md),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.secondaryContainer,
+          borderRadius: BorderRadius.circular(AppBorderRadius.lg),
+          border: Border.all(color: theme.colorScheme.secondary),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              Icons.info_outline,
+              color: theme.colorScheme.onSecondaryContainer,
+            ),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Text(
+                currentUserRole == UserRole.owner
+                    ? 'Room owners cannot book rooms. You can manage your own '
+                          'listings and booking requests instead.'
+                    : 'Only student accounts can book rooms.',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSecondaryContainer,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // -------------------------------------------------------------------
     // A request for this room already exists.
     //
     // The button says **"Cancel booking"** — not "Request to Book". The
@@ -581,20 +884,20 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
             onPressed: _busy || requestId == null || !canCancel
                 ? null
                 : () => _cancelBooking(
-                      context,
-                      activeRequest ??
-                          JoinRequestModel(
-                            requestId: requestId,
-                            roomId: room.roomId,
-                            studentId: currentUser.uid,
-                            ownerId: room.ownerId,
-                            status: JoinRequestStatus.pending,
-                            createdAt: DateTime.now(),
-                            updatedAt: DateTime.now(),
-                            monthlyRentAtJoin: room.monthlyRent,
-                            commissionPercentageAtJoin: 30,
-                          ),
-                    ),
+                    context,
+                    activeRequest ??
+                        JoinRequestModel(
+                          requestId: requestId,
+                          roomId: room.roomId,
+                          studentId: currentUser.uid,
+                          ownerId: room.ownerId,
+                          status: JoinRequestStatus.pending,
+                          createdAt: DateTime.now(),
+                          updatedAt: DateTime.now(),
+                          monthlyRentAtJoin: room.monthlyRent,
+                          commissionPercentageAtJoin: 30,
+                        ),
+                  ),
             isLoading: _busy,
             isFullWidth: true,
             type: ButtonType.danger,
@@ -633,7 +936,14 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
           children: [
             Icon(Icons.info_outline, color: Colors.orange),
             const SizedBox(width: AppSpacing.sm),
-            Expanded(child: Text('This room is currently not available for booking', style: theme.textTheme.bodyMedium?.copyWith(color: Colors.orange))),
+            Expanded(
+              child: Text(
+                'This room is currently not available for booking',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: Colors.orange,
+                ),
+              ),
+            ),
           ],
         ),
       );
@@ -763,7 +1073,9 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     setState(() => _busy = true);
 
     try {
-      await ref.read(studentJoinRequestProvider).cancelJoinRequest(
+      await ref
+          .read(studentJoinRequestProvider)
+          .cancelJoinRequest(
             request.requestId,
             reason: 'Cancelled by the student from the room page',
           );
@@ -785,9 +1097,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       setState(() => _busy = false);
       messenger.showSnackBar(
         SnackBar(
-          content: Text(
-            e.toString().replaceFirst('Exception: ', ''),
-          ),
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
           backgroundColor: errorColor,
         ),
       );
@@ -809,9 +1119,7 @@ class _BookingOutcome {
 
   const _BookingOutcome.created(this.requestId) : duplicate = false;
 
-  const _BookingOutcome.duplicateExisting()
-      : requestId = '',
-        duplicate = true;
+  const _BookingOutcome.duplicateExisting() : requestId = '', duplicate = true;
 }
 
 class _BookingDialog extends ConsumerStatefulWidget {
@@ -833,7 +1141,8 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
 
     // The fee percentage is a platform setting — the admin can change it, so
     // it is read from Firestore instead of being hardcoded.
-    final settings = ref.watch(platformSettingsProvider).valueOrNull ??
+    final settings =
+        ref.watch(platformSettingsProvider).valueOrNull ??
         PlatformSettings.fallback;
     final feePercentage = settings.feePercentage;
     final platformFee = room.monthlyRent * (feePercentage / 100);
@@ -846,26 +1155,46 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Room: ${room.title}', style: theme.textTheme.titleMedium),
-            Text('Location: ${room.location.shortAddress}', style: theme.textTheme.bodyMedium),
+            Text(
+              'Location: ${room.location.shortAddress}',
+              style: theme.textTheme.bodyMedium,
+            ),
             const SizedBox(height: AppSpacing.md),
             Row(
               children: [
                 Text('Monthly Rent: ', style: theme.textTheme.bodyMedium),
-                Text(AppFormatters.formatCurrency(room.monthlyRent), style: theme.textTheme.titleMedium?.copyWith(color: theme.colorScheme.primary)),
+                Text(
+                  AppFormatters.formatCurrency(room.monthlyRent),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    color: theme.colorScheme.primary,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: AppSpacing.xs),
             Row(
               children: [
-                Text('${feePercentage.toStringAsFixed(0)}% Platform Fee: ', style: theme.textTheme.bodyMedium),
-                Text(AppFormatters.formatCurrency(platformFee), style: theme.textTheme.titleMedium?.copyWith(color: theme.colorScheme.primary, fontWeight: FontWeight.bold)),
+                Text(
+                  '${feePercentage.toStringAsFixed(0)}% Platform Fee: ',
+                  style: theme.textTheme.bodyMedium,
+                ),
+                Text(
+                  AppFormatters.formatCurrency(platformFee),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    color: theme.colorScheme.primary,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: AppSpacing.xs),
             Row(
               children: [
                 Text('Security Deposit: ', style: theme.textTheme.bodyMedium),
-                Text(AppFormatters.formatCurrency(room.securityDeposit), style: theme.textTheme.bodyMedium),
+                Text(
+                  AppFormatters.formatCurrency(room.securityDeposit),
+                  style: theme.textTheme.bodyMedium,
+                ),
               ],
             ),
             const SizedBox(height: AppSpacing.lg),
@@ -915,7 +1244,11 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
         FilledButton(
           onPressed: _isProcessing ? null : () => _processBooking(),
           child: _isProcessing
-              ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+              ? const SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
               : const Text('Send Request'),
         ),
       ],
@@ -937,7 +1270,9 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
       // Create the join request. The platform fee is *not* charged here —
       // the owner has to approve first, and only then does the student get
       // a server-issued payment link from the "My Requests" screen.
-      final request = await ref.read(studentJoinRequestProvider).createJoinRequest(
+      final request = await ref
+          .read(studentJoinRequestProvider)
+          .createJoinRequest(
             roomId: room.roomId,
             ownerId: room.ownerId,
             monthlyRent: room.monthlyRent,
@@ -967,7 +1302,10 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
 
       setState(() => _isProcessing = false);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Request failed: $message'), backgroundColor: Theme.of(context).colorScheme.error),
+        SnackBar(
+          content: Text('Request failed: $message'),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
       );
     }
   }

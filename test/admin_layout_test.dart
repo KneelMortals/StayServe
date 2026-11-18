@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -54,8 +54,7 @@ UserModel _user({
     updatedAt: _now,
     banReason: banReason,
     deletionScheduled: deletionScheduled,
-    deletionScheduledAt:
-        deletionScheduled ? _now : null,
+    deletionScheduledAt: deletionScheduled ? _now : null,
     deleteAfter: deletionScheduled ? _now.add(const Duration(days: 7)) : null,
   );
 }
@@ -106,14 +105,7 @@ RoomModel _room({
     description: 'A comfortable room near the college',
     monthlyRent: 12000,
     securityDeposit: 30000,
-    location: const Location(
-      address: 'MG Road, Indiranagar',
-      city: 'Bengaluru',
-      state: 'Karnataka',
-      pincode: '560001',
-      latitude: 12.9716,
-      longitude: 77.5946,
-    ),
+    location: const Location(city: 'Bengaluru', state: 'Karnataka'),
     roomType: RoomType.single,
     furnishing: FurnishingType.semi,
     availableFrom: _now,
@@ -129,11 +121,7 @@ RoomModel _room({
 
 final List<RoomModel> _rooms = [
   _room(),
-  _room(
-    roomId: 'room-2',
-    ownerId: 'owner-2',
-    title: 'Second listing',
-  ),
+  _room(roomId: 'room-2', ownerId: 'owner-2', title: 'Second listing'),
 ];
 
 JoinRequestModel _request({
@@ -261,21 +249,27 @@ const LaunchPincodeConfig _launchConfig = LaunchPincodeConfig(
 List<Override> _overrides() {
   return [
     adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
-    adminRecentRequestsProvider
-        .overrideWith((ref) => Stream.value(_recentRequests)),
+    adminRecentRequestsProvider.overrideWith(
+      (ref) => Stream.value(_recentRequests),
+    ),
     adminUsersProvider.overrideWith((ref, filter) => Stream.value(_users)),
     adminRoomsProvider.overrideWith((ref, filter) => Stream.value(_rooms)),
-    adminJoinRequestsProvider
-        .overrideWith((ref, filter) => Stream.value(_requests)),
-    adminInvoicesProvider.overrideWith((ref, filter) => Stream.value(_invoices)),
-    adminPaymentsProvider
-        .overrideWith((ref, filter) => Stream.value(_payments)),
+    adminJoinRequestsProvider.overrideWith(
+      (ref, filter) => Stream.value(_requests),
+    ),
+    adminInvoicesProvider.overrideWith(
+      (ref, filter) => Stream.value(_invoices),
+    ),
+    adminPaymentsProvider.overrideWith(
+      (ref, filter) => Stream.value(_payments),
+    ),
     adminCommissionPercentageProvider.overrideWith((ref) async => 30.0),
     adminMaintenanceModeProvider.overrideWith((ref) async => false),
     adminNotificationsEnabledProvider.overrideWith((ref) async => true),
     adminFeePayerProvider.overrideWith((ref) async => 'owner'),
-    adminLaunchPincodeConfigProvider
-        .overrideWith((ref) => Stream.value(_launchConfig)),
+    adminLaunchPincodeConfigProvider.overrideWith(
+      (ref) => Stream.value(_launchConfig),
+    ),
     unreadNotificationCountProvider.overrideWith((ref) => Stream.value(7)),
   ];
 }
@@ -292,12 +286,7 @@ Future<Object?> _render(
 
   final router = GoRouter(
     initialLocation: path,
-    routes: [
-      GoRoute(
-        path: path,
-        builder: (context, state) => screen,
-      ),
-    ],
+    routes: [GoRoute(path: path, builder: (context, state) => screen)],
   );
   addTearDown(router.dispose);
 
@@ -476,8 +465,9 @@ void main() {
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 400));
 
-        final scaffold =
-            tester.state<ScaffoldState>(find.byType(Scaffold).first);
+        final scaffold = tester.state<ScaffoldState>(
+          find.byType(Scaffold).first,
+        );
         scaffold.openDrawer();
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 400));

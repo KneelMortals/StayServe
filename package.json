@@ -1,20 +1,26 @@
 {
   "name": "stayserve",
   "version": "1.0.0",
-  "description": "A new Flutter project.",
+  "description": "Firebase emulator and security-rules tooling for StayServe.",
+  "private": true,
   "main": "index.js",
   "directories": {
     "lib": "lib",
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run test:functions && npm run test:callables && npm run test:location-cli && npm run test:rules && npm run test:storage-rules",
+    "test:functions": "npm --prefix functions run build && node tools/functions_unit_test.mjs && node functions/test/rooms_unit_test.mjs && node functions/test/room_location_unit_test.mjs && node functions/test/otp_atomicity_test.mjs && tools/test_batches.sh",
+    "test:callables": "tools/test_backend_callables.sh",
+    "test:location-cli": "tools/test_private_location_cli.sh",
+    "test:rules": "tools/test_firestore_rules.sh",
+    "test:storage-rules": "tools/test_storage_rules.sh"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
-    "firebase-tools": "^15.34.2"
+    "firebase-tools": "^15.36.0"
   }
 }

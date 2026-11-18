@@ -1,7 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -37,11 +37,11 @@ class _FakeFunctionsService extends FunctionsService {
 /// Records the messages that were sent instead of writing them to Firestore.
 class _FakeConversationRepository extends ConversationRepository {
   _FakeConversationRepository()
-      : super(
-          firestore: _FakeFirestore(),
-          auth: MockFirebaseAuth(),
-          functions: _FakeFunctionsService(),
-        );
+    : super(
+        firestore: _FakeFirestore(),
+        auth: MockFirebaseAuth(),
+        functions: _FakeFunctionsService(),
+      );
 
   final List<Map<String, String>> sent = [];
   bool markedRead = false;

@@ -1,5 +1,6 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'core/constants/app_constants.dart';
 import 'core/theme/app_theme.dart';
@@ -8,12 +9,16 @@ import 'core/routing/app_router.dart';
 import 'core/routing/back_to_dashboard.dart';
 import 'features/notifications/presentation/providers/notification_tap_handler.dart';
 import 'firebase/firebase_config.dart';
+import 'firebase/app_check/app_check_service.dart';
+import 'firebase/auth/auth_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   try {
-    await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
   } catch (e) {
     // Swallowing this error leaves the app running against a half
     // initialised Firebase: every screen then fails with confusing
@@ -21,6 +26,21 @@ void main() async {
     debugPrint('Firebase initialization failed: $e');
     runApp(const _FirebaseInitErrorApp());
     return;
+  }
+
+  // App Check has to be ready before the first Firestore, Storage or callable
+  // request. Activation failures are deliberately non-fatal while the
+  // provider is being rolled out; the server-side switch is the final gate.
+  await AppCheckService.activate();
+
+  // Configure persistence before the first frame. On native platforms Firebase
+  // already persists Auth state locally; the web build has to request it
+  // explicitly. A persistence failure must not stop the app from opening,
+  // but it has to be visible in the logs.
+  try {
+    await configureAuthPersistence(FirebaseAuth.instance);
+  } catch (e) {
+    debugPrint('Firebase Auth persistence could not be configured: $e');
   }
 
   // The theme mode is read **before** the first frame, so the app never
@@ -62,7 +82,9 @@ class StayServeApp extends ConsumerWidget {
       onNavigationNotification: handleNavigationNotification,
       builder: (context, child) {
         return MediaQuery(
-          data: MediaQuery.of(context).copyWith(textScaler: TextScaler.linear(1.0)),
+          data: MediaQuery.of(
+            context,
+          ).copyWith(textScaler: TextScaler.linear(1.0)),
           child: child!,
         );
       },

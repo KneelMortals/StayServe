@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:go_router/go_router.dart';
@@ -206,6 +206,15 @@ final userProfileProvider = FutureProvider.family<UserModel?, String>((
 /// The role of the currently signed-in user, resolved from their profile.
 final userRoleProvider = Provider<UserRole?>((ref) {
   return ref.watch(authSessionProvider).valueOrNull?.role;
+});
+
+/// The role stored in the live profile of the signed-in account.
+///
+/// Unlike [userRoleProvider], this does **not** fall back to `student` while
+/// the profile is still loading. Role-gated actions can therefore fail
+/// closed instead of briefly offering an action to the wrong role.
+final currentUserRoleProvider = Provider<UserRole?>((ref) {
+  return ref.watch(authSessionProvider).valueOrNull?.profile?.role;
 });
 
 final authControllerProvider = AsyncNotifierProvider<AuthController, void>(() {

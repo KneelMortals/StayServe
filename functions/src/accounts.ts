@@ -1,11 +1,51 @@
-import * as functions from 'firebase-functions';
-import * as admin from 'firebase-admin';
+import * as functions from 'firebase-functions/v1';
+import * as firestore from 'firebase-admin/firestore';
+
+import { canActAsRoomOwner, canBookAsStudent } from './bookingAccess';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-const db = admin.firestore();
+const db = firestore.getFirestore();
+
+/** The live profile fields used by the privileged-account checks. */
+export interface LiveAccountState {
+  exists: boolean;
+  registrationCompleted: unknown;
+  isActive: unknown;
+  role: unknown;
+}
+
+/** Whether a live profile may act as an administrator. */
+export function canActAsAdmin(profile: LiveAccountState): boolean {
+  return (
+    profile.exists &&
+    profile.registrationCompleted === true &&
+    profile.isActive === true &&
+    String(profile.role ?? '').trim().toLowerCase() === 'admin'
+  );
+}
+
+/**
+ * Reads a set of user profiles in a stable document-path order.
+ *
+ * Two administrators who act on each other at the same time would otherwise
+ * acquire the same two profile locks in opposite orders. A fixed order makes
+ * the transactions abort and retry instead of deadlocking.
+ */
+export async function readUserProfilesInPathOrder(
+  transaction: firestore.Transaction,
+  uids: string[],
+): Promise<Map<string, firestore.DocumentSnapshot>> {
+  const unique = Array.from(new Set(uids.filter(Boolean))).sort();
+  const snapshots = new Map<string, firestore.DocumentSnapshot>();
+  for (const uid of unique) {
+    const snapshot = await transaction.get(db.collection('users').doc(uid));
+    snapshots.set(uid, snapshot);
+  }
+  return snapshots;
+}
 
 /**
  * The state of an account.
@@ -31,7 +71,7 @@ export async function assertActiveAccount(uid: string): Promise<void> {
     );
   }
 
-  let snapshot: admin.firestore.DocumentSnapshot;
+  let snapshot: firestore.DocumentSnapshot;
   try {
     snapshot = await db.collection('users').doc(uid).get();
   } catch (error) {
@@ -71,18 +111,104 @@ export async function assertActiveAccount(uid: string): Promise<void> {
 }
 
 /**
+ * Checks the **live** student role of an account that wants to book a room.
+ *
+ * Booking is a student-only operation. The role is read from the live
+ * Firestore profile so an owner cannot bypass this check with an old token
+ * or by changing a field on the client.
+ */
+export async function assertLiveStudent(uid: string): Promise<void> {
+  if (!uid) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Please sign in before using this feature.',
+    );
+  }
+
+  let snapshot: firestore.DocumentSnapshot;
+  try {
+    // The role, registration state and active flag are read from the same
+    // snapshot. Reading them separately could combine values from two
+    // different versions of the profile.
+    snapshot = await db.collection('users').doc(uid).get();
+  } catch (error) {
+    console.error(`Could not read the profile of ${uid}:`, error);
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The account state could not be verified. Please try again.',
+    );
+  }
+
+  if (!snapshot.exists || snapshot.get('registrationCompleted') !== true) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Complete your registration before using this feature.',
+    );
+  }
+
+  if (snapshot.get('isActive') !== true) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'This account has been disabled. Please contact support.',
+    );
+  }
+
+  if (
+    !canBookAsStudent({
+      exists: snapshot.exists,
+      registrationCompleted: snapshot.get('registrationCompleted'),
+      isActive: snapshot.get('isActive'),
+      role: snapshot.get('role'),
+    })
+  ) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Only student accounts can book rooms.',
+    );
+  }
+}
+
+/**
  * Checks the **live** administrator role.
  *
  * The `admin` custom claim is copied into an ID token and remains valid
  * until that token expires. A demoted or banned admin could therefore keep
  * using the old token. The server-side role in Firestore is the source of
  * truth for an administrative operation.
+ *
+ * This helper is a **preflight check**: it rejects an account which is
+ * already known to be ineligible. A protected mutation must read the
+ * administrator profile again inside its own transaction, so a demotion
+ * which commits between this check and the write is still refused.
  */
 export async function assertLiveAdmin(uid: string): Promise<void> {
-  await assertActiveAccount(uid);
+  if (!uid) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Please sign in before using this feature.',
+    );
+  }
 
-  const snapshot = await db.collection('users').doc(uid).get();
-  if (!snapshot.exists || snapshot.get('role') !== 'admin') {
+  let snapshot: firestore.DocumentSnapshot;
+  try {
+    // The role, registration state and active flag come from one profile
+    // version. Reading them in separate snapshots could combine a live admin
+    // role with an account which was banned in between.
+    snapshot = await db.collection('users').doc(uid).get();
+  } catch (error) {
+    console.error(`Could not read the profile of ${uid}:`, error);
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The account state could not be verified. Please try again.',
+    );
+  }
+
+  if (!canActAsAdmin({
+    exists: snapshot.exists,
+    registrationCompleted: snapshot.get('registrationCompleted'),
+    isActive: snapshot.get('isActive'),
+    role: snapshot.get('role'),
+  })) {
     throw new functions.https.HttpsError(
       'permission-denied',
       'Admin access required',
@@ -99,10 +225,30 @@ export async function assertLiveAdmin(uid: string): Promise<void> {
  * cannot keep using an old token.
  */
 export async function assertLiveOwner(uid: string): Promise<void> {
-  await assertActiveAccount(uid);
+  if (!uid) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Please sign in before using this feature.',
+    );
+  }
 
-  const snapshot = await db.collection('users').doc(uid).get();
-  if (!snapshot.exists || snapshot.get('role') !== 'owner') {
+  let snapshot: firestore.DocumentSnapshot;
+  try {
+    snapshot = await db.collection('users').doc(uid).get();
+  } catch (error) {
+    console.error(`Could not read the profile of ${uid}:`, error);
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The account state could not be verified. Please try again.',
+    );
+  }
+
+  if (!canActAsRoomOwner({
+    exists: snapshot.exists,
+    registrationCompleted: snapshot.get('registrationCompleted'),
+    isActive: snapshot.get('isActive'),
+    role: snapshot.get('role'),
+  })) {
     throw new functions.https.HttpsError(
       'permission-denied',
       'Owner access required',
@@ -121,17 +267,48 @@ export async function assertLiveOwner(uid: string): Promise<void> {
 export async function assertLiveOwnerOrAdmin(
   uid: string,
 ): Promise<'owner' | 'admin'> {
-  await assertActiveAccount(uid);
+  if (!uid) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Please sign in before using this feature.',
+    );
+  }
 
-  const snapshot = await db.collection('users').doc(uid).get();
-  const role = snapshot.exists ? String(snapshot.get('role') || '') : '';
+  let snapshot: firestore.DocumentSnapshot;
+  try {
+    snapshot = await db.collection('users').doc(uid).get();
+  } catch (error) {
+    console.error(`Could not read the profile of ${uid}:`, error);
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The account state could not be verified. Please try again.',
+    );
+  }
 
-  if (role !== 'owner' && role !== 'admin') {
+  const role = snapshot.exists
+    ? String(snapshot.get('role') || '')
+        .trim()
+        .toLowerCase()
+    : '';
+  if (
+    !canActAsAdmin({
+      exists: snapshot.exists,
+      registrationCompleted: snapshot.get('registrationCompleted'),
+      isActive: snapshot.get('isActive'),
+      role,
+    }) &&
+    !canActAsRoomOwner({
+      exists: snapshot.exists,
+      registrationCompleted: snapshot.get('registrationCompleted'),
+      isActive: snapshot.get('isActive'),
+      role,
+    })
+  ) {
     throw new functions.https.HttpsError(
       'permission-denied',
       'Owner or admin access required',
     );
   }
 
-  return role;
+  return role as 'owner' | 'admin';
 }

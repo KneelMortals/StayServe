@@ -2,6 +2,18 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../core/constants/enums.dart';
 
+String _stringOr(dynamic value, String fallback) {
+  return value is String ? value : fallback;
+}
+
+String? _optionalString(dynamic value) {
+  return value is String ? value : null;
+}
+
+double _doubleOr(dynamic value, double fallback) {
+  return value is num ? value.toDouble() : fallback;
+}
+
 /// A platform-fee payment attached to a join request.
 ///
 /// The amount and the payee are decided by the server, never by the client,
@@ -59,20 +71,22 @@ class PaymentModel {
   factory PaymentModel.fromJson(Map<String, dynamic> json, String paymentId) {
     return PaymentModel(
       paymentId: paymentId,
-      requestId: json['requestId'] as String? ?? '',
-      studentId: json['studentId'] as String? ?? '',
-      ownerId: json['ownerId'] as String? ?? '',
-      roomId: json['roomId'] as String? ?? '',
-      amount: (json['amount'] as num?)?.toDouble() ?? 0,
-      feePercentage: (json['feePercentage'] as num?)?.toDouble() ?? 0,
-      reference: json['reference'] as String? ?? '',
-      method: json['method'] as String? ?? 'upi',
-      payeeVpa: json['payeeVpa'] as String? ?? '',
-      status: PaymentStatusX.fromString(json['status'] as String? ?? 'submitted'),
+      requestId: _stringOr(json['requestId'], ''),
+      studentId: _stringOr(json['studentId'], ''),
+      ownerId: _stringOr(json['ownerId'], ''),
+      roomId: _stringOr(json['roomId'], ''),
+      amount: _doubleOr(json['amount'], 0),
+      feePercentage: _doubleOr(json['feePercentage'], 0),
+      reference: _stringOr(json['reference'], ''),
+      method: _stringOr(json['method'], 'upi'),
+      payeeVpa: _stringOr(json['payeeVpa'], ''),
+      status: PaymentStatusX.fromString(
+        json['status'] is String ? json['status'] as String : 'submitted',
+      ),
       submittedAt: _toDate(json['submittedAt']) ?? DateTime.now(),
       verifiedAt: _toDate(json['verifiedAt']),
-      verifiedBy: json['verifiedBy'] as String?,
-      note: json['note'] as String?,
+      verifiedBy: _optionalString(json['verifiedBy']),
+      note: _optionalString(json['note']),
     );
   }
 

@@ -1,7 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -35,7 +35,7 @@ class _FakeFirestore implements FirebaseFirestore {
 
 class _FakeStudentRepository extends StudentRepository {
   _FakeStudentRepository()
-      : super(firestore: _FakeFirestore(), auth: MockFirebaseAuth());
+    : super(firestore: _FakeFirestore(), auth: MockFirebaseAuth());
 
   @override
   Future<bool> isRoomSaved(String roomId) async => false;
@@ -46,7 +46,7 @@ class _FakeLocationNotifier extends UserLocationNotifier {
   UserLocation? build() => null;
 }
 
-RoomModel _room({String ownerId = 'owner-1'}) {
+RoomModel _room({String ownerId = 'owner-1', List<String> images = const []}) {
   final now = DateTime(2026, 1, 1);
   return RoomModel(
     roomId: 'room-1',
@@ -55,20 +55,14 @@ RoomModel _room({String ownerId = 'owner-1'}) {
     description: 'A room for the test',
     monthlyRent: 12000,
     securityDeposit: 30000,
-    location: const Location(
-      address: 'MG Road',
-      city: 'Bengaluru',
-      state: 'Karnataka',
-      pincode: '560001',
-      latitude: 12.9716,
-      longitude: 77.5946,
-    ),
+    location: const Location(city: 'Bengaluru', state: 'Karnataka'),
     roomType: RoomType.single,
     furnishing: FurnishingType.semi,
     availableFrom: now,
     amenities: const ['WiFi'],
     occupancy: 1,
     genderPreference: GenderPreference.any,
+    images: images,
     status: RoomStatus.available,
     createdAt: now,
     updatedAt: now,
@@ -77,8 +71,9 @@ RoomModel _room({String ownerId = 'owner-1'}) {
 
 void main() {
   group('the owner cannot book their own room', () {
-    testWidgets('the booking buttons are gone on their own listing',
-        (tester) async {
+    testWidgets('the booking buttons are gone on their own listing', (
+      tester,
+    ) async {
       final user = MockUser(uid: 'owner-1', email: 'owner@example.com');
 
       final router = GoRouter(
@@ -96,17 +91,20 @@ void main() {
         ProviderScope(
           overrides: [
             currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.owner),
             authStateProvider.overrideWith((ref) => Stream.value(user)),
             roomProvider.overrideWith((ref, roomId) => Stream.value(_room())),
             userLocationProvider.overrideWith(_FakeLocationNotifier.new),
-            studentRepositoryProvider
-                .overrideWithValue(_FakeStudentRepository()),
-            studentJoinRequestProvider
-                .overrideWithValue(StudentJoinRequestRepository(
-              firestore: _FakeFirestore(),
-              auth: MockFirebaseAuth(),
-              functions: _NeverCalledFunctionsService(),
-            )),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
+            studentJoinRequestProvider.overrideWithValue(
+              StudentJoinRequestRepository(
+                firestore: _FakeFirestore(),
+                auth: MockFirebaseAuth(),
+                functions: _NeverCalledFunctionsService(),
+              ),
+            ),
           ],
           child: MaterialApp.router(routerConfig: router),
         ),
@@ -114,16 +112,12 @@ void main() {
       await tester.pumpAndSettle();
 
       // The owner sees their own listing — not a booking button.
-      expect(find.text('This is your listing. You cannot book your own room.'),
-          findsOneWidget);
       expect(
-        find.widgetWithText(AppButton, 'Request to Book'),
-        findsNothing,
+        find.text('This is your listing. You cannot book your own room.'),
+        findsOneWidget,
       );
-      expect(
-        find.widgetWithText(AppButton, 'Contact Owner'),
-        findsNothing,
-      );
+      expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
+      expect(find.widgetWithText(AppButton, 'Contact Owner'), findsNothing);
     });
 
     testWidgets('a student still gets the booking button', (tester) async {
@@ -144,11 +138,49 @@ void main() {
         ProviderScope(
           overrides: [
             currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.student),
             authStateProvider.overrideWith((ref) => Stream.value(user)),
             roomProvider.overrideWith((ref, roomId) => Stream.value(_room())),
             userLocationProvider.overrideWith(_FakeLocationNotifier.new),
-            studentRepositoryProvider
-                .overrideWithValue(_FakeStudentRepository()),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
+          ],
+          child: MaterialApp.router(routerConfig: router),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.widgetWithText(AppButton, 'Request to Book'), findsOneWidget);
+    });
+    testWidgets('an owner cannot book somebody else\'s room', (tester) async {
+      final user = MockUser(uid: 'owner-1', email: 'owner@example.com');
+
+      final router = GoRouter(
+        initialLocation: '/room/room-1',
+        routes: [
+          GoRoute(
+            path: '/room/:roomId',
+            builder: (context, state) =>
+                RoomDetailScreen(roomId: state.pathParameters['roomId']!),
+          ),
+        ],
+      );
+      addTearDown(router.dispose);
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.owner),
+            authStateProvider.overrideWith((ref) => Stream.value(user)),
+            roomProvider.overrideWith(
+              (ref, roomId) => Stream.value(_room(ownerId: 'owner-2')),
+            ),
+            userLocationProvider.overrideWith(_FakeLocationNotifier.new),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
           ],
           child: MaterialApp.router(routerConfig: router),
         ),
@@ -156,7 +188,91 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(
-        find.widgetWithText(AppButton, 'Request to Book'),
+        find.text(
+          'Room owners cannot book rooms. You can manage your own listings '
+          'and booking requests instead.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
+    });
+  });
+
+  group('the room photo gallery', () {
+    testWidgets('a student can reach every photo uploaded by the owner', (
+      tester,
+    ) async {
+      const images = [
+        'https://example.com/room-photo-1.jpg',
+        'https://example.com/room-photo-2.jpg',
+        'https://example.com/room-photo-3.jpg',
+      ];
+      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+      final router = GoRouter(
+        initialLocation: '/room/room-1',
+        routes: [
+          GoRoute(
+            path: '/room/:roomId',
+            builder: (context, state) =>
+                RoomDetailScreen(roomId: state.pathParameters['roomId']!),
+          ),
+        ],
+      );
+      addTearDown(router.dispose);
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.student),
+            authStateProvider.overrideWith((ref) => Stream.value(user)),
+            roomProvider.overrideWith(
+              (ref, roomId) => Stream.value(_room(images: images)),
+            ),
+            myJoinRequestsProvider.overrideWith(
+              (ref) => Stream.value(const []),
+            ),
+            userLocationProvider.overrideWith(_FakeLocationNotifier.new),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
+          ],
+          child: MaterialApp.router(routerConfig: router),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // The room uses a swipeable gallery instead of a single hero image.
+      expect(find.byType(PageView), findsOneWidget);
+
+      // Every photo also has its own thumbnail, so none of them is hidden.
+      for (final image in images) {
+        expect(
+          find.byKey(ValueKey('room-gallery-thumbnail-$image')),
+          findsOneWidget,
+        );
+      }
+      expect(find.text('1 / ${images.length}'), findsOneWidget);
+
+      // Selecting another thumbnail opens that exact photo.
+      await tester.tap(
+        find.byKey(
+          const ValueKey(
+            'room-gallery-thumbnail-https://example.com/room-photo-2.jpg',
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(find.text('2 / ${images.length}'), findsOneWidget);
+      expect(
+        find.byKey(
+          const ValueKey(
+            'room-gallery-image-https://example.com/room-photo-2.jpg',
+          ),
+        ),
         findsOneWidget,
       );
     });
@@ -186,8 +302,9 @@ void main() {
               ),
               GoRoute(
                 path: '/student/requests',
-                builder: (context, state) =>
-                    const Scaffold(body: Center(child: Text('Student Requests'))),
+                builder: (context, state) => const Scaffold(
+                  body: Center(child: Text('Student Requests')),
+                ),
               ),
             ],
           ),
@@ -205,9 +322,9 @@ void main() {
           overrides: [
             currentUserProvider.overrideWithValue(user),
             authStateProvider.overrideWith((ref) => Stream.value(user)),
-            authSessionProvider.overrideWith((ref) => Stream.value(
-                  AuthSession(user: user),
-                )),
+            authSessionProvider.overrideWith(
+              (ref) => Stream.value(AuthSession(user: user)),
+            ),
           ],
           child: MaterialApp.router(routerConfig: router),
         ),
@@ -331,9 +448,9 @@ void main() {
       final platformCalls = <MethodCall>[];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(SystemChannels.platform, (call) async {
-        platformCalls.add(call);
-        return null;
-      });
+            platformCalls.add(call);
+            return null;
+          });
       addTearDown(() {
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
             .setMockMethodCallHandler(SystemChannels.platform, null);
@@ -347,10 +464,7 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
-      expect(
-        find.text('Press back again to leave StayServe'),
-        findsOneWidget,
-      );
+      expect(find.text('Press back again to leave StayServe'), findsOneWidget);
       expect(
         platformCalls.where((c) => c.method == 'SystemNavigator.pop'),
         isEmpty,
@@ -379,15 +493,14 @@ void main() {
         initialLocation: '/owner/dashboard',
         routes: [
           ShellRoute(
-            builder: (context, state, child) => OwnerShell(
-              location: state.uri.path,
-              child: child,
-            ),
+            builder: (context, state, child) =>
+                OwnerShell(location: state.uri.path, child: child),
             routes: [
               GoRoute(
                 path: '/owner/dashboard',
-                builder: (context, state) =>
-                    const Scaffold(body: Center(child: Text('Owner Dashboard'))),
+                builder: (context, state) => const Scaffold(
+                  body: Center(child: Text('Owner Dashboard')),
+                ),
               ),
               GoRoute(
                 path: '/owner/rooms',
@@ -415,15 +528,14 @@ void main() {
         initialLocation: '/admin/dashboard',
         routes: [
           ShellRoute(
-            builder: (context, state, child) => AdminShell(
-              location: state.uri.path,
-              child: child,
-            ),
+            builder: (context, state, child) =>
+                AdminShell(location: state.uri.path, child: child),
             routes: [
               GoRoute(
                 path: '/admin/dashboard',
-                builder: (context, state) =>
-                    const Scaffold(body: Center(child: Text('Admin Dashboard'))),
+                builder: (context, state) => const Scaffold(
+                  body: Center(child: Text('Admin Dashboard')),
+                ),
               ),
               GoRoute(
                 path: '/admin/payments',
@@ -468,8 +580,9 @@ void main() {
       '/owner/requests',
       '/owner/invoices',
     ]) {
-      testWidgets('the back button on $section leads to the dashboard',
-          (tester) async {
+      testWidgets('the back button on $section leads to the dashboard', (
+        tester,
+      ) async {
         final user = MockUser(uid: 'owner-1', email: 'owner@example.com');
         final router = buildOwnerRouter();
         addTearDown(router.dispose);
@@ -490,8 +603,9 @@ void main() {
       });
     }
 
-    testWidgets('the back button on an admin screen leads to the dashboard',
-        (tester) async {
+    testWidgets('the back button on an admin screen leads to the dashboard', (
+      tester,
+    ) async {
       final user = MockUser(uid: 'admin-1', email: 'admin@example.com');
       final router = buildAdminRouter();
       addTearDown(router.dispose);
@@ -534,8 +648,9 @@ void main() {
       expect(find.text('Owner Dashboard'), findsOneWidget);
     });
 
-    testWidgets('a second back press on the dashboard asks to leave the app',
-        (tester) async {
+    testWidgets('a second back press on the dashboard asks to leave the app', (
+      tester,
+    ) async {
       final user = MockUser(uid: 'owner-1', email: 'owner@example.com');
       final router = buildOwnerRouter();
       addTearDown(router.dispose);
@@ -543,9 +658,9 @@ void main() {
       final platformCalls = <MethodCall>[];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(SystemChannels.platform, (call) async {
-        platformCalls.add(call);
-        return null;
-      });
+            platformCalls.add(call);
+            return null;
+          });
       addTearDown(() {
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
             .setMockMethodCallHandler(SystemChannels.platform, null);
@@ -566,10 +681,7 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
 
-      expect(
-        find.text('Press back again to leave StayServe'),
-        findsOneWidget,
-      );
+      expect(find.text('Press back again to leave StayServe'), findsOneWidget);
       expect(
         platformCalls.where((c) => c.method == 'SystemNavigator.pop'),
         isEmpty,
@@ -661,17 +773,11 @@ void main() {
     });
 
     test('an intent without a payee is refused', () {
-      expect(
-        UpiIntentValidator.validate('upi://pay?am=133.00'),
-        isNotNull,
-      );
+      expect(UpiIntentValidator.validate('upi://pay?am=133.00'), isNotNull);
     });
 
     test('an intent that is not a UPI link is refused', () {
-      expect(
-        UpiIntentValidator.validate('https://example.com/pay'),
-        isNotNull,
-      );
+      expect(UpiIntentValidator.validate('https://example.com/pay'), isNotNull);
     });
 
     test('an empty intent is refused', () {

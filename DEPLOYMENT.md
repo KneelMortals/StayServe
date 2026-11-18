@@ -11,23 +11,28 @@ delivery.
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Flutter | 3.44.1 (Dart 3.12.1) | `flutter --version` |
+| Flutter | 3.50.0 (Dart 3.14.0) | `flutter --version` |
 | Node.js | 22 | Required by `functions/` (`"runtime": "nodejs22"` in `firebase.json`) |
-| Firebase CLI | latest | `npm i -g firebase-tools` |
+| Firebase CLI | 15.36.0 | Root `npm ci` installs the pinned local copy |
 
 Firebase project: **`myfirstapp-fa30f52b`**
 Android app id: `1:96035616668:android:cfc3cf3dab21aa9488fa59`
+
+The commands below are shown as `firebase`. If Firebase CLI is installed only by
+the root `npm ci`, run them as `npx firebase ...` from the repository root.
 
 ---
 
 ## 2. Firebase configuration lives in the repo
 
-`lib/firebase/firebase_config.dart` contains the Firebase options and is
-currently **Android-only**.
+`lib/firebase/firebase_config.dart` contains separate Android and iOS
+Firebase options.
 
-> **Known limitation:** iOS and web builds will fail to initialise Firebase
-> because no `iosOptions` / `webOptions` are present. Add them before
-> targeting those platforms.
+> **Known limitation:** the Firebase project has no registered Web app. The
+> current web target falls back to the Android options, so the web bundle can
+> be compiled but browser authentication is not production-ready. Register a
+> Web app in the Firebase console and add its options before publishing the
+> site.
 
 ---
 
@@ -37,12 +42,20 @@ currently **Android-only**.
 
 ```bash
 cd functions
-npm install
+npm ci --engine-strict
 ```
 
 The OTP implementation deliberately adds **zero new npm dependencies** — it
 uses the global `fetch` available in Node 18+, so only `firebase-admin` and
 `firebase-functions` are required.
+
+> **Why `functions/package.json` contains overrides:** `firebase-admin`
+> 14.5.1 accepts `@firebase/database-compat` 2.1.4 or newer, but release
+> 2.1.8 raised that package's Node requirement to 24.12. Firebase Functions
+> currently supports Node 22, not Node 24. The lock therefore keeps
+> `@firebase/database-compat` 2.1.7 and `@firebase/database` 1.1.5, the
+> newest pair that still supports Node 20/22. Do not remove those overrides
+> without checking the transitive `engines` field under Node 22.
 
 ### 3.2 Type-check
 
@@ -196,6 +209,26 @@ firebase deploy --only \
 > admin payments list and the student payments list fail with
 > "The query requires an index". Deploy them with
 > `firebase deploy --only firestore:indexes`.
+
+### 3.7 Firebase App Check (staged rollout)
+
+The Android and iOS clients activate App Check automatically. Callable
+enforcement is controlled by one environment variable and is **off by
+default** so an unregistered provider cannot take the API offline:
+
+```dotenv
+# functions/.env
+APP_CHECK_ENFORCE=false
+```
+
+Register the Android/iOS apps, release providers and debug tokens first. Set
+the value to `true` and redeploy the functions only after every supported
+client has a valid token. Firestore and Storage enforcement are separate
+Firebase Console settings and must only be enabled after the callable rollout
+has succeeded.
+
+The complete rollout and rollback checklist is in
+[`docs/APP_CHECK_ROLLOUT.md`](docs/APP_CHECK_ROLLOUT.md).
 
 ---
 
@@ -435,19 +468,23 @@ backfill is complete — from that point on a missing value is always denied.
 
 ### 5.2 Testing the rules locally
 
-The rules are covered by an automated test suite that runs against the
-Firestore emulator:
+The rules are covered by automated test suites that run against the local
+Firestore and Storage emulators:
 
 ```bash
 cd ~/Desktop/StayServe
 tools/test_firestore_rules.sh
+tools/test_storage_rules.sh
 ```
 
-It starts the emulator, exercises 99 allow/deny assertions (the account
-state, the profile writes, the room fields, the server-owned booking,
-payment and invoice collections, the notification bookkeeping, the two-party
-messaging, the capacity guard and the migration switch) and prints a summary.
-It exits with a non-zero status if an assertion fails.
+The Firestore suite exercises 170 allow/deny assertions (the account state,
+profile writes, room fields and image lists, server-owned booking/payment/
+invoice collections, notification bookkeeping, two-party messaging, capacity
+guards and the migration switch). The Storage suite starts Firestore and
+Storage together and exercises 30 assertions covering owner isolation, live
+role changes, admin isolation, image type/size validation, deletes and the
+production two-document-access invariant. Both suites print a summary and exit
+with a non-zero status if an assertion fails.
 
 ### 5.3 Testing the *deployed* rules
 
@@ -467,13 +504,15 @@ is removed again, including the account.
 
 Run it after every rules deployment. It needs `firebase login` (no
 service-account key) and it **writes to the production database**: the
-throw-away account, its profile, one notification and one room listing are
-created and deleted again.
+throw-away account, its profile, one notification and two complete
+public/private room listings are created and deleted again.
 
 > **Current status:** the rules are deployed and the script reports
-> **44 passed, 0 failed** against the real project (it creates the throw-away
-> account, promotes it through the server-side channel, seeds the notification
-> and removes everything again — the database is verified clean afterwards).
+> **46 passed, 0 failed** against the real project (it creates the throw-away
+> account, promotes it through the server-side channel, creates two complete
+> public/private listings, exercises the critical allow/deny paths and removes
+> every listing, profile, notification and completed cleanup-job artifact
+> again — the database is verified clean afterwards).
 >
 > The listing assertions are:
 >
@@ -520,7 +559,33 @@ created and deleted again.
 > `Error compiling rules: L<line>:<column> Unexpected 'if'`, which is easy to
 > miss because it only surfaces when the first request hits the emulator.
 
-### 5.4 Storage rules
+### 5.4 Production core-flow smoke test
+
+The deployed-rules check proves individual allow/deny paths. The separate
+core-flow script proves that those paths still work together in production:
+
+```bash
+cd ~/Desktop/StayServe
+node tools/production_core_flow_smoke.mjs
+```
+
+It creates one disposable live owner, one disposable live student, one room
+photo, one public/private listing, one booking request, one verified
+conversation and one message. It then exercises owner create/edit, the private
+location callable, student-only booking, owner approval, student confirmation,
+the accepted-student visit details, messaging, listing deletion and both
+account-deletion triggers. The script deletes the listing through
+`deleteRoomListing`, deletes both Auth accounts, removes the completed
+account-deletion job tombstones and verifies that no disposable profile,
+request, lock, conversation, notification, private location, cleanup job or
+Storage object remains.
+
+> **Current status:** the script reports **25 passed, 0 failed** against
+> `myfirstapp-fa30f52b`. It needs `firebase login` and deliberately writes
+> disposable production data while it runs; every artifact is removed before
+> the command exits.
+
+### 5.5 Storage rules
 
 `storage.rules` is deployed with:
 
@@ -533,10 +598,19 @@ alone is not enough, because a demoted admin keeps the old claim until the
 token expires:
 
 * `rooms/{ownerId}/{roomId}/{fileName}` may be read by every live, registered
-  account and written by the live owner of that folder (images only, below
-  10 MB);
-* everything else may be read by a live, registered account and written by a
-  live admin.
+  account and written only by the live owner of that folder (non-empty image
+  objects up to 5 MiB);
+* `admin/{fileName}` may be written by a live administrator;
+* every other client write is denied. In particular, an administrator cannot
+  overwrite or delete an owner's room image through the Storage API.
+
+A room-photo write reads exactly two distinct Firestore documents: the
+caller's live profile and the durable `roomDeletionTombstones/{roomId}`
+reservation. Firebase permits at most two distinct Firestore documents in one
+Storage Rules evaluation, so the rule must not also read the public room
+document. The listing-deletion transaction commits the tombstone together
+with the room's `deletionInProgress` marker; the tombstone therefore closes
+the upload path both during deletion and after the room document is gone.
 
 The rules are **fail-closed**: a profile without `registrationCompleted: true`
 or with `isActive: false` has no access at all. Backfill the legacy profiles
@@ -693,8 +767,10 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    optional contact information. This is deliberate: SMS costs roughly
    INR 0.25–7 per message and the feature is not paid for yet. Turning it
    back on is documented in section 3.3.
-2. **iOS / web are not configured.** `firebase_config.dart` only contains
-   Android options. iOS and web builds will crash on `Firebase.initializeApp()`.
+2. **The web target is not production-configured.** Android and iOS options
+   are present, but the Firebase project has no registered Web app. The web
+   bundle compiles with the Android fallback, but browser authentication needs
+   a real Web-app configuration before publishing.
 3. **The UPI VPA is duplicated in two places** — the `PLATFORM_UPI_VPA`
    environment variable of the Cloud Function and
    `AppConstants.platformUpiVpa` in the app. The client asserts that both
@@ -708,48 +784,54 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
 5. **OTP delivery is not end-to-end encrypted** — the code is hashed at rest
    in Firestore, but it travels over the provider's own channel (email/SMS).
    Consider adding a second factor for admin accounts.
-6. **`npm audit` reports 11 advisories** (1 low, 10 moderate, no high or
-   critical) in `functions/`. Worth running `npm audit fix` before a
-   production release.
-7. **The Flutter test suite is growing but still thin in places.** There are
-   now 266 Dart/widget tests (session, routing, booking, payment, chat,
-   layout, button audit), 34 backend state-machine checks, 16 room
-   listing/deletion checks and 99 Firestore-rules assertions in the
-   emulator. The OTP sign-up flow is additionally covered end to end by
-   `tools/signup_e2e.mjs` (real mail → code → verify → profile written), and
-   the "owner uploads a room → the student sees it" path by
-   `tools/verify_room_visibility.mjs`.
-8. **The project is not under version control.** Every edit is a direct
-   filesystem change, so there is no way to roll back.
-9. **The custom claims are attached asynchronously.** The `onUserCreate`
-   trigger and `completeRegistration` set the `role` / `admin` claims *after*
-   the account was created, so the token issued at sign-up does not carry
-   them. The app now refreshes the token after registration, on session start
-   and after a role change, but a third-party client that talks to the
-   project directly would have to do the same.
-10. **The exact address of a room is still readable by every registered
-    account.** `rooms/{id}.location` holds the address and the coordinates
-    in the public document. The app only shows the exact location to the
-    participants, but a modified client can still read the whole document.
-    The fix needs the public/private split that
-    [`docs/PRIVATE_LOCATION_MIGRATION.md`](docs/PRIVATE_LOCATION_MIGRATION.md)
-    describes — it is **not** part of this repair round.
+6. **The root dev dependency still carries 13 moderate `npm audit`
+   advisories.** They all come through `firebase-tools` and affect the local
+   CLI/emulator toolchain, not the deployed Functions. The Functions runtime
+   itself has **0** production advisories. The audit's suggested fix is an
+   unsafe downgrade of `firebase-tools`, so it is intentionally not applied.
+7. **Some end-to-end paths still depend on external services.** The local
+   suite contains 303 Dart/widget tests, 416 backend callable
+   state-machine/security checks, 170 Firestore-rules assertions and 30
+   Storage-rules assertions. The private-location operator CLI has its own
+   regression suite. Against production, the deployed-rules check reports 46
+   passing assertions and the isolated core-flow smoke test reports 25; both
+   remove their disposable artifacts before exiting. The OTP sign-up flow is
+   additionally covered end to end by `tools/signup_e2e.mjs` (real mail → code
+   → verify → profile written).
+8. **The repair diff is currently local and uncommitted.** The project is
+   under Git control on `main`, but no commit or push has been made. Several
+   audited artifacts have been deployed to production; review and commit the
+   complete diff before treating the repository as a reproducible release.
+9. **The custom claims are attached asynchronously.** `completeRegistration`
+   and the revision-aware role-claim jobs publish the `role` / `admin` claims
+   after the authoritative Firestore profile changes, so the token issued at
+   sign-up may not carry them immediately. The app refreshes the token after
+   registration, on session start and after a role change, but a third-party
+   client that talks to the project directly would have to do the same.
+10. **Old clients need a minimum-version or force-update transition.** The
+    production location rollout is finalized: exact addresses live only in
+    `roomPrivate/{roomId}`, public listings retain city/state and the rounded
+    `geoCell`, and the durable privacy latch prevents the legacy exact-write
+    window from reopening. An old client can therefore no longer save an exact
+    public location or create a conversation directly. Distribution should
+    require a current client version before old builds are retired.
 11. **A live mailbox bearer token was committed in `.mail_inbox.json`.** The
     file has been deleted and is git-ignored, but the token is still valid at
     the mail provider: **rotate/revoke it there.** Anyone who read the old
     repository can read the OTP inbox until it is revoked.
-12. **The stricter rules need the legacy profiles to be backfilled first.**
-    The backfill has been applied for this project (the only legacy profile
-    was the admin account), but a new account created before the marker was
-    introduced would have no access at all until it is backfilled — or until
-    the temporary legacy window (section 5.1.2) is opened. The same applies
-    to the listings: `tools/backfill_rooms.mjs` has filled the two existing
-    listings with their `status` / `currentOccupancy`.
-13. **The new Firestore rules and the Cloud Functions are deployed.** The
-    production check reports **44 passed, 0 failed** (section 5.3). The
-    `onRoomCreated` trigger gives a listing the server-owned defaults when a
-    client leaves them out — it has to stay deployed, otherwise a listing of
-    an older app version would be invisible in the student search.
+12. **The stricter rules and legacy backfills are live.** All five production
+    profiles are active and registration-complete. The two pre-existing
+    listings received the server-owned `status` / `currentOccupancy` values,
+    and both now have exactly one matching private location. A newly created
+    legacy-shaped profile would still need the documented backfill or the
+    temporary legacy window, but there is no remaining production profile in
+    that state.
+13. **The new Firestore rules and all 43 Cloud Functions are deployed.** The
+    deployed Firestore and Storage rules match the tested local files, every
+    function is `ACTIVE` on Node.js 22, and the complete private-location
+    verification reports `publicExactRemaining = 0`. The `onRoomCreated`
+    trigger must remain deployed: it assigns the server-owned listing
+    defaults and the immutable listing generation.
 
 ---
 

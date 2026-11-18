@@ -1,6 +1,6 @@
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -116,13 +116,12 @@ UserModel _profile() {
 
 void main() {
   group('the verification code', () {
-    testWidgets('the error stays visible when the code was wrong',
-        (tester) async {
+    testWidgets('the error stays visible when the code was wrong', (
+      tester,
+    ) async {
       await tester.pumpWidget(
         ProviderScope(
-          overrides: [
-            otpServiceProvider.overrideWithValue(_WrongOtpService()),
-          ],
+          overrides: [otpServiceProvider.overrideWithValue(_WrongOtpService())],
           child: const MaterialApp(
             home: OtpVerificationScreen(
               channel: OtpChannel.email,
@@ -149,8 +148,9 @@ void main() {
       expect(field.controller?.text, isEmpty);
     });
 
-    testWidgets('a failed request does not claim that a code was sent',
-        (tester) async {
+    testWidgets('a failed request does not claim that a code was sent', (
+      tester,
+    ) async {
       await tester.pumpWidget(
         ProviderScope(
           overrides: [
@@ -184,9 +184,8 @@ void main() {
         routes: [
           GoRoute(
             path: '/home',
-            builder: (context, state) => const Scaffold(
-              body: Center(child: Text('HOME')),
-            ),
+            builder: (context, state) =>
+                const Scaffold(body: Center(child: Text('HOME'))),
           ),
           GoRoute(
             path: '/student/profile/edit',
@@ -277,22 +276,21 @@ void main() {
   });
 
   group('the route of a push notification', () {
-    testWidgets('the route is remembered while the splash screen is running',
-        (tester) async {
+    testWidgets('the route is remembered while the splash screen is running', (
+      tester,
+    ) async {
       final router = GoRouter(
         initialLocation: '/splash',
         routes: [
           GoRoute(
             path: '/splash',
-            builder: (context, state) => const Scaffold(
-              body: Center(child: Text('SPLASH')),
-            ),
+            builder: (context, state) =>
+                const Scaffold(body: Center(child: Text('SPLASH'))),
           ),
           GoRoute(
             path: '/owner/requests',
-            builder: (context, state) => const Scaffold(
-              body: Center(child: Text('OWNER REQUESTS')),
-            ),
+            builder: (context, state) =>
+                const Scaffold(body: Center(child: Text('OWNER REQUESTS'))),
           ),
         ],
       );
@@ -309,10 +307,7 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(
-        router.routerDelegate.currentConfiguration.uri.path,
-        '/splash',
-      );
+      expect(router.routerDelegate.currentConfiguration.uri.path, '/splash');
 
       // The route of the notification is written down — the splash screen
       // picks it up instead of opening the home screen.

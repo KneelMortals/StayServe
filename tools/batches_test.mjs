@@ -77,8 +77,20 @@ function section(title) {
 const { deleteWhere, deleteWhereAsync, updateWhere, PAGE_SIZE, BATCH_SIZE } =
   require(join(ROOT, 'functions', 'lib', 'batches.js'));
 
-const admin = require(join(ROOT, 'functions', 'node_modules', 'firebase-admin'));
-const db = admin.firestore();
+// Firebase Admin 14 exposes the services through modular entry points.
+// The compiled batch helper initializes the default app when it is loaded
+// above, so Firestore can now be opened without the removed
+// `admin.firestore()` namespace helper.
+const firestore = require(join(
+  ROOT,
+  'functions',
+  'node_modules',
+  'firebase-admin',
+  'lib',
+  'firestore',
+  'index.js',
+));
+const db = firestore.getFirestore();
 
 async function clear() {
   const collections = await db.listCollections();

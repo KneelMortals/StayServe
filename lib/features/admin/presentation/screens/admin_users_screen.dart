@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/index.dart';
@@ -40,7 +40,9 @@ class _AdminUsersScreenState extends ConsumerState<AdminUsersScreen> {
               // The indicator has to wait for the **new** data —
               // `invalidate` returns nothing, so the spinner
               // disappeared while the list was still loading.
-              final _ = await ref.refresh(adminUsersProvider(_roleFilter).future);
+              final _ = await ref.refresh(
+                adminUsersProvider(_roleFilter).future,
+              );
             },
             child: ListView.builder(
               padding: const EdgeInsets.all(AppSpacing.md),
@@ -106,10 +108,9 @@ class _AdminUsersScreenState extends ConsumerState<AdminUsersScreen> {
       builder: (dialogContext) => _BanDialog(name: user.name),
     ).then((reason) async {
       if (reason == null || !screenContext.mounted) return;
-      final error = await ref.read(adminControllerProvider.notifier).banUser(
-            user.uid,
-            reason: reason.isNotEmpty ? reason : null,
-          );
+      final error = await ref
+          .read(adminControllerProvider.notifier)
+          .banUser(user.uid, reason: reason.isNotEmpty ? reason : null);
       if (!screenContext.mounted) return;
       screenContext.showErrorIfAny(error);
     });
@@ -154,7 +155,8 @@ class _AdminUsersScreenState extends ConsumerState<AdminUsersScreen> {
                     ChoiceChip(
                       label: Text(option == 1 ? '1 day' : '$option days'),
                       selected: graceDays == option,
-                      onSelected: (_) => setDialogState(() => graceDays = option),
+                      onSelected: (_) =>
+                          setDialogState(() => graceDays = option),
                     ),
                 ],
               ),
@@ -248,15 +250,47 @@ class _AdminUsersScreenState extends ConsumerState<AdminUsersScreen> {
           'grace period. This action cannot be undone.',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
           TextButton(
             onPressed: () async {
               Navigator.pop(dialogContext);
-              final error = await ref
-                  .read(adminControllerProvider.notifier)
-                  .deleteUser(user.uid);
+              final controller = ref.read(adminControllerProvider.notifier);
+              final error = await controller.deleteUser(user.uid);
               if (!screenContext.mounted) return;
-              screenContext.showErrorIfAny(error);
+              if (screenContext.showErrorIfAny(error)) return;
+
+              final result = controller.lastDeletionResult;
+              if (result == null) {
+                screenContext.showSuccessSnackBar(
+                  'The deletion request for ${user.name} was submitted.',
+                );
+                return;
+              }
+
+              if (result.completed) {
+                screenContext.showSuccessSnackBar(
+                  'Deletion completed — state: ${result.state}.',
+                );
+                return;
+              }
+
+              if (result.blocked) {
+                screenContext.showWarningSnackBar(
+                  'Deletion blocked — state: ${result.state}. '
+                  'Retryable: no. '
+                  '${result.message.isEmpty ? 'The request remains queued.' : result.message}',
+                );
+                return;
+              }
+
+              screenContext.showWarningSnackBar(
+                'Deletion queued — state: ${result.state}. '
+                'Retryable: ${result.retryable ? 'yes' : 'no'}. '
+                '${result.message}',
+              );
             },
             style: TextButton.styleFrom(foregroundColor: Colors.red),
             child: const Text('Delete now'),
@@ -315,7 +349,8 @@ class _BanDialogState extends State<_BanDialog> {
           child: const Text('Cancel'),
         ),
         TextButton(
-          onPressed: () => Navigator.pop(context, _reasonController.text.trim()),
+          onPressed: () =>
+              Navigator.pop(context, _reasonController.text.trim()),
           style: TextButton.styleFrom(foregroundColor: Colors.red),
           child: const Text('Ban User'),
         ),
@@ -369,7 +404,11 @@ class _UserCard extends ConsumerWidget {
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                AppAvatar(name: user.name, radius: 24, imageUrl: user.profileImage),
+                AppAvatar(
+                  name: user.name,
+                  radius: 24,
+                  imageUrl: user.profileImage,
+                ),
                 const SizedBox(width: AppSpacing.md),
                 Expanded(
                   child: Column(
@@ -429,7 +468,10 @@ class _UserCard extends ConsumerWidget {
                     }
                   },
                   itemBuilder: (context) => [
-                    const PopupMenuItem(value: 'role', child: Text('Change Role')),
+                    const PopupMenuItem(
+                      value: 'role',
+                      child: Text('Change Role'),
+                    ),
                     if (user.deletionScheduled)
                       const PopupMenuItem(
                         value: 'cancelDeletion',
@@ -482,7 +524,9 @@ class _UserCard extends ConsumerWidget {
                 ),
                 Switch(
                   value: user.isActive,
-                  onChanged: adminState.isLoading ? null : (value) => onToggleActive(value),
+                  onChanged: adminState.isLoading
+                      ? null
+                      : (value) => onToggleActive(value),
                 ),
               ],
             ),
@@ -507,10 +551,14 @@ class _UserCard extends ConsumerWidget {
           },
           child: Column(
             mainAxisSize: MainAxisSize.min,
-            children: UserRole.values.map((role) => RadioListTile<UserRole>(
-              title: Text(role.displayName),
-              value: role,
-            )).toList(),
+            children: UserRole.values
+                .map(
+                  (role) => RadioListTile<UserRole>(
+                    title: Text(role.displayName),
+                    value: role,
+                  ),
+                )
+                .toList(),
           ),
         ),
       ),
@@ -586,7 +634,10 @@ class _RoleBadge extends StatelessWidget {
         break;
     }
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.sm,
+        vertical: AppSpacing.xs,
+      ),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(AppBorderRadius.full),

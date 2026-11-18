@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -41,8 +41,9 @@ void main() {
     return ProviderScope(
       overrides: [
         myJoinRequestsProvider.overrideWith((ref) => Stream.value(requests)),
-        roomReviewsProvider('RM-1')
-            .overrideWith((ref) => Stream.value(reviews)),
+        roomReviewsProvider(
+          'RM-1',
+        ).overrideWith((ref) => Stream.value(reviews)),
         myRoomReviewProvider('RM-1').overrideWith((ref) => Stream.value(null)),
       ],
       child: const MaterialApp(
@@ -51,8 +52,9 @@ void main() {
     );
   }
 
-  testWidgets('a student without an accepted request gets no review form',
-      (tester) async {
+  testWidgets('a student without an accepted request gets no review form', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       screen(requests: [request(status: JoinRequestStatus.pending)]),
     );
@@ -86,8 +88,9 @@ void main() {
     expect(find.text('Publish review'), findsOneWidget);
   });
 
-  testWidgets('the confirmation of the student shows the review form too',
-      (tester) async {
+  testWidgets('the confirmation of the student shows the review form too', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       screen(requests: [request(status: JoinRequestStatus.studentConfirmed)]),
     );
@@ -96,15 +99,13 @@ void main() {
     expect(find.text('Write a review'), findsOneWidget);
   });
 
-  testWidgets('the acceptance of another room does not show the form',
-      (tester) async {
+  testWidgets('the acceptance of another room does not show the form', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       screen(
         requests: [
-          request(
-            status: JoinRequestStatus.ownerConfirmed,
-            roomId: 'RM-2',
-          ),
+          request(status: JoinRequestStatus.ownerConfirmed, roomId: 'RM-2'),
         ],
       ),
     );

@@ -24,6 +24,26 @@ InvoiceStatus _parseInvoiceStatus(String value) {
   );
 }
 
+String _stringOr(dynamic value, String fallback) {
+  return value is String ? value : fallback;
+}
+
+String? _optionalString(dynamic value) {
+  return value is String ? value : null;
+}
+
+double _doubleOr(dynamic value, double fallback) {
+  return value is num ? value.toDouble() : fallback;
+}
+
+double? _optionalDouble(dynamic value) {
+  return value is num ? value.toDouble() : null;
+}
+
+bool _boolOr(dynamic value, bool fallback) {
+  return value is bool ? value : fallback;
+}
+
 class JoinRequestModel {
   final String requestId;
   final String roomId;
@@ -96,10 +116,10 @@ class JoinRequestModel {
 
   factory JoinRequestModel.fromJson(Map<String, dynamic> json) {
     return JoinRequestModel(
-      requestId: json['requestId'] as String? ?? '',
-      roomId: json['roomId'] as String? ?? '',
-      studentId: json['studentId'] as String? ?? '',
-      ownerId: json['ownerId'] as String? ?? '',
+      requestId: _stringOr(json['requestId'], ''),
+      roomId: _stringOr(json['roomId'], ''),
+      studentId: _stringOr(json['studentId'], ''),
+      ownerId: _stringOr(json['ownerId'], ''),
       status: _parseJoinRequestStatus(
         json['status'] is String ? json['status'] as String : '',
       ),
@@ -109,22 +129,24 @@ class JoinRequestModel {
       ownerConfirmedAt: _toDateOrNull(json['ownerConfirmedAt']),
       adminReviewedAt: _toDateOrNull(json['adminReviewedAt']),
       rejectedAt: _toDateOrNull(json['rejectedAt']),
-      rejectionReason: json['rejectionReason'] as String?,
-      monthlyRentAtJoin: (json['monthlyRentAtJoin'] as num?)?.toDouble() ?? 0,
-      commissionPercentageAtJoin:
-          (json['commissionPercentageAtJoin'] as num?)?.toDouble() ?? 0,
-      invoiceId: json['invoiceId'] as String?,
-      advancePaid: json['advancePaid'] as bool? ?? false,
-      advanceAmount: (json['advanceAmount'] as num?)?.toDouble(),
-      advancePaymentReference: json['advancePaymentReference'] as String?,
-      advancePaymentMethod: json['advancePaymentMethod'] as String?,
-      advanceUpiTransactionId: json['advanceUpiTransactionId'] as String?,
+      rejectionReason: _optionalString(json['rejectionReason']),
+      monthlyRentAtJoin: _doubleOr(json['monthlyRentAtJoin'], 0),
+      commissionPercentageAtJoin: _doubleOr(
+        json['commissionPercentageAtJoin'],
+        0,
+      ),
+      invoiceId: _optionalString(json['invoiceId']),
+      advancePaid: _boolOr(json['advancePaid'], false),
+      advanceAmount: _optionalDouble(json['advanceAmount']),
+      advancePaymentReference: _optionalString(json['advancePaymentReference']),
+      advancePaymentMethod: _optionalString(json['advancePaymentMethod']),
+      advanceUpiTransactionId: _optionalString(json['advanceUpiTransactionId']),
       advancePaidAt: _toDateOrNull(json['advancePaidAt']),
       advancePaymentStatus: json['advancePaymentStatus'] is String
           ? PaymentStatusX.fromString(json['advancePaymentStatus'] as String)
           : null,
-      platformCutTaken: json['platformCutTaken'] as bool? ?? false,
-      platformFeePayer: json['platformFeePayer'] as String? ?? 'owner',
+      platformCutTaken: _boolOr(json['platformCutTaken'], false),
+      platformFeePayer: _stringOr(json['platformFeePayer'], 'owner'),
     );
   }
 
@@ -312,24 +334,23 @@ class CommissionInvoiceModel {
 
   factory CommissionInvoiceModel.fromJson(Map<String, dynamic> json) {
     return CommissionInvoiceModel(
-      invoiceId: json['invoiceId'] as String? ?? '',
-      roomId: json['roomId'] as String? ?? '',
-      ownerId: json['ownerId'] as String? ?? '',
-      tenantId: json['tenantId'] as String? ?? '',
-      joinRequestId: json['joinRequestId'] as String? ?? '',
-      monthlyRent: (json['monthlyRent'] as num?)?.toDouble() ?? 0,
-      commissionPercentage:
-          (json['commissionPercentage'] as num?)?.toDouble() ?? 0,
-      commissionAmount: (json['commissionAmount'] as num?)?.toDouble() ?? 0,
+      invoiceId: _stringOr(json['invoiceId'], ''),
+      roomId: _stringOr(json['roomId'], ''),
+      ownerId: _stringOr(json['ownerId'], ''),
+      tenantId: _stringOr(json['tenantId'], ''),
+      joinRequestId: _stringOr(json['joinRequestId'], ''),
+      monthlyRent: _doubleOr(json['monthlyRent'], 0),
+      commissionPercentage: _doubleOr(json['commissionPercentage'], 0),
+      commissionAmount: _doubleOr(json['commissionAmount'], 0),
       status: _parseInvoiceStatus(
         json['status'] is String ? json['status'] as String : '',
       ),
       createdAt: _toDate(json['createdAt']),
       updatedAt: _toDate(json['updatedAt']),
       paidAt: _toDateOrNull(json['paidAt']),
-      paymentReference: json['paymentReference'] as String?,
-      paymentMethod: json['paymentMethod'] as String?,
-      upiTransactionId: json['upiTransactionId'] as String?,
+      paymentReference: _optionalString(json['paymentReference']),
+      paymentMethod: _optionalString(json['paymentMethod']),
+      upiTransactionId: _optionalString(json['upiTransactionId']),
     );
   }
 

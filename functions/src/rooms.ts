@@ -1,5 +1,8 @@
-import * as admin from 'firebase-admin';
-import * as functions from 'firebase-functions';
+import * as firestore from 'firebase-admin/firestore';
+import * as functions from 'firebase-functions/v1';
+import { callableHttps } from './appCheck';
+import * as storage from 'firebase-admin/storage';
+import * as crypto from 'crypto';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
@@ -9,11 +12,629 @@ import {
   assertLiveAdmin,
   assertLiveOwner,
   assertLiveOwnerOrAdmin,
+  canActAsAdmin,
 } from './accounts';
+import { canActAsRoomOwner } from './bookingAccess';
 import { isActiveBookingStatus } from './bookings';
+import {
+  isValidCurrentOccupancy,
+  isValidRoomCapacity,
+} from './roomValidation';
+import { PAGE_SIZE } from './batches';
 import { notify } from './notifications';
 
-const db = admin.firestore();
+const db = firestore.getFirestore();
+
+/**
+ * The durable cleanup-job id for one listing generation and cleanup kind.
+ *
+ * The owner, room id and immutable listing generation are all part of the
+ * identity. A pending cleanup can therefore never be merged into a later
+ * listing which happens to reuse the same room id.
+ */
+function roomPhotoCleanupJobId(
+  ownerId: string,
+  roomId: string,
+  listingGeneration: string,
+  kind: string,
+): string {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${kind}:${ownerId}:${roomId}:${listingGeneration}`)
+    .digest('hex');
+  return `room-photo-cleanup-${digest}`;
+}
+
+/** The durable job which resumes an interrupted listing deletion. */
+function roomDeletionJobId(roomId: string): string {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`room-deletion:${roomId}`)
+    .digest('hex');
+  return `room-deletion-${digest}`;
+}
+
+/**
+ * The immutable generation of one room listing.
+ *
+ * New listings receive a server-generated UUID. Legacy listings fall back to
+ * a stable digest of their owner, id and creation time so that their cleanup
+ * jobs are still separated from a later listing with the same id.
+ */
+function roomListingGeneration(room: Record<string, any>): string {
+  const data = room;
+  const explicit = String(data?.listingGeneration || '').trim();
+  if (explicit) return explicit;
+
+  const ownerId = String(data?.ownerId || '').trim();
+  const roomId = String(data?.roomId || '').trim();
+  const createdAt = data?.createdAt;
+  const createdMillis =
+    createdAt && typeof createdAt.toMillis === 'function'
+      ? String(createdAt.toMillis())
+      : String(createdAt || '');
+  const legacyDigest = crypto
+    .createHash('sha256')
+    .update(`${ownerId}:${roomId}:${createdMillis}`)
+    .digest('hex')
+    .slice(0, 24);
+  return `legacy-${legacyDigest}`;
+}
+
+/**
+ * Extracts the Storage object path from a Firebase download URL.
+ *
+ * Only the two download-URL formats emitted by Firebase Storage are
+ * accepted. The caller additionally checks that the path is below the
+ * expected room prefix before it is ever deleted.
+ */
+export function storageObjectPathFromDownloadUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    const host = url.hostname.toLowerCase();
+    let objectPath = '';
+
+    if (host === 'firebasestorage.googleapis.com') {
+      const marker = '/o/';
+      const markerIndex = url.pathname.indexOf(marker);
+      if (markerIndex < 0) return null;
+      objectPath = decodeURIComponent(url.pathname.substring(markerIndex + marker.length));
+    } else if (host === 'storage.googleapis.com') {
+      const marker = '/o/';
+      const markerIndex = url.pathname.indexOf(marker);
+      if (markerIndex >= 0) {
+        objectPath = decodeURIComponent(url.pathname.substring(markerIndex + marker.length));
+      } else {
+        // Legacy format: https://storage.googleapis.com/{bucket}/{objectPath}
+        const segments = url.pathname.split('/').filter(Boolean);
+        if (segments.length < 2) return null;
+        objectPath = decodeURIComponent(segments.slice(1).join('/'));
+      }
+    } else {
+      return null;
+    }
+
+    objectPath = objectPath.replace(/^\/+/, '').trim();
+    return objectPath || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Reads a list of non-empty strings from a Firestore value. */
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (trimmed && !result.includes(trimmed)) result.push(trimmed);
+  }
+  return result;
+}
+
+/** How long one photo-cleanup lock may block a client room update. */
+const ROOM_PHOTO_CLEANUP_LOCK_MS = 2 * 60 * 1000;
+
+/** The Storage paths which the current room document still references. */
+function referencedRoomPhotoPaths(
+  snapshot: firestore.DocumentSnapshot,
+): Set<string> {
+  const paths = new Set<string>();
+  if (!snapshot.exists) return paths;
+
+  for (const url of stringList(snapshot.get('images'))) {
+    const path = storageObjectPathFromDownloadUrl(url);
+    if (path) paths.add(path);
+  }
+  return paths;
+}
+
+/** A cleanup job which can never be executed safely. */
+class InvalidRoomPhotoCleanupJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidRoomPhotoCleanupJobError';
+  }
+}
+
+/** The newest timestamp which can prove that a review is still old. */
+function reviewRelevantMillis(review: Record<string, any>): number | null {
+  const createdAt = review.createdAt as
+    | { toMillis?: () => number }
+    | null
+    | undefined;
+  const updatedAt = review.updatedAt as
+    | { toMillis?: () => number }
+    | null
+    | undefined;
+  const createdMillis =
+    createdAt && typeof createdAt.toMillis === 'function'
+      ? createdAt.toMillis()
+      : null;
+  const updatedMillis =
+    updatedAt && typeof updatedAt.toMillis === 'function'
+      ? updatedAt.toMillis()
+      : null;
+  return createdMillis === null
+    ? updatedMillis
+    : updatedMillis === null
+      ? createdMillis
+      : Math.max(createdMillis, updatedMillis);
+}
+
+/**
+ * Deletes the reviews which belonged to a removed listing.
+ *
+ * The immutable listing generation is the primary boundary. The timestamp
+ * cutoff is only used for legacy reviews which predate generations. Every
+ * candidate is re-read in a transaction before it is deleted, so a review
+ * which was updated after the query snapshot cannot be removed by a stale
+ * cleanup decision.
+ */
+async function deleteRoomReviewsBefore(
+  roomId: string,
+  cutoff: firestore.Timestamp,
+  listingGeneration: string,
+): Promise<void> {
+  const cutoffMillis = cutoff.toMillis();
+  let cursor: firestore.QueryDocumentSnapshot | undefined;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    let query = db
+      .collection('roomReviews')
+      .where('roomId', '==', roomId)
+      .orderBy('__name__');
+    if (cursor) query = query.startAfter(cursor);
+
+    const page = await query.limit(PAGE_SIZE).get();
+    if (page.empty) break;
+
+    for (const reviewDoc of page.docs) {
+      await db.runTransaction(async (transaction) => {
+        const current = await transaction.get(reviewDoc.ref);
+        if (!current.exists) return;
+
+        const review = current.data() as Record<string, any>;
+        const reviewGeneration = String(
+          review.listingGeneration || '',
+        ).trim();
+        if (reviewGeneration && reviewGeneration !== listingGeneration) {
+          // This review belongs to a different listing generation. It must
+          // survive even when the room id was reused.
+          return;
+        }
+
+        const relevantMillis = reviewRelevantMillis(review);
+        if (
+          reviewGeneration !== listingGeneration &&
+          relevantMillis !== null &&
+          relevantMillis > cutoffMillis
+        ) {
+          // A legacy review was updated after the deletion cutoff. It may be
+          // a review of a later listing, so it is retained.
+          return;
+        }
+
+        transaction.delete(reviewDoc.ref);
+      });
+    }
+
+    cursor = page.docs[page.docs.length - 1];
+    if (page.size < PAGE_SIZE) break;
+  }
+}
+
+/**
+ * Removes the Storage objects described by one cleanup job and then deletes
+ * the job. The job is only removed after the Storage deletion succeeded, so a
+ * transient failure is retried by the scheduled worker.
+ */
+async function processRoomPhotoCleanupJob(
+  jobRef: firestore.DocumentReference,
+): Promise<void> {
+  const snapshot = await jobRef.get();
+  if (!snapshot.exists) return;
+
+  const data = snapshot.data() as Record<string, any>;
+  const ownerId = String(data.ownerId || '').trim();
+  const roomId = String(data.roomId || '').trim();
+  const listingGeneration = String(data.listingGeneration || '').trim();
+  const expectedPrefix = `rooms/${ownerId}/${roomId}/`;
+  const tombstoneRef = db.collection('roomDeletionTombstones').doc(roomId);
+  const type = String(data.type || '');
+  const cleanupLock: {
+    roomRef: firestore.DocumentReference | null;
+    token: string;
+  } = { roomRef: null, token: '' };
+
+  try {
+    if (!ownerId || !roomId || !expectedPrefix.startsWith('rooms/')) {
+      throw new InvalidRoomPhotoCleanupJobError(
+        'The room-photo cleanup job is invalid',
+      );
+    }
+
+    const deletionOperationId = String(data.deletionOperationId || '').trim();
+    if (type === 'roomPhotoPrefix' && deletionOperationId) {
+      const tombstone = await tombstoneRef.get();
+      const tombstoneOperationId = String(
+        tombstone.get('deletionOperationId') || '',
+      ).trim();
+      const tombstoneGeneration = String(
+        tombstone.get('listingGeneration') || '',
+      ).trim();
+      if (
+        !tombstone.exists ||
+        tombstoneOperationId !== deletionOperationId ||
+        (listingGeneration && tombstoneGeneration !== listingGeneration)
+      ) {
+        throw new InvalidRoomPhotoCleanupJobError(
+          'The room-photo cleanup tombstone does not match the listing',
+        );
+      }
+    }
+
+    if (data.deleteRoomReviews === true) {
+      const cutoff = data.reviewCutoff;
+      if (
+        !cutoff ||
+        typeof cutoff.toMillis !== 'function'
+      ) {
+        throw new InvalidRoomPhotoCleanupJobError(
+          'The room-review cleanup cutoff is invalid',
+        );
+      }
+      await deleteRoomReviewsBefore(
+        roomId,
+        cutoff as firestore.Timestamp,
+        listingGeneration,
+      );
+    }
+
+    const bucket = storage.getStorage().bucket();
+    let processedPaths: string[] = [];
+
+    if (type === 'roomPhotoPrefix') {
+      const prefix = String(data.storagePrefix || expectedPrefix);
+      if (!prefix.startsWith(expectedPrefix)) {
+        throw new InvalidRoomPhotoCleanupJobError(
+          'The room-photo cleanup prefix is invalid',
+        );
+      }
+      const [files] = await bucket.getFiles({ prefix });
+      processedPaths = files.map((file) => file.name);
+      for (const file of files) {
+        await file.delete({ ignoreNotFound: true });
+      }
+    } else if (type === 'roomPhotoPaths') {
+      const initialPaths = stringList(data.paths);
+      for (const path of initialPaths) {
+        if (!path.startsWith(expectedPrefix)) {
+          throw new InvalidRoomPhotoCleanupJobError(
+            'The room-photo cleanup path is invalid',
+          );
+        }
+      }
+
+      const roomRef = db.collection('rooms').doc(roomId);
+      const lockToken = crypto.randomUUID();
+
+      await db.runTransaction(async (transaction) => {
+        const latest = await transaction.get(jobRef);
+        if (!latest.exists) return;
+
+        const roomSnapshot = await transaction.get(roomRef);
+        const currentPaths = stringList(latest.get('paths'));
+        const referencedPaths = referencedRoomPhotoPaths(roomSnapshot);
+        const currentGeneration = String(
+          roomSnapshot.get('listingGeneration') || '',
+        ).trim();
+        if (
+          roomSnapshot.exists &&
+          currentGeneration &&
+          currentGeneration !== listingGeneration
+        ) {
+          // This cleanup belongs to an earlier lifetime of the room id. The
+          // prefix cleanup of that listing removed its files; touching them
+          // now could delete a photo of the current listing.
+          transaction.delete(jobRef);
+          processedPaths = [];
+          return;
+        }
+
+        // A path which the room references again is live data, not an
+        // orphan. It is removed from the cleanup job without deleting the
+        // Storage object.
+        const safePaths = currentPaths.filter(
+          (path) => !referencedPaths.has(path),
+        );
+        const retainedPaths = currentPaths.filter((path) =>
+          referencedPaths.has(path),
+        );
+
+        // Every path-processing pass installs the room lock, including a
+        // pass in which all paths are currently referenced. Otherwise an
+        // owner could remove a referenced path while the worker was running;
+        // the update trigger would add it back to the job, but the worker
+        // would then remove the path from the job without deleting its file.
+        cleanupLock.roomRef = roomRef;
+
+        if (roomSnapshot.exists && currentPaths.length > 0) {
+          const existingLock = roomSnapshot.get('photoCleanupLock');
+          const lockExpiresAt =
+            existingLock &&
+            existingLock.expiresAt &&
+            typeof existingLock.expiresAt.toMillis === 'function'
+              ? existingLock.expiresAt.toMillis()
+              : 0;
+          if (lockExpiresAt > Date.now()) {
+            throw new Error(
+              'The room photo cleanup is already locked by another worker',
+            );
+          }
+
+          // The lock is committed on the room before Storage is touched.
+          // Firestore rules reject client room updates while it is active,
+          // so an image cannot be re-added between the reference check and
+          // the file deletion. A crashed worker releases the edit block
+          // automatically when the short lease expires.
+          transaction.update(roomRef, {
+            photoCleanupLock: {
+              token: lockToken,
+              expiresAt: firestore.Timestamp.fromMillis(
+                Date.now() + ROOM_PHOTO_CLEANUP_LOCK_MS,
+              ),
+            },
+          });
+          cleanupLock.roomRef = roomRef;
+          cleanupLock.token = lockToken;
+        }
+
+        processedPaths = [...safePaths, ...retainedPaths];
+      });
+
+      for (const path of processedPaths) {
+        const roomSnapshot = cleanupLock.roomRef
+          ? await cleanupLock.roomRef.get()
+          : null;
+        const referencedPaths = roomSnapshot
+          ? referencedRoomPhotoPaths(roomSnapshot)
+          : new Set<string>();
+        if (referencedPaths.has(path)) continue;
+        await bucket.file(path).delete({ ignoreNotFound: true });
+      }
+    } else {
+      throw new InvalidRoomPhotoCleanupJobError(
+        'The room-photo cleanup job type is invalid',
+      );
+    }
+
+    // Re-read the job transactionally before removing it. A concurrent room
+    // update may have added another path while the files were being deleted;
+    // in that case the job has to stay for the next run.
+    await db.runTransaction(async (transaction) => {
+      const latest = await transaction.get(jobRef);
+      if (!latest.exists) return;
+      const lockedRoomSnapshot = cleanupLock.roomRef
+        ? await transaction.get(cleanupLock.roomRef)
+        : null;
+      const tombstoneSnapshot = await transaction.get(tombstoneRef);
+
+      const latestType = String(latest.get('type') || '');
+      if (latestType === 'roomPhotoPrefix') {
+        const latestPrefix = String(latest.get('storagePrefix') || '');
+        const latestOperationId = String(
+          latest.get('deletionOperationId') || '',
+        );
+        const expectedOperationId = String(
+          data.deletionOperationId || '',
+        );
+        if (
+          latestPrefix === String(data.storagePrefix || expectedPrefix) &&
+          (!expectedOperationId || latestOperationId === expectedOperationId)
+        ) {
+          transaction.delete(jobRef);
+          if (
+            expectedOperationId &&
+            tombstoneSnapshot.exists &&
+            String(tombstoneSnapshot.get('deletionOperationId') || '') ===
+              expectedOperationId
+          ) {
+            // The room id remains reserved until every old photo and review
+            // has really been removed. Only now may a later listing reuse
+            // the id without sharing its Storage prefix.
+            transaction.delete(tombstoneRef);
+          }
+        }
+        return;
+      }
+
+      if (latestType === 'roomPhotoPaths') {
+        const latestPaths = stringList(latest.get('paths'));
+        const remainingPaths = latestPaths.filter(
+          (path) => !processedPaths.includes(path),
+        );
+        if (remainingPaths.length === 0) {
+          transaction.delete(jobRef);
+        } else if (remainingPaths.length !== latestPaths.length) {
+          transaction.update(jobRef, {
+            paths: remainingPaths,
+            updatedAt: firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      }
+
+      if (cleanupLock.roomRef && cleanupLock.token && lockedRoomSnapshot) {
+        const lock = lockedRoomSnapshot.get('photoCleanupLock');
+        if (
+          lock &&
+          String(lock.token || '') === cleanupLock.token
+        ) {
+          transaction.update(cleanupLock.roomRef, {
+            photoCleanupLock: firestore.FieldValue.delete(),
+          });
+        }
+      }
+    });
+  } catch (error) {
+    if (cleanupLock.roomRef && cleanupLock.token) {
+      try {
+        await db.runTransaction(async (transaction) => {
+          const roomSnapshot = await transaction.get(cleanupLock.roomRef!);
+          const lock = roomSnapshot.get('photoCleanupLock');
+          if (
+            lock &&
+            String(lock.token || '') === cleanupLock.token
+          ) {
+            transaction.update(cleanupLock.roomRef!, {
+              photoCleanupLock: firestore.FieldValue.delete(),
+            });
+          }
+        });
+      } catch (releaseError) {
+        console.error(
+          'Could not release the room photo cleanup lock:',
+          releaseError,
+        );
+      }
+    }
+
+    try {
+      if (error instanceof InvalidRoomPhotoCleanupJobError) {
+        // A malformed job can never succeed. Move it out of the worker's
+        // query instead of letting it occupy every run and starve valid
+        // cleanup jobs forever.
+        await jobRef.set(
+          {
+            type: 'quarantinedRoomPhotoCleanup',
+            status: 'quarantined',
+            lastError: String(error).slice(0, 300),
+            quarantinedAt: firestore.FieldValue.serverTimestamp(),
+            updatedAt: firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+        console.error('Quarantined an invalid room-photo cleanup job:', error);
+        return;
+      }
+
+      const attempts = Number(data.attempts || 0);
+      const backoffMinutes = Math.min(24 * 60, 15 * Math.pow(2, attempts));
+      await jobRef.set(
+        {
+          attempts: firestore.FieldValue.increment(1),
+          lastError: String(error).slice(0, 300),
+          nextAttemptAt: firestore.Timestamp.fromMillis(
+            Date.now() + backoffMinutes * 60 * 1000,
+          ),
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+    } catch (updateError) {
+      console.error('Could not record the cleanup-job failure:', updateError);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Retries durable room-photo cleanup jobs.
+ *
+ * A job is written together with the room deletion or by the room-update
+ * trigger. A Storage outage can therefore never leave unreferenced photos
+ * with no server-side record of the work which still has to be done.
+ */
+export const processRoomPhotoCleanupJobs = functions.pubsub
+  .schedule('every 15 minutes')
+  .onRun(async () => {
+    let completed = 0;
+    let failed = 0;
+    let inspected = 0;
+    let cursor: firestore.QueryDocumentSnapshot | undefined;
+
+    // Walk every matching job instead of taking only the first 50. A fixed
+    // limit allowed a handful of deferred or repeatedly failing jobs to
+    // starve every valid cleanup behind them.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      let query = db
+        .collection('cleanupJobs')
+        .where('type', 'in', [
+          'roomDeletion',
+          'roomPhotoPrefix',
+          'roomPhotoPaths',
+        ])
+        .orderBy('__name__');
+      if (cursor) query = query.startAfter(cursor);
+      const jobs = await query.limit(100).get();
+      if (jobs.empty) break;
+
+      for (const job of jobs.docs) {
+        inspected += 1;
+        const nextAttemptAt = job.get('nextAttemptAt');
+        if (
+          nextAttemptAt &&
+          typeof nextAttemptAt.toMillis === 'function' &&
+          nextAttemptAt.toMillis() > Date.now()
+        ) {
+          continue;
+        }
+
+        try {
+          if (job.get('type') === 'roomDeletion') {
+            await processRoomDeletionJob(job.ref);
+          } else {
+            await processRoomPhotoCleanupJob(job.ref);
+          }
+          completed += 1;
+        } catch (error) {
+          failed += 1;
+          console.error(
+            `Could not clean the room photos for job ${job.id}:`,
+            error,
+          );
+        }
+      }
+
+      cursor = jobs.docs[jobs.docs.length - 1];
+      if (jobs.size < 100) break;
+    }
+
+    if (failed > 0) {
+      // The jobs remain durable, and the failed invocation is also retried by
+      // the scheduler so a transient Storage outage is visible immediately.
+      throw new Error(`${failed} room cleanup job(s) failed`);
+    }
+
+    console.log(
+      `Room cleanup jobs completed: ${completed}/${inspected}`,
+    );
+    return null;
+  });
 
 /**
  * The listing status values an owner may choose.
@@ -62,12 +683,11 @@ export function decideRoomListingAvailability(
   occupancy: number,
   currentOccupancy: number,
 ): RoomListingAvailabilityDecision {
-  if (!Number.isFinite(occupancy) || occupancy <= 0) {
+  if (!isValidRoomCapacity(occupancy)) {
     return { allowed: false, reason: 'invalid-capacity' };
   }
   if (
-    !Number.isFinite(currentOccupancy) ||
-    currentOccupancy < 0 ||
+    !isValidCurrentOccupancy(currentOccupancy) ||
     currentOccupancy > occupancy
   ) {
     return { allowed: false, reason: 'invalid-occupancy' };
@@ -96,7 +716,7 @@ export function decideRoomListingAvailability(
  * This function never writes `currentOccupancy`. Booking activation and its
  * rollback are the only paths that own that counter.
  */
-export const setRoomListingAvailability = functions.https.onCall(
+export const setRoomListingAvailability = callableHttps.onCall(
   async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError(
@@ -138,6 +758,27 @@ export const setRoomListingAvailability = functions.https.onCall(
       }
 
       const room = snapshot.data() as Record<string, any>;
+
+      // The live owner role is checked in the same transaction as the status
+      // change. A concurrent demotion or ban cannot be overwritten by this
+      // write.
+      const ownerProfile = await transaction.get(
+        db.collection('users').doc(uid),
+      );
+      if (
+        !canActAsRoomOwner({
+          exists: ownerProfile.exists,
+          registrationCompleted: ownerProfile.get('registrationCompleted'),
+          isActive: ownerProfile.get('isActive'),
+          role: ownerProfile.get('role'),
+        })
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'Only a live owner account can change this listing.',
+        );
+      }
+
       if (room.deletionInProgress === true) {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -151,14 +792,8 @@ export const setRoomListingAvailability = functions.https.onCall(
         );
       }
 
-      const occupancy =
-        room.occupancy === undefined || room.occupancy === null
-          ? 1
-          : Number(room.occupancy);
-      const currentOccupancy =
-        room.currentOccupancy === undefined || room.currentOccupancy === null
-          ? 0
-          : Number(room.currentOccupancy);
+      const occupancy = room.occupancy;
+      const currentOccupancy = room.currentOccupancy;
 
       const decision = decideRoomListingAvailability(
         isOccupied,
@@ -195,7 +830,7 @@ export const setRoomListingAvailability = functions.https.onCall(
       // `currentOccupancy` is absent from this update on purpose.
       transaction.update(roomRef, {
         status: decision.status,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
       });
 
       return decision.status;
@@ -245,10 +880,7 @@ export function decideRoomDeletion(
   currentOccupancy: number,
   requests: readonly RoomDeletionRequestState[],
 ): RoomDeletionDecision {
-  if (
-    !Number.isFinite(currentOccupancy) ||
-    currentOccupancy < 0
-  ) {
+  if (!isValidCurrentOccupancy(currentOccupancy)) {
     return { allowed: false, reason: 'invalid-occupancy' };
   }
 
@@ -275,6 +907,558 @@ export function decideRoomDeletion(
 }
 
 /**
+ * Inspects every request of one listing in bounded pages.
+ *
+ * The old listing-deletion path read the complete request collection with
+ * one unbounded query. A room with a long request history could therefore
+ * exhaust the function's memory before the safety decision was made. This
+ * helper stops at the first blocking request and never holds more than one
+ * page in memory.
+ */
+async function inspectRoomRequestsForDeletion(
+  roomId: string,
+  currentOccupancy: number,
+): Promise<RoomDeletionDecision> {
+  let cursor: firestore.QueryDocumentSnapshot | undefined;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    let query = db
+      .collection('joinRequests')
+      .where('roomId', '==', roomId)
+      .orderBy(firestore.FieldPath.documentId());
+    if (cursor) query = query.startAfter(cursor);
+
+    const snapshot = await query.limit(PAGE_SIZE).get();
+    if (snapshot.empty) break;
+
+    for (const requestDoc of snapshot.docs) {
+      const request = requestDoc.data() as Record<string, any>;
+      const decision = decideRoomDeletion(currentOccupancy, [
+        {
+          status: String(request.status || ''),
+          advancePaid: request.advancePaid === true,
+          platformCutTaken: request.platformCutTaken === true,
+          advancePaymentStatus: String(request.advancePaymentStatus || ''),
+        },
+      ]);
+      if (!decision.allowed) return decision;
+    }
+
+    cursor = snapshot.docs[snapshot.docs.length - 1];
+    if (snapshot.size < PAGE_SIZE) break;
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Re-checks the live authority of a caller inside a deletion transaction.
+ *
+ * A caller may lose the owner or administrator role after the deletion was
+ * marked but before its requests and listing are removed. Every destructive
+ * step therefore reads the caller's current profile again.
+ */
+function assertLiveRoomDeletionCaller(
+  callerSnapshot: firestore.DocumentSnapshot,
+  uid: string,
+  ownerId: string,
+): void {
+  const role = String(callerSnapshot.get('role') || '')
+    .trim()
+    .toLowerCase();
+  const isAdmin = canActAsAdmin({
+    exists: callerSnapshot.exists,
+    registrationCompleted: callerSnapshot.get('registrationCompleted'),
+    isActive: callerSnapshot.get('isActive'),
+    role,
+  });
+  const isOwner = canActAsRoomOwner({
+    exists: callerSnapshot.exists,
+    registrationCompleted: callerSnapshot.get('registrationCompleted'),
+    isActive: callerSnapshot.get('isActive'),
+    role,
+  });
+
+  if (!isAdmin && (!isOwner || ownerId !== uid)) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Owner or admin access required',
+    );
+  }
+}
+
+/** The durable state of one listing-deletion operation. */
+interface RoomDeletionOperation {
+  roomId: string;
+  ownerId: string;
+  listingGeneration: string;
+  deletionOperationId: string;
+  requestedBy: string;
+  previousStatus: string;
+}
+
+/** Reads and validates the durable state of a listing-deletion job. */
+function roomDeletionOperationFromSnapshot(
+  snapshot: firestore.DocumentSnapshot,
+): RoomDeletionOperation {
+  if (!snapshot.exists) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The listing-deletion job no longer exists',
+    );
+  }
+
+  const data = snapshot.data() as Record<string, any>;
+  const operation: RoomDeletionOperation = {
+    roomId: String(data.roomId || '').trim(),
+    ownerId: String(data.ownerId || '').trim(),
+    listingGeneration: String(data.listingGeneration || '').trim(),
+    deletionOperationId: String(data.deletionOperationId || '').trim(),
+    requestedBy: String(data.deletionRequestedBy || '').trim(),
+    previousStatus: String(data.previousStatus || 'available').trim(),
+  };
+  if (
+    !operation.roomId ||
+    !operation.ownerId ||
+    !operation.listingGeneration ||
+    !operation.deletionOperationId ||
+    !operation.requestedBy
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The listing-deletion job is invalid',
+    );
+  }
+  return operation;
+}
+
+/**
+ * Restores a listing whose deletion operation did not complete.
+ *
+ * The room marker, the durable deletion job and the id-reservation tombstone
+ * are removed in one transaction. If that transaction fails, all three remain
+ * together and the scheduled worker can safely resume the operation.
+ */
+async function restoreRoomDeletion(
+  operation: RoomDeletionOperation,
+  jobRef: firestore.DocumentReference,
+): Promise<void> {
+  const roomRef = db.collection('rooms').doc(operation.roomId);
+  const tombstoneRef = db
+    .collection('roomDeletionTombstones')
+    .doc(operation.roomId);
+
+  await db.runTransaction(async (transaction) => {
+    const [roomSnapshot, jobSnapshot, tombstoneSnapshot] =
+      await transaction.getAll(roomRef, jobRef, tombstoneRef);
+    if (!roomSnapshot.exists) return;
+
+    const room = roomSnapshot.data() as Record<string, any>;
+    if (
+      room.deletionInProgress !== true ||
+      String(room.deletionOperationId || '') !== operation.deletionOperationId
+    ) {
+      // A newer operation superseded this one. It owns the marker and must
+      // not be removed by the stale operation.
+      return;
+    }
+
+    const restoreStatus =
+      String(room.status || '') === 'inactive' &&
+      operation.previousStatus !== 'inactive'
+        ? operation.previousStatus
+        : String(room.status || 'inactive');
+
+    transaction.update(roomRef, {
+      status: restoreStatus,
+      deletionInProgress: firestore.FieldValue.delete(),
+      deletionRequestedBy: firestore.FieldValue.delete(),
+      deletionOperationId: firestore.FieldValue.delete(),
+      deletionRequestedAt: firestore.FieldValue.delete(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (
+      jobSnapshot.exists &&
+      String(jobSnapshot.get('deletionOperationId') || '') ===
+        operation.deletionOperationId
+    ) {
+      transaction.delete(jobRef);
+    }
+    if (
+      tombstoneSnapshot.exists &&
+      String(tombstoneSnapshot.get('deletionOperationId') || '') ===
+        operation.deletionOperationId
+    ) {
+      transaction.delete(tombstoneRef);
+    }
+  });
+}
+
+/**
+ * Cancels every open request of the listing which is being deleted.
+ *
+ * Each request is re-read with the room and the requesting account in one
+ * transaction. A payment, activation or administrative demotion which races
+ * with the deletion therefore cannot be overwritten by a stale cancellation.
+ */
+async function cancelOpenRoomRequestsForDeletion(
+  operation: RoomDeletionOperation,
+): Promise<number> {
+  const roomRef = db.collection('rooms').doc(operation.roomId);
+  let cancelledRequests = 0;
+  let requestCursor: firestore.QueryDocumentSnapshot | undefined;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    let requestQuery = db
+      .collection('joinRequests')
+      .where('roomId', '==', operation.roomId)
+      .orderBy(firestore.FieldPath.documentId());
+    if (requestCursor) requestQuery = requestQuery.startAfter(requestCursor);
+
+    const requestPage = await requestQuery.limit(PAGE_SIZE).get();
+    if (requestPage.empty) break;
+
+    for (const requestDoc of requestPage.docs) {
+      const requestRef = requestDoc.ref;
+      const cancelled = await db.runTransaction(async (transaction) => {
+        const [roomSnapshot, callerSnapshot, requestSnapshot] =
+          await transaction.getAll(
+            roomRef,
+            db.collection('users').doc(operation.requestedBy),
+            requestRef,
+          );
+        if (!roomSnapshot.exists || !requestSnapshot.exists) return null;
+
+        const room = roomSnapshot.data() as Record<string, any>;
+        if (
+          room.deletionInProgress !== true ||
+          String(room.deletionOperationId || '') !==
+            operation.deletionOperationId
+        ) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'The listing deletion is no longer active. Try again.',
+          );
+        }
+
+        assertLiveRoomDeletionCaller(
+          callerSnapshot,
+          operation.requestedBy,
+          operation.ownerId,
+        );
+
+        const request = requestSnapshot.data() as Record<string, any>;
+        const status = String(request.status || '');
+        const decision = decideRoomDeletion(room.currentOccupancy, [
+          {
+            status,
+            advancePaid: request.advancePaid === true,
+            platformCutTaken: request.platformCutTaken === true,
+            advancePaymentStatus: String(request.advancePaymentStatus || ''),
+          },
+        ]);
+
+        if (!decision.allowed) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'The booking changed while the listing was being deleted. Try again.',
+          );
+        }
+
+        if (OPEN_ROOM_REQUEST_STATUSES.indexOf(status) < 0) return null;
+
+        transaction.update(requestRef, {
+          status: 'cancelled',
+          cancelledAt: firestore.FieldValue.serverTimestamp(),
+          cancelledBy: operation.requestedBy,
+          cancellationReason: 'The room listing was deleted',
+          deletionOperationId: operation.deletionOperationId,
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        });
+
+        return {
+          studentId: String(request.studentId || ''),
+          requestId: requestRef.id,
+          roomId: String(request.roomId || operation.roomId),
+        };
+      });
+
+      if (cancelled) {
+        cancelledRequests += 1;
+
+        // The request id stays in the notification payload. Without it the
+        // app cannot route the notice to the cancelled booking.
+        if (cancelled.studentId && cancelled.studentId !== operation.requestedBy) {
+          await notify(
+            cancelled.studentId,
+            'Room listing removed',
+            'The room listing you requested was removed. The request was cancelled.',
+            'joinRequest',
+            {
+              requestId: cancelled.requestId,
+              roomId: cancelled.roomId,
+            },
+          );
+        }
+      }
+    }
+
+    requestCursor = requestPage.docs[requestPage.docs.length - 1];
+    if (requestPage.size < PAGE_SIZE) break;
+  }
+
+  return cancelledRequests;
+}
+
+/**
+ * Deletes the marked listing and commits the durable photo/review cleanup.
+ *
+ * The public room, its private location and the superseded path-cleanup job
+ * are removed in the same transaction as the prefix-cleanup job. The
+ * tombstone deliberately survives until that prefix cleanup has completed.
+ */
+async function finalizeRoomDeletion(
+  operation: RoomDeletionOperation,
+  jobRef: firestore.DocumentReference,
+): Promise<firestore.DocumentReference> {
+  const roomRef = db.collection('rooms').doc(operation.roomId);
+  const privateLocationRef = db
+    .collection('roomPrivate')
+    .doc(operation.roomId);
+  const pathCleanupRef = db
+    .collection('cleanupJobs')
+    .doc(
+      roomPhotoCleanupJobId(
+        operation.ownerId,
+        operation.roomId,
+        operation.listingGeneration,
+        'paths',
+      ),
+    );
+  const prefixCleanupRef = db
+    .collection('cleanupJobs')
+    .doc(
+      roomPhotoCleanupJobId(
+        operation.ownerId,
+        operation.roomId,
+        operation.listingGeneration,
+        'prefix',
+      ),
+    );
+
+  await db.runTransaction(async (transaction) => {
+    const [roomSnapshot, callerSnapshot] = await transaction.getAll(
+      roomRef,
+      db.collection('users').doc(operation.requestedBy),
+    );
+    if (!roomSnapshot.exists) return;
+
+    const room = roomSnapshot.data() as Record<string, any>;
+    if (
+      room.deletionInProgress !== true ||
+      String(room.deletionOperationId || '') !== operation.deletionOperationId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The listing deletion is no longer active. Try again.',
+      );
+    }
+
+    assertLiveRoomDeletionCaller(
+      callerSnapshot,
+      operation.requestedBy,
+      operation.ownerId,
+    );
+
+    const finalDecision = decideRoomDeletion(room.currentOccupancy, []);
+    if (!finalDecision.allowed) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The room changed while the listing was being deleted. Try again.',
+      );
+    }
+
+    transaction.delete(roomRef);
+    // The exact address belongs to the listing. It must not survive as an
+    // orphan after the public room document is removed.
+    transaction.delete(privateLocationRef);
+    // The prefix cleanup supersedes every individual path cleanup of this
+    // listing generation.
+    transaction.delete(pathCleanupRef);
+    transaction.delete(jobRef);
+    transaction.set(
+      prefixCleanupRef,
+      {
+        type: 'roomPhotoPrefix',
+        roomId: operation.roomId,
+        ownerId: operation.ownerId,
+        listingGeneration: operation.listingGeneration,
+        storagePrefix: `rooms/${operation.ownerId}/${operation.roomId}/`,
+        deletionOperationId: operation.deletionOperationId,
+        // Reviews are part of the listing. They are removed by the same
+        // durable cleanup job, but only reviews which belonged to this
+        // immutable listing generation.
+        deleteRoomReviews: true,
+        reviewCutoff: firestore.FieldValue.serverTimestamp(),
+        createdAt: firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
+        attempts: 0,
+      },
+      { merge: true },
+    );
+  });
+
+  return prefixCleanupRef;
+}
+
+/** Executes or resumes one durable listing-deletion operation. */
+async function executeRoomDeletionOperation(
+  jobRef: firestore.DocumentReference,
+  restoreOnFailure: boolean,
+): Promise<{ cancelledRequests: number }> {
+  const jobSnapshot = await jobRef.get();
+  const operation = roomDeletionOperationFromSnapshot(jobSnapshot);
+  const roomRef = db.collection('rooms').doc(operation.roomId);
+
+  try {
+    const roomSnapshot = await roomRef.get();
+    if (!roomSnapshot.exists) {
+      // The final transaction removes the deletion job together with the
+      // listing. A missing room therefore means that this operation has
+      // already completed.
+      await jobRef.delete();
+      return { cancelledRequests: 0 };
+    }
+
+    const room = roomSnapshot.data() as Record<string, any>;
+    if (
+      room.deletionInProgress !== true ||
+      String(room.deletionOperationId || '') !== operation.deletionOperationId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The listing deletion is no longer active. Try again.',
+      );
+    }
+
+    const deletionDecision = await inspectRoomRequestsForDeletion(
+      operation.roomId,
+      Number(room.currentOccupancy || 0),
+    );
+    if (!deletionDecision.allowed) {
+      const message =
+        deletionDecision.reason === 'active-booking'
+          ? 'This room has an active booking and cannot be deleted.'
+          : deletionDecision.reason === 'payment-in-progress'
+            ? 'This room has a payment waiting for verification and cannot be deleted.'
+            : 'This room still has occupants and cannot be deleted.';
+      throw new functions.https.HttpsError('failed-precondition', message);
+    }
+
+    const cancelledRequests = await cancelOpenRoomRequestsForDeletion(operation);
+    const prefixCleanupRef = await finalizeRoomDeletion(operation, jobRef);
+
+    // Start the Storage cleanup immediately. A failure does not undo the
+    // successful room deletion: the durable cleanup job remains and the
+    // scheduled worker retries it.
+    try {
+      await processRoomPhotoCleanupJob(prefixCleanupRef);
+    } catch (error) {
+      console.error(
+        `Could not clean the photos of the deleted room ${operation.roomId}:`,
+        error,
+      );
+    }
+
+    return { cancelledRequests };
+  } catch (error) {
+    if (restoreOnFailure) {
+      try {
+        await restoreRoomDeletion(operation, jobRef);
+      } catch (restoreError) {
+        // The marker, job and tombstone are removed together. If that
+        // transaction failed, all three remain and the scheduled worker can
+        // resume the deletion safely.
+        console.error(
+          `Could not restore room ${operation.roomId} after a failed deletion:`,
+          restoreError,
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+/** Whether an error will not be fixed by simply retrying the operation. */
+function isPermanentRoomDeletionError(error: unknown): boolean {
+  const code = String((error as { code?: string })?.code || '');
+  return (
+    code === 'failed-precondition' ||
+    code === 'permission-denied' ||
+    code === 'not-found' ||
+    code === 'unauthenticated'
+  );
+}
+
+/**
+ * Resumes one interrupted listing deletion.
+ *
+ * A transient error leaves the durable job and room marker in place for the
+ * next scheduled run. A permanent conflict restores the listing and removes
+ * the marker so the owner is not left with a permanently inactive room.
+ */
+async function processRoomDeletionJob(
+  jobRef: firestore.DocumentReference,
+): Promise<void> {
+  const snapshot = await jobRef.get();
+  if (!snapshot.exists) return;
+  const operation = roomDeletionOperationFromSnapshot(snapshot);
+
+  try {
+    await executeRoomDeletionOperation(jobRef, false);
+  } catch (error) {
+    if (!isPermanentRoomDeletionError(error)) {
+      const attempts = Number(snapshot.get('attempts') || 0);
+      const backoffMinutes = Math.min(24 * 60, 15 * Math.pow(2, attempts));
+      try {
+        await jobRef.set(
+          {
+            attempts: firestore.FieldValue.increment(1),
+            lastError: String(error).slice(0, 300),
+            nextAttemptAt: firestore.Timestamp.fromMillis(
+              Date.now() + backoffMinutes * 60 * 1000,
+            ),
+            updatedAt: firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      } catch (updateError) {
+        console.error(
+          'Could not record the listing-deletion retry state:',
+          updateError,
+        );
+      }
+      throw error;
+    }
+    try {
+      await restoreRoomDeletion(operation, jobRef);
+    } catch (restoreError) {
+      console.error(
+        `Could not restore room ${operation.roomId} after a failed deletion:`,
+        restoreError,
+      );
+      throw restoreError;
+    }
+    console.warn(
+      `The listing deletion for ${operation.roomId} was stopped and the listing restored.`,
+    );
+  }
+}
+
+/**
  * Removes a listing on the server.
  *
  * An owner may delete their own empty listing; a live administrator may
@@ -286,7 +1470,7 @@ export function decideRoomDeletion(
  * creation transaction reads that marker, so no new request can slip in
  * between the safety check and the deletion.
  */
-export const deleteRoomListing = functions.https.onCall(
+export const deleteRoomListing = callableHttps.onCall(
   async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError(
@@ -304,13 +1488,22 @@ export const deleteRoomListing = functions.https.onCall(
       );
     }
 
-    const role = await assertLiveOwnerOrAdmin(uid);
+    await assertLiveOwnerOrAdmin(uid);
     const roomRef = db.collection('rooms').doc(roomId);
+    const tombstoneRef = db
+      .collection('roomDeletionTombstones')
+      .doc(roomId);
+    const deletionJobRef = db
+      .collection('cleanupJobs')
+      .doc(roomDeletionJobId(roomId));
 
     // Mark the listing as unavailable first. `createJoinRequest` checks this
     // marker in the same transaction in which it creates a request, so the
-    // request set cannot grow while the deletion is being completed.
-    const markedRoom = await db.runTransaction(async (transaction) => {
+    // request set cannot grow while the deletion is being completed. The
+    // durable job and the id-reservation tombstone are committed with the
+    // marker, so a terminated function can always be resumed safely.
+    const deletionOperationId = crypto.randomUUID();
+    await db.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(roomRef);
       if (!snapshot.exists) {
         throw new functions.https.HttpsError(
@@ -320,15 +1513,38 @@ export const deleteRoomListing = functions.https.onCall(
       }
 
       const room = snapshot.data() as Record<string, any>;
-      const ownerId = String(room.ownerId || '');
-      if (role === 'owner' && ownerId !== uid) {
+      const ownerId = String(room.ownerId || '').trim();
+
+      // Recompute the caller's live authority inside the marker
+      // transaction. The outside check is only a fast failure; this read is
+      // what serializes a concurrent demotion with the deletion.
+      const callerProfile = await transaction.get(
+        db.collection('users').doc(uid),
+      );
+      assertLiveRoomDeletionCaller(callerProfile, uid, ownerId);
+
+      const callerIsAdmin = canActAsAdmin({
+        exists: callerProfile.exists,
+        registrationCompleted: callerProfile.get('registrationCompleted'),
+        isActive: callerProfile.get('isActive'),
+        role: callerProfile.get('role'),
+      });
+
+      // The same caller may start a fresh operation, which receives its own
+      // operation id and safely supersedes the older one. A live administrator
+      // may also take over a stranded operation. Another owner may not.
+      if (
+        room.deletionInProgress === true &&
+        String(room.deletionRequestedBy || '') !== uid &&
+        !callerIsAdmin
+      ) {
         throw new functions.https.HttpsError(
-          'permission-denied',
-          'You can only delete your own listings',
+          'failed-precondition',
+          'This listing is already being deleted.',
         );
       }
 
-      const currentOccupancy = Number(room.currentOccupancy || 0);
+      const currentOccupancy = room.currentOccupancy;
       const occupancyDecision = decideRoomDeletion(currentOccupancy, []);
       if (!occupancyDecision.allowed) {
         throw new functions.https.HttpsError(
@@ -339,178 +1555,59 @@ export const deleteRoomListing = functions.https.onCall(
         );
       }
 
+      const listingGeneration =
+        String(room.listingGeneration || '').trim() || crypto.randomUUID();
+      const previousStatus = String(room.status || 'available');
+
       transaction.update(roomRef, {
         status: 'inactive',
+        listingGeneration,
         deletionInProgress: true,
         deletionRequestedBy: uid,
-        deletionRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        deletionOperationId,
+        deletionRequestedAt: firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
       });
-
-      return {
-        previousStatus: String(room.status || 'available'),
-      };
+      transaction.set(
+        tombstoneRef,
+        {
+          type: 'roomDeletionTombstone',
+          roomId,
+          ownerId,
+          listingGeneration,
+          deletionOperationId,
+          createdAt: firestore.FieldValue.serverTimestamp(),
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+      transaction.set(
+        deletionJobRef,
+        {
+          type: 'roomDeletion',
+          roomId,
+          ownerId,
+          listingGeneration,
+          deletionOperationId,
+          deletionRequestedBy: uid,
+          previousStatus,
+          createdAt: firestore.FieldValue.serverTimestamp(),
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+          attempts: 0,
+        },
+        { merge: true },
+      );
     });
 
-    const restoreRoomAfterFailedDeletion = async (): Promise<void> => {
-      await db.runTransaction(async (transaction) => {
-        const snapshot = await transaction.get(roomRef);
-        if (!snapshot.exists) return;
-
-        const room = snapshot.data() as Record<string, any>;
-        if (
-          room.deletionInProgress !== true ||
-          String(room.deletionRequestedBy || '') !== uid
-        ) {
-          return;
-        }
-
-        const restoreStatus =
-          String(room.status || '') === 'inactive' &&
-          markedRoom.previousStatus !== 'inactive'
-            ? markedRoom.previousStatus
-            : String(room.status || 'inactive');
-
-        transaction.update(roomRef, {
-          status: restoreStatus,
-          deletionInProgress: admin.firestore.FieldValue.delete(),
-          deletionRequestedBy: admin.firestore.FieldValue.delete(),
-          deletionRequestedAt: admin.firestore.FieldValue.delete(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      });
-    };
-
-    const requestsSnapshot = await db
-      .collection('joinRequests')
-      .where('roomId', '==', roomId)
-      .get();
-
-    const requestStates = requestsSnapshot.docs.map((doc) => {
-      const data = doc.data() as Record<string, any>;
-      return {
-        status: String(data.status || ''),
-        advancePaid: data.advancePaid === true,
-        platformCutTaken: data.platformCutTaken === true,
-        advancePaymentStatus: String(data.advancePaymentStatus || ''),
-      };
-    });
-
-    const currentRoom = await roomRef.get();
-    const currentOccupancy = Number(
-      (currentRoom.data()?.currentOccupancy as number | undefined) || 0,
-    );
-    const deletionDecision = decideRoomDeletion(
-      currentOccupancy,
-      requestStates,
-    );
-
-    if (!deletionDecision.allowed) {
-      // Put the listing back the way it was. The marker is removed as well,
-      // so a later retry starts from a clean state.
-      await restoreRoomAfterFailedDeletion();
-
-      const message =
-        deletionDecision.reason === 'active-booking'
-          ? 'This room has an active booking and cannot be deleted.'
-          : deletionDecision.reason === 'payment-in-progress'
-            ? 'This room has a payment waiting for verification and cannot be deleted.'
-            : 'This room still has occupants and cannot be deleted.';
-
-      throw new functions.https.HttpsError('failed-precondition', message);
-    }
-
-    const cancelledStudents: string[] = [];
-
-    try {
-      // Cancel every open request. The transaction re-reads the request, so a
-      // payment or activation that races with the deletion cannot be
-      // overwritten by a cancellation.
-      for (const requestDoc of requestsSnapshot.docs) {
-        const requestRef = requestDoc.ref;
-        const cancelled = await db.runTransaction(async (transaction) => {
-          const snapshot = await transaction.get(requestRef);
-          if (!snapshot.exists) return null;
-
-          const request = snapshot.data() as Record<string, any>;
-          const status = String(request.status || '');
-          const decision = decideRoomDeletion(currentOccupancy, [
-            {
-              status,
-              advancePaid: request.advancePaid === true,
-              platformCutTaken: request.platformCutTaken === true,
-              advancePaymentStatus: String(request.advancePaymentStatus || ''),
-            },
-          ]);
-
-          if (!decision.allowed) {
-            throw new functions.https.HttpsError(
-              'failed-precondition',
-              'The booking changed while the listing was being deleted. Try again.',
-            );
-          }
-
-          if (OPEN_ROOM_REQUEST_STATUSES.indexOf(status) < 0) return null;
-
-          transaction.update(requestRef, {
-            status: 'cancelled',
-            cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-            cancelledBy: uid,
-            cancellationReason: 'The room listing was deleted',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return String(request.studentId || '');
-        });
-
-        if (cancelled) cancelledStudents.push(cancelled);
-      }
-
-      // The final read and delete are transactional. If an occupancy or active
-      // booking appeared in the meantime, the listing is not removed.
-      await db.runTransaction(async (transaction) => {
-        const snapshot = await transaction.get(roomRef);
-        if (!snapshot.exists) return;
-
-        const room = snapshot.data() as Record<string, any>;
-        const finalDecision = decideRoomDeletion(
-          Number(room.currentOccupancy || 0),
-          [],
-        );
-        if (!finalDecision.allowed) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            'The room changed while the listing was being deleted. Try again.',
-          );
-        }
-
-        transaction.delete(roomRef);
-      });
-    } catch (error) {
-      // A failed cancellation must not leave the listing permanently marked
-      // for deletion. Restore the previous state so the owner can resolve the
-      // conflicting booking and try again.
-      await restoreRoomAfterFailedDeletion();
-      throw error;
-    }
-
-    // A notification must never make a successful deletion fail.
-    await Promise.all(
-      cancelledStudents.map((studentId) =>
-        notify(
-          studentId,
-          'Room listing removed',
-          'The room listing you requested was removed. The request was cancelled.',
-          'joinRequest',
-          { requestId: '', roomId },
-        ),
-      ),
+    const result = await executeRoomDeletionOperation(
+      deletionJobRef,
+      true,
     );
 
     return {
       success: true,
       roomId,
-      cancelledRequests: cancelledStudents.length,
+      cancelledRequests: result.cancelledRequests,
     };
   },
 );
@@ -536,29 +1633,135 @@ export const deleteRoomListing = functions.https.onCall(
 export const onRoomCreated = functions.firestore
   .document('rooms/{roomId}')
   .onCreate(async (snapshot) => {
-    const data = snapshot.data() as Record<string, any> | undefined;
-    if (!data) return;
-
-    const patch: Record<string, unknown> = {};
-
-    if (data.status === undefined || data.status === null) {
-      patch.status = 'available';
-    }
-    if (data.currentOccupancy === undefined || data.currentOccupancy === null) {
-      patch.currentOccupancy = 0;
-    }
-
-    if (Object.keys(patch).length === 0) return;
-
     try {
-      await snapshot.ref.set(patch, { merge: true });
-      console.log(
-        `Room ${snapshot.id}: initialized ${Object.keys(patch).join(', ')}`,
-      );
+      let initializedFields: string[] = [];
+
+      // The create trigger races with an immediate listing deletion. A plain
+      // merge on the stale event snapshot could recreate a room which the
+      // deletion already removed, or overwrite the generation written by the
+      // deletion transaction. The current document is therefore read and
+      // patched in one transaction.
+      await db.runTransaction(async (transaction) => {
+        initializedFields = [];
+        const current = await transaction.get(snapshot.ref);
+        if (!current.exists) return;
+
+        const data = current.data() as Record<string, any>;
+        const patch: Record<string, unknown> = {};
+
+        if (data.status === undefined || data.status === null) {
+          patch.status = 'available';
+        }
+        if (
+          data.currentOccupancy === undefined ||
+          data.currentOccupancy === null
+        ) {
+          patch.currentOccupancy = 0;
+        }
+        if (!String(data.listingGeneration || '').trim()) {
+          // The generation identifies this exact lifetime of a room id. It is
+          // assigned by the server and may never be changed by the client.
+          patch.listingGeneration = crypto.randomUUID();
+        }
+
+        if (Object.keys(patch).length === 0) return;
+        transaction.update(snapshot.ref, patch);
+        initializedFields = Object.keys(patch);
+      });
+
+      if (initializedFields.length > 0) {
+        console.log(
+          `Room ${snapshot.id}: initialized ${initializedFields.join(', ')}`,
+        );
+      }
     } catch (error) {
       console.error(`Error initializing room ${snapshot.id}:`, error);
       throw error;
     }
+  });
+
+/**
+ * Removes Storage photos which an owner deleted from a room listing.
+ *
+ * The room document is the authoritative image list. Whenever that list
+ * changes, the removed download URLs are converted back into their Storage
+ * object paths and written to a durable cleanup job. The client does not
+ * have to delete the files, and a Storage outage is retried by the
+ * scheduled worker instead of leaving an orphan forever.
+ */
+export const onRoomUpdated = functions.firestore
+  .document('rooms/{roomId}')
+  .onUpdate(async (change) => {
+    const before = change.before.data() as Record<string, any> | undefined;
+    const after = change.after.data() as Record<string, any> | undefined;
+    if (!before || !after) return;
+
+    const roomId = change.after.id;
+    const ownerId = String(after.ownerId || before.ownerId || '').trim();
+    const listingGeneration = roomListingGeneration({
+      ...before,
+      ...after,
+      roomId,
+      ownerId,
+    });
+    const expectedPrefix = `rooms/${ownerId}/${roomId}/`;
+    if (!ownerId) return;
+
+    const beforeImages = stringList(before.images);
+    const afterImages = new Set(stringList(after.images));
+    const removedUrls = beforeImages.filter((url) => !afterImages.has(url));
+    if (removedUrls.length === 0) return;
+
+    const removedPaths: string[] = [];
+    for (const url of removedUrls) {
+      const path = storageObjectPathFromDownloadUrl(url);
+      if (!path || !path.startsWith(expectedPrefix)) {
+        console.warn(
+          `Could not derive the Storage path of a removed photo in room ${roomId}.`,
+        );
+        continue;
+      }
+      if (!removedPaths.includes(path)) removedPaths.push(path);
+    }
+    if (removedPaths.length === 0) return;
+
+    const cleanupJobRef = db
+      .collection('cleanupJobs')
+      .doc(
+        roomPhotoCleanupJobId(
+          ownerId,
+          roomId,
+          listingGeneration,
+          'paths',
+        ),
+      );
+
+    // The paths are merged in a transaction. Two owners editing the same
+    // room on two devices cannot overwrite each other's pending cleanup.
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(cleanupJobRef);
+      const existing = snapshot.exists
+        ? stringList(snapshot.get('paths'))
+        : [];
+      const paths = [...existing];
+      for (const path of removedPaths) {
+        if (!paths.includes(path)) paths.push(path);
+      }
+      transaction.set(
+        cleanupJobRef,
+        {
+          type: 'roomPhotoPaths',
+          roomId,
+          ownerId,
+          listingGeneration,
+          paths,
+          createdAt: firestore.FieldValue.serverTimestamp(),
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+          attempts: 0,
+        },
+        { merge: true },
+      );
+    });
   });
 
 /**
@@ -568,7 +1771,7 @@ export const onRoomCreated = functions.firestore
  * listing/legacy compatibility field; actual tenants are represented by
  * `currentOccupancy`, which only the booking state machine may change.
  */
-export const adminSetRoomListingStatus = functions.https.onCall(
+export const adminSetRoomListingStatus = callableHttps.onCall(
   async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError(
@@ -577,6 +1780,7 @@ export const adminSetRoomListingStatus = functions.https.onCall(
       );
     }
 
+    const adminUid = context.auth.uid;
     const roomId = String(data?.roomId || '').trim();
     const status = String(data?.status || '').trim();
     if (!roomId) {
@@ -605,13 +1809,39 @@ export const adminSetRoomListingStatus = functions.https.onCall(
       }
 
       const room = snapshot.data() as Record<string, any>;
+
+      // The live admin role is checked in the same transaction as the
+      // listing-status write.
+      const adminProfile = await transaction.get(
+        db.collection('users').doc(adminUid),
+      );
+      if (
+        !canActAsAdmin({
+          exists: adminProfile.exists,
+          registrationCompleted: adminProfile.get('registrationCompleted'),
+          isActive: adminProfile.get('isActive'),
+          role: adminProfile.get('role'),
+        })
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'Admin access required',
+        );
+      }
+
       if (room.deletionInProgress === true) {
         throw new functions.https.HttpsError(
           'failed-precondition',
           'This listing is being deleted and its status cannot be changed',
         );
       }
-      const currentOccupancy = Number(room.currentOccupancy || 0);
+      const currentOccupancy = room.currentOccupancy;
+      if (!isValidCurrentOccupancy(currentOccupancy)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This room has an invalid occupancy',
+        );
+      }
 
       // A room with tenants cannot be published as available. The server
       // keeps the status consistent with the occupancy counter.
@@ -624,7 +1854,7 @@ export const adminSetRoomListingStatus = functions.https.onCall(
 
       transaction.update(roomRef, {
         status,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
       });
     });
 

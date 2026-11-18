@@ -42,6 +42,18 @@ service firebase.storage {
           .data.get('role', '') == 'admin';
     }
 
+    // The deletion tombstone is committed in the same transaction as the
+    // room's `deletionInProgress` marker. It therefore covers both the
+    // deletion-in-progress state and the interval after the room document has
+    // been removed. Do not also read the room document here: Storage Rules
+    // permit at most two Firestore documents in one evaluation, and this
+    // write already needs the live profile plus the tombstone.
+    function roomPhotoWriteIsAllowed(roomId) {
+      let tombstone =
+        /databases/(default)/documents/roomDeletionTombstones/$(roomId);
+      return !firestore.exists(tombstone);
+    }
+
     // -----------------------------------------------------------------------
     // The photos of a room listing.
     //
@@ -61,25 +73,42 @@ service firebase.storage {
       allow read: if isLiveRegisteredAccount();
       allow write: if isLiveOwner() &&
         request.auth.uid == ownerId &&
+        roomPhotoWriteIsAllowed(roomId) &&
         (
           request.resource == null ||
           (
-            request.resource.size < 10 * 1024 * 1024 &&
+            request.resource.size > 0 &&
+            request.resource.size <= 5 * 1024 * 1024 &&
             request.resource.contentType.matches('image/.*')
           )
         );
     }
 
     // -----------------------------------------------------------------------
-    // Everything else (profile pictures, files the admin uploads, …).
+    // Administrator-owned files.
     //
-    // Reading is open to live, registered accounts; writing is reserved for
-    // a live administrator. The current Firebase claim is also required, but
-    // it is never sufficient on its own.
+    // This grant is deliberately limited to its own namespace. A broad
+    // `/{allPaths=**}` admin-write rule also matched the room-image rule
+    // above, and Firebase combines matching grants with OR. A live admin
+    // could therefore overwrite or delete another owner's room photos.
+    // Moderation cleanup of a room photo must go through a server callable
+    // using the Admin SDK instead.
+    // -----------------------------------------------------------------------
+    match /admin/{fileName} {
+      allow read: if isLiveRegisteredAccount();
+      allow write: if isLiveAdmin();
+    }
+
+    // -----------------------------------------------------------------------
+    // Everything else.
+    //
+    // Reading remains open to live, registered accounts for compatibility
+    // with the existing profile/media paths. No client may write an object
+    // which has no explicit namespace rule above.
     // -----------------------------------------------------------------------
     match /{allPaths=**} {
       allow read: if isLiveRegisteredAccount();
-      allow write: if isLiveAdmin();
+      allow write: if false;
     }
   }
 }

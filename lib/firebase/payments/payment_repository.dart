@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/constants/app_constants.dart';
 import '../../../core/constants/enums.dart';
+import '../../../core/utils/app_logger.dart';
+import '../../../core/utils/safe_document_parser.dart';
 import '../../../models/payment_model.dart';
 import '../../../services/payment_service.dart';
 import '../auth/auth_service.dart';
@@ -250,8 +252,11 @@ class PaymentRepository {
   }
 
   List<PaymentModel> _toPayments(QuerySnapshot<Map<String, dynamic>> snapshot) {
-    return snapshot.docs
-        .map((doc) => PaymentModel.fromJson(doc.data(), doc.id))
-        .toList();
+    return parseDocumentsSafely(
+      snapshot.docs.map((doc) => (id: doc.id, data: doc.data())),
+      (id, data) => PaymentModel.fromJson(data, id),
+      onError: (id, error) =>
+          AppLogger.warning('Could not read the payment $id', error: error),
+    );
   }
 }

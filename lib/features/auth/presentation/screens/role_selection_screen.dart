@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -15,7 +15,8 @@ class RoleSelectionScreen extends ConsumerStatefulWidget {
   const RoleSelectionScreen({super.key});
 
   @override
-  ConsumerState<RoleSelectionScreen> createState() => _RoleSelectionScreenState();
+  ConsumerState<RoleSelectionScreen> createState() =>
+      _RoleSelectionScreenState();
 }
 
 class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
@@ -53,8 +54,13 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
 
       if (!mounted) return;
 
-      // The server writes the profile and re-checks the verification.
-      await ref.read(otpServiceProvider).completeRegistration(
+      // The server writes the profile and re-checks the verification. It
+      // returns the role which was actually stored; an already claimed role
+      // is preserved by the server and may differ from the button which was
+      // pressed.
+      final completedRole = await ref
+          .read(otpServiceProvider)
+          .completeRegistration(
             name: user.displayName?.trim().isNotEmpty == true
                 ? user.displayName!.trim()
                 : 'User',
@@ -65,7 +71,7 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
 
       if (!mounted) return;
 
-      if (_selectedRole == UserRole.owner) {
+      if (completedRole == UserRole.owner.name) {
         context.go('/owner/dashboard');
       } else {
         context.go('/student/home');
@@ -120,7 +126,9 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                         height: 80,
                         decoration: BoxDecoration(
                           color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(AppBorderRadius.xl),
+                          borderRadius: BorderRadius.circular(
+                            AppBorderRadius.xl,
+                          ),
                         ),
                         child: Icon(
                           Icons.home_outlined,
@@ -172,10 +180,12 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                           role: UserRole.student,
                           title: 'Student',
                           subtitle: 'Looking for a room to rent',
-                          description: 'Search rooms, contact owners, and manage your stay',
+                          description:
+                              'Search rooms, contact owners, and manage your stay',
                           icon: Icons.school_outlined,
                           selected: _selectedRole == UserRole.student,
-                          onTap: () => setState(() => _selectedRole = UserRole.student),
+                          onTap: () =>
+                              setState(() => _selectedRole = UserRole.student),
                         ),
                       ),
                       const SizedBox(height: AppSpacing.md),
@@ -184,10 +194,12 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                           role: UserRole.owner,
                           title: 'Room Owner',
                           subtitle: 'Have rooms to rent out',
-                          description: 'List rooms, manage bookings, and earn income',
+                          description:
+                              'List rooms, manage bookings, and earn income',
                           icon: Icons.apartment_outlined,
                           selected: _selectedRole == UserRole.owner,
-                          onTap: () => setState(() => _selectedRole = UserRole.owner),
+                          onTap: () =>
+                              setState(() => _selectedRole = UserRole.owner),
                         ),
                       ),
                     ],
@@ -196,7 +208,9 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                 const SizedBox(height: AppSpacing.lg),
                 AppButton(
                   label: 'Continue',
-                  onPressed: _selectedRole != null && !_isLoading ? _continue : null,
+                  onPressed: _selectedRole != null && !_isLoading
+                      ? _continue
+                      : null,
                   isLoading: _isLoading,
                 ),
               ],
@@ -237,10 +251,14 @@ class _RoleSelectionCard extends StatelessWidget {
         duration: AppConstants.animationDuration,
         padding: const EdgeInsets.all(AppSpacing.lg),
         decoration: BoxDecoration(
-          color: selected ? theme.colorScheme.primaryContainer : theme.colorScheme.surface,
+          color: selected
+              ? theme.colorScheme.primaryContainer
+              : theme.colorScheme.surface,
           borderRadius: BorderRadius.circular(AppBorderRadius.xl),
           border: Border.all(
-            color: selected ? theme.colorScheme.primary : theme.colorScheme.outlineVariant,
+            color: selected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outlineVariant,
             width: selected ? 3 : 1,
           ),
           boxShadow: selected ? AppShadows.level2 : AppShadows.level1,
@@ -259,14 +277,18 @@ class _RoleSelectionCard extends StatelessWidget {
               child: Icon(
                 icon,
                 size: 40,
-                color: selected ? theme.colorScheme.onPrimary : theme.colorScheme.primary,
+                color: selected
+                    ? theme.colorScheme.onPrimary
+                    : theme.colorScheme.primary,
               ),
             ),
             const SizedBox(height: AppSpacing.md),
             Text(
               title,
               style: theme.textTheme.headlineSmall?.copyWith(
-                color: selected ? theme.colorScheme.primary : theme.colorScheme.onSurface,
+                color: selected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurface,
                 fontWeight: FontWeight.w600,
               ),
             ),

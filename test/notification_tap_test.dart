@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -28,17 +28,15 @@ class _FakeFirestore implements FirebaseFirestore {
 
 class _FakeFirebaseMessaging implements FirebaseMessaging {
   @override
-  dynamic noSuchMethod(Invocation invocation) =>
-      throw UnimplementedError('Firebase Messaging is not available in the test');
+  dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError(
+    'Firebase Messaging is not available in the test',
+  );
 }
 
 /// A messaging service that lets the test fire the taps.
 class _FakeMessagingService extends MessagingService {
   _FakeMessagingService()
-      : super(
-          messaging: _FakeFirebaseMessaging(),
-          firestore: _FakeFirestore(),
-        );
+    : super(messaging: _FakeFirebaseMessaging(), firestore: _FakeFirestore());
 
   final StreamController<RemoteMessage> _opened =
       StreamController<RemoteMessage>.broadcast();
@@ -72,10 +70,7 @@ RemoteMessage _message(String type, Map<String, String> data) {
   return RemoteMessage(
     messageId: 'm1',
     data: {'type': type, ...data},
-    notification: const RemoteNotification(
-      title: 'Title',
-      body: 'Body',
-    ),
+    notification: const RemoteNotification(title: 'Title', body: 'Body'),
   );
 }
 
@@ -108,8 +103,9 @@ void main() {
     );
   }
 
-  testWidgets('the tap opens the screen the notification came from',
-      (tester) async {
+  testWidgets('the tap opens the screen the notification came from', (
+    tester,
+  ) async {
     final messaging = _FakeMessagingService();
     final session = StreamController<AuthSession?>();
     addTearDown(session.close);
@@ -213,8 +209,9 @@ void main() {
     expect(find.text('OWNER INVOICES'), findsOneWidget);
   });
 
-  testWidgets('the app that was opened by a tap waits for the splash screen',
-      (tester) async {
+  testWidgets('the app that was opened by a tap waits for the splash screen', (
+    tester,
+  ) async {
     final messaging = _FakeMessagingService();
     final session = StreamController<AuthSession?>();
     addTearDown(session.close);
@@ -265,17 +262,14 @@ void main() {
     // screen of the role. The route of the notification is remembered, so
     // that the splash screen opens **that** screen instead.
     expect(find.text('SPLASH'), findsOneWidget);
-    expect(
-      container.read(pendingNotificationRouteProvider),
-      '/owner/requests',
-    );
+    expect(container.read(pendingNotificationRouteProvider), '/owner/requests');
   });
 
-  testWidgets('the app that was opened with a message opens that screen',
-      (tester) async {
+  testWidgets('the app that was opened with a message opens that screen', (
+    tester,
+  ) async {
     final messaging = _FakeMessagingService();
-    messaging.initialMessage =
-        _message('joinRequest', {'requestId': 'JRQ-1'});
+    messaging.initialMessage = _message('joinRequest', {'requestId': 'JRQ-1'});
     final session = StreamController<AuthSession?>();
     addTearDown(session.close);
 

@@ -31,8 +31,10 @@ import 'package:stayserve/firebase/storage/storage_service.dart';
 import 'package:stayserve/firebase/visits/visit_repository.dart';
 import 'package:stayserve/models/join_request_model.dart';
 import 'package:stayserve/models/messaging_model.dart';
+import 'package:stayserve/models/owned_room_model.dart';
 import 'package:stayserve/models/payment_model.dart';
 import 'package:stayserve/models/room_model.dart';
+import 'package:stayserve/models/room_private_location.dart';
 import 'package:stayserve/models/room_review_model.dart';
 import 'package:stayserve/models/user_model.dart';
 import 'package:stayserve/services/location_service.dart';
@@ -109,10 +111,10 @@ class FakeStorageService extends StorageService {
   }
 
   @override
-  Future<void> deleteFile(String url) async {}
+  Future<bool> deleteFile(String url) async => true;
 
   @override
-  Future<void> deleteFiles(List<String> urls) async {}
+  Future<List<String>> deleteFiles(List<String> urls) async => const [];
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +345,18 @@ class FakeAdminRepository extends AdminRepository {
   Future<void> deleteUser(String uid) async {}
 
   @override
+  Future<AccountDeletionResult> deleteUserWithResult(String uid) async {
+    return const AccountDeletionResult(
+      completed: true,
+      queued: false,
+      blocked: false,
+      retryable: false,
+      state: 'completed',
+      message: 'User deleted completely',
+    );
+  }
+
+  @override
   Future<void> scheduleUserDeletion(String uid, {int days = 7}) async {}
 
   @override
@@ -469,17 +483,20 @@ class FakeOtpService extends OtpService {
   }
 
   @override
-  Future<void> registerUserRole({required String role}) async {}
+  Future<void> registerUserRole({
+    required String role,
+    required String challenge,
+  }) async {}
 
   @override
-  Future<void> completeRegistration({
+  Future<String> completeRegistration({
     required String name,
     required String role,
     required String challenge,
     String? phone,
     String? phoneChallenge,
     String? pincode,
-  }) async {}
+  }) async => role;
 }
 
 /// The location service — it always knows where the device is.
@@ -586,14 +603,7 @@ RoomModel auditRoom({
     description: 'A comfortable room near the campus.',
     monthlyRent: rent,
     securityDeposit: rent * 2,
-    location: const Location(
-      address: '42 Test Street',
-      city: 'Bengaluru',
-      state: 'Karnataka',
-      pincode: '560001',
-      latitude: 12.9716,
-      longitude: 77.5946,
-    ),
+    location: const Location(city: 'Bengaluru', state: 'Karnataka'),
     roomType: RoomType.single,
     furnishing: FurnishingType.semi,
     availableFrom: auditNow(),
@@ -607,6 +617,36 @@ RoomModel auditRoom({
     updatedAt: auditNow(),
     latitude: 12.9716,
     longitude: 77.5946,
+  );
+}
+
+/// The owner-facing view of [auditRoom], including its exact private address.
+OwnedRoomModel auditOwnedRoom({
+  String roomId = 'room-1',
+  String ownerId = 'owner-1',
+  String title = 'Test Room',
+  double rent = 5000,
+  RoomStatus status = RoomStatus.available,
+}) {
+  return OwnedRoomModel(
+    listing: auditRoom(
+      roomId: roomId,
+      ownerId: ownerId,
+      title: title,
+      rent: rent,
+      status: status,
+    ),
+    privateLocation: RoomPrivateLocation(
+      roomId: roomId,
+      ownerId: ownerId,
+      address: '42 Test Street',
+      city: 'Bengaluru',
+      state: 'Karnataka',
+      pincode: '560001',
+      latitude: 12.9716,
+      longitude: 77.5946,
+      updatedAt: auditNow(),
+    ),
   );
 }
 

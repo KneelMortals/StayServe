@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -61,6 +62,18 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   /// do with the page they are on.
   bool _hasLeftSplash = false;
 
+  /// Whether the start-up failed while Firebase Auth still reports a
+  /// signed-in user.
+  ///
+  /// A network or profile-read failure must not be treated as a logout. The
+  /// user stays on the splash screen and can retry instead of being sent to
+  /// the login screen every time the app is opened with a flaky connection.
+  bool _restoreFailed = false;
+
+  /// Prevents two start-up attempts from running at the same time when the
+  /// user taps **Try again**.
+  bool _isInitializing = false;
+
   @override
   void initState() {
     super.initState();
@@ -68,14 +81,31 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   }
 
   Future<void> _initializeApp() async {
-    if (!mounted) return;
+    if (!mounted || _isInitializing) return;
+    _isInitializing = true;
 
-    // The pre-flight gets **one** budget for both of its steps, so a slow
-    // network cannot stretch the splash screen to twice the limit.
-    final deadline = DateTime.now().add(preflightTimeout);
+    if (_restoreFailed && mounted) {
+      setState(() => _restoreFailed = false);
+    }
+
+    User? authenticatedUser;
 
     try {
-      // 1. Check for force update / maintenance first.
+      // 1. Resolve authentication **before** any network work.
+      //
+      //    Firebase Auth restores the persisted user from the device, so this
+      //    does not need the network. It must also happen before the
+      //    remote-config check: that check used to be able to consume the
+      //    whole 30-second budget, after which the missing session was
+      //    mistaken for a logout and the user was sent to the login screen.
+      authenticatedUser = await _resolveAuthenticatedUser();
+      if (!mounted) return;
+
+      // The pre-flight gets **one** budget for its network steps, so a slow
+      // network cannot stretch the splash screen to twice the limit.
+      final deadline = DateTime.now().add(preflightTimeout);
+
+      // 2. Check for force update / maintenance.
       //
       //    A broken or slow remote config must not lock everybody out of
       //    the app, so the check is given up when the budget runs out and
@@ -94,19 +124,22 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         return;
       }
 
-      // 2. Resolve the session. Waiting for the first value is required —
-      //    reading the provider synchronously returns null while the auth
-      //    stream has not emitted yet, which would send an already
-      //    signed-in user to the login screen.
-      final session = await _withPreflightBudget<AuthSession?>(
-        ref.read(authSessionProvider.future),
-        null,
-        deadline: deadline,
-        description: 'The session lookup',
-      );
+      // 3. Resolve the profile-enriched session when the user is signed in.
+      //    Waiting for the first value is required — reading the provider
+      //    synchronously returns null while the auth stream has not emitted
+      //    yet.
+      AuthSession? session;
+      if (authenticatedUser != null) {
+        session = await _withPreflightBudget<AuthSession?>(
+          ref.read(authSessionProvider.future),
+          null,
+          deadline: deadline,
+          description: 'The session lookup',
+        );
+      }
       if (!mounted) return;
 
-      // 3. Ask for the location and check whether StayServe runs there.
+      // 4. Ask for the location and check whether StayServe runs there.
       //    This happens on **every** start, not only on the first one.
       //
       //    This step is deliberately **not** covered by the pre-flight
@@ -123,19 +156,117 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         return;
       }
 
-      // 4. Let the user in.
+      // 5. Let the user in.
       if (session != null) {
         await _checkLoggedInUser(session);
+      } else if (authenticatedUser != null) {
+        // The Auth user is still signed in, but the profile did not arrive
+        // within the budget. Restore the profile directly. A failure here
+        // is a temporary connection problem — it is **not** a logout.
+        await _restoreAuthenticatedUser(authenticatedUser);
       } else {
         _navigateToLogin();
       }
     } catch (e) {
-      // A failure during the start-up must never keep the user on the
-      // splash screen — the app has to open.
       AppLogger.warning('The start-up failed', error: e);
       if (!mounted) return;
-      _navigateToLogin();
+
+      // Never turn a server/network failure into a logout. If Firebase Auth
+      // still has a user, keep the session and offer a retry. Reading the
+      // cached user can itself fail (for example when the Firebase app is
+      // unavailable), so that lookup must not escape this catch block.
+      User? stillAuthenticated = authenticatedUser;
+      if (stillAuthenticated == null) {
+        try {
+          stillAuthenticated = ref.read(authRepositoryProvider).currentUser;
+        } catch (error) {
+          AppLogger.warning(
+            'Could not read the cached Auth user while recovering from a '
+            'start-up failure',
+            error: error,
+          );
+        }
+      }
+      if (stillAuthenticated != null) {
+        _showSessionRestoreFailure();
+      } else {
+        _navigateToLogin();
+      }
+    } finally {
+      _isInitializing = false;
     }
+  }
+
+  /// Returns the user restored from Firebase Auth, if there is one.
+  ///
+  /// The synchronous `currentUser` is checked first because it is available
+  /// immediately on native platforms. The auth-state stream is the fallback
+  /// for the short interval in which the native SDK is still restoring its
+  /// persisted session.
+  Future<User?> _resolveAuthenticatedUser() async {
+    final cachedUser = ref.read(authRepositoryProvider).currentUser;
+    if (cachedUser != null) return cachedUser;
+
+    try {
+      return await ref
+          .read(authStateProvider.future)
+          .timeout(const Duration(seconds: 5));
+    } catch (e) {
+      AppLogger.warning('Could not resolve the restored Auth user', error: e);
+      return ref.read(authRepositoryProvider).currentUser;
+    }
+  }
+
+  /// Restores the profile of an already authenticated user.
+  ///
+  /// This is the fallback for a start-up in which the profile stream did not
+  /// produce a value before the pre-flight budget ended. It deliberately
+  /// keeps the Auth session intact when the read fails.
+  Future<void> _restoreAuthenticatedUser(User user) async {
+    try {
+      final currentProfile = ref.read(authSessionProvider).valueOrNull?.profile;
+      if (currentProfile != null && currentProfile.uid == user.uid) {
+        _navigateToRoleHome(currentProfile.role);
+        return;
+      }
+
+      final profile = await ref
+          .read(authRepositoryProvider)
+          .getUserProfile(user.uid)
+          .timeout(const Duration(seconds: 10));
+      if (!mounted) return;
+
+      if (profile != null) {
+        _navigateToRoleHome(profile.role);
+      } else {
+        // The Auth account exists but the server-side profile does not.
+        // The user still has to complete role selection; this is not a
+        // logout.
+        context.go('/role-selection');
+      }
+    } catch (e) {
+      AppLogger.warning(
+        'Could not restore the profile of ${user.uid}',
+        error: e,
+      );
+      if (!mounted) return;
+      _showSessionRestoreFailure();
+    }
+  }
+
+  void _showSessionRestoreFailure() {
+    if (!mounted) return;
+    setState(() => _restoreFailed = true);
+    _updateStatus(
+      'Your session is still saved, but it could not be restored. '
+      'Check your connection and try again.',
+    );
+  }
+
+  void _retryStartup() {
+    if (_isInitializing) return;
+    _updateStatus('Retrying...');
+    _initializeApp();
   }
 
   /// Runs [work] with the time that is left of the pre-flight budget.
@@ -192,7 +323,8 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         return false;
       }
 
-      if (forceUpdateResult.isUpdateRequired && !forceUpdateResult.isForceUpdate) {
+      if (forceUpdateResult.isUpdateRequired &&
+          !forceUpdateResult.isForceUpdate) {
         _showOptionalUpdateDialog(forceUpdateResult);
       }
     } catch (e) {
@@ -219,7 +351,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
           message.isNotEmpty
               ? message
               : 'StayServe is under maintenance right now. '
-                  'Please try again in a little while.',
+                    'Please try again in a little while.',
         );
         return false;
       }
@@ -328,8 +460,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
             'Launch-area check: using the pincode of the profile '
             '($profilePincode) — NOT allowed',
           );
-          final action =
-              await _showNotLaunchedDialog(pincode: profilePincode);
+          final action = await _showNotLaunchedDialog(pincode: profilePincode);
           if (action == _LaunchGateAction.exit) {
             await quitApp();
             return false;
@@ -414,8 +545,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   /// position it already had.
   Future<void> _applyManualPincodeLocation(String pincode) async {
     try {
-      final location =
-          await ref.read(locationServiceProvider).resolvePincodeLocation(pincode);
+      final location = await ref
+          .read(locationServiceProvider)
+          .resolvePincodeLocation(pincode);
       if (location == null) {
         AppLogger.warning(
           'The pincode $pincode could not be turned into coordinates — the '
@@ -449,9 +581,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   /// Shows a short message at the bottom of the screen.
   void _showSnack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   /// Resolves the location without checking the launch areas.
@@ -477,10 +609,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     if (profile.pincode == pincode) return;
 
     try {
-      await ref.read(authRepositoryProvider).updateUserProfile(
-            profile.uid,
-            {'pincode': pincode},
-          );
+      await ref.read(authRepositoryProvider).updateUserProfile(profile.uid, {
+        'pincode': pincode,
+      });
     } catch (e) {
       AppLogger.warning('Could not store the pincode on the profile', error: e);
     }
@@ -488,8 +619,11 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
 
   Future<void> _checkLoggedInUser(AuthSession session) async {
     try {
-      final userProfile = session.profile ??
-          await ref.read(authRepositoryProvider).getUserProfile(session.user.uid);
+      final userProfile =
+          session.profile ??
+          await ref
+              .read(authRepositoryProvider)
+              .getUserProfile(session.user.uid);
       if (!mounted) return;
 
       if (userProfile != null) {
@@ -498,8 +632,13 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         context.go('/role-selection');
       }
     } catch (e) {
+      AppLogger.warning('Could not restore the signed-in user', error: e);
       if (!mounted) return;
-      _navigateToLogin();
+
+      // The account is still authenticated. A failed profile read is a
+      // temporary failure, not a logout, so keep the session and let the
+      // user retry.
+      _showSessionRestoreFailure();
     }
   }
 
@@ -547,7 +686,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   /// Shows the "we do not run here yet" dialog.
   ///
   /// The user can try again, type the location by hand, or leave the app.
-  Future<_LaunchGateAction> _showNotLaunchedDialog({required String pincode}) async {
+  Future<_LaunchGateAction> _showNotLaunchedDialog({
+    required String pincode,
+  }) async {
     if (_hasLeftSplash) return _LaunchGateAction.exit;
 
     _updateStatus('StayServe is not available in your location');
@@ -576,9 +717,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
             Container(
               padding: const EdgeInsets.all(AppSpacing.sm),
               decoration: BoxDecoration(
-                color: Theme.of(dialogContext)
-                    .colorScheme
-                    .surfaceContainerHighest,
+                color: Theme.of(
+                  dialogContext,
+                ).colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(AppBorderRadius.md),
               ),
               child: Row(
@@ -613,10 +754,8 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
             child: const Text('Exit'),
           ),
           TextButton(
-            onPressed: () => Navigator.pop(
-              dialogContext,
-              _LaunchGateAction.manualLocation,
-            ),
+            onPressed: () =>
+                Navigator.pop(dialogContext, _LaunchGateAction.manualLocation),
             child: const Text('Enter location manually'),
           ),
           FilledButton.icon(
@@ -663,10 +802,8 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
             child: const Text('Exit'),
           ),
           TextButton(
-            onPressed: () => Navigator.pop(
-              dialogContext,
-              _LaunchGateAction.manualLocation,
-            ),
+            onPressed: () =>
+                Navigator.pop(dialogContext, _LaunchGateAction.manualLocation),
             child: const Text('Enter location manually'),
           ),
           TextButton(
@@ -696,7 +833,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
       context: context,
       barrierDismissible: !result.isForceUpdate,
       builder: (context) => AlertDialog(
-        title: Text(result.isForceUpdate ? 'Update Required' : 'Update Available'),
+        title: Text(
+          result.isForceUpdate ? 'Update Required' : 'Update Available',
+        ),
         content: Text(result.message),
         actions: [
           if (!result.isForceUpdate)
@@ -838,11 +977,28 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
               ),
             ),
             const SizedBox(height: AppSpacing.xxl),
-            CircularProgressIndicator(
-              valueColor: AlwaysStoppedAnimation<Color>(
-                theme.colorScheme.onPrimary,
+            if (_restoreFailed) ...[
+              Icon(
+                Icons.cloud_off_outlined,
+                size: 44,
+                color: theme.colorScheme.onPrimary,
               ),
-            ),
+              const SizedBox(height: AppSpacing.md),
+              FilledButton.icon(
+                onPressed: _retryStartup,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Try again'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: theme.colorScheme.onPrimary,
+                  foregroundColor: theme.colorScheme.primary,
+                ),
+              ),
+            ] else
+              CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  theme.colorScheme.onPrimary,
+                ),
+              ),
             const SizedBox(height: AppSpacing.lg),
             Text(
               _statusMessage,
@@ -930,10 +1086,7 @@ class _ManualPincodeDialogState extends State<_ManualPincodeDialog> {
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('Check'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('Check')),
       ],
     );
   }

@@ -33,12 +33,7 @@ RoomModel _room() {
     description: '',
     monthlyRent: 1000,
     securityDeposit: 0,
-    location: const Location(
-      address: '',
-      city: 'Bengaluru',
-      state: 'Karnataka',
-      pincode: '560001',
-    ),
+    location: const Location(city: 'Bengaluru', state: 'Karnataka'),
     roomType: RoomType.single,
     furnishing: FurnishingType.unfurnished,
     availableFrom: now,

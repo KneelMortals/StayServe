@@ -1,43 +1,69 @@
 #!/usr/bin/env bash
 #
-# Runs the tests of the batched maintenance helpers against the local
-# Firestore emulator.
-#
-#   tools/test_batches.sh
-#
-# The emulator is stopped again when the script exits.
+# Runs the Firestore batching regressions against a dedicated emulator.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EMU_DIR="$(mktemp -d)"
-# A free port — a leftover emulator of an earlier run must never be able to
-# answer for this one (it would carry the *old* data).
-PORT="${FIRESTORE_EMULATOR_PORT:-8181}"
-if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-  :
-else
-  for candidate in 8182 8183 8184 8185 8190 8191 8192 8193; do
+EMU_DIR="$(mktemp -d "${TMPDIR:-/tmp}/stayserve-batches.XXXXXX")"
+PROJECT="demo-stayserve-batches-$$"
+
+pick_port() {
+  local preferred="$1"
+  shift
+  if ! nc -z 127.0.0.1 "$preferred" 2>/dev/null; then
+    echo "$preferred"
+    return
+  fi
+  for candidate in "$@"; do
     if ! nc -z 127.0.0.1 "$candidate" 2>/dev/null; then
-      PORT="$candidate"
-      break
+      echo "$candidate"
+      return
     fi
   done
+  echo "No free port is available for this emulator." >&2
+  exit 1
+}
+
+FIRESTORE_PORT="$(pick_port 8181 8182 8183 8184 8185 8190 8191 8192 8193)"
+HUB_PORT="$(pick_port 4411 4412 4413 4414 4415 4416 4417 4418)"
+
+if [[ -x "$ROOT/node_modules/.bin/firebase" ]]; then
+  FIREBASE="$ROOT/node_modules/.bin/firebase"
+elif command -v firebase >/dev/null 2>&1; then
+  FIREBASE="$(command -v firebase)"
+else
+  echo "firebase-tools is not installed." >&2
+  exit 1
 fi
-HUB_PORT=4421
-for candidate in 4421 4422 4423 4424 4425 4426 4427 4428; do
-  if ! nc -z 127.0.0.1 "$candidate" 2>/dev/null; then
-    HUB_PORT="$candidate"
-    break
+
+kill_port_listener() {
+  local port="$1"
+  [[ -n "$port" ]] || return 0
+  command -v lsof >/dev/null 2>&1 || return 0
+
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+
+  if ((${#pids[@]})); then
+    kill "${pids[@]}" 2>/dev/null || true
+    sleep 1
+    kill -KILL "${pids[@]}" 2>/dev/null || true
   fi
-done
-PROJECT="demo-stayserve-batches"
+}
 
 cleanup() {
   if [[ -n "${EMU_PID:-}" ]] && kill -0 "$EMU_PID" 2>/dev/null; then
+    # The Firebase CLI starts the Java emulator as a child. Killing only the
+    # CLI can orphan that listener and make a later suite talk to stale data.
+    pkill -TERM -P "$EMU_PID" 2>/dev/null || true
     kill "$EMU_PID" 2>/dev/null || true
     wait "$EMU_PID" 2>/dev/null || true
   fi
+  kill_port_listener "$FIRESTORE_PORT"
+  kill_port_listener "$HUB_PORT"
   pkill -f "emulators:start --only firestore --project $PROJECT" 2>/dev/null || true
   rm -rf "$EMU_DIR"
 }
@@ -50,7 +76,7 @@ cat > "$EMU_DIR/firebase.json" <<EOF
     "indexes": "$ROOT/firestore.indexes.json"
   },
   "emulators": {
-    "firestore": { "port": $PORT },
+    "firestore": { "port": $FIRESTORE_PORT },
     "ui": { "enabled": false },
     "hub": { "port": $HUB_PORT }
   }
@@ -61,28 +87,29 @@ cat > "$EMU_DIR/.firebaserc" <<EOF
 { "projects": { "default": "$PROJECT" } }
 EOF
 
-echo "Starting the Firestore emulator on port $PORT ..."
-(cd "$EMU_DIR" && exec firebase emulators:start --only firestore --project "$PROJECT" > emulator.log 2>&1) &
+echo "Starting the Firestore emulator on port $FIRESTORE_PORT ..."
+(
+  cd "$EMU_DIR"
+  exec "$FIREBASE" emulators:start \
+    --only firestore \
+    --project "$PROJECT"
+) > "$EMU_DIR/emulator.log" 2>&1 &
 EMU_PID=$!
 
-for _ in $(seq 1 60); do
-  if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then
+ready=false
+for _ in $(seq 1 90); do
+  if curl -s -o /dev/null "http://127.0.0.1:$FIRESTORE_PORT/" && \
+    grep -q "All emulators ready" "$EMU_DIR/emulator.log"; then
+    ready=true
     break
   fi
   sleep 1
 done
 
-if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then
-  echo "The emulator did not start. Log:"
+if [[ "$ready" != true ]]; then
+  echo "The Firestore emulator did not start. Log:"
   cat "$EMU_DIR/emulator.log"
   exit 1
 fi
 
-if ! grep -q "All emulators ready" "$EMU_DIR/emulator.log"; then
-  echo "The emulator on port $PORT is not the one that was started here."
-  echo "Log:"
-  cat "$EMU_DIR/emulator.log"
-  exit 1
-fi
-
-node "$ROOT/tools/batches_test.mjs" "$PORT" "$PROJECT"
+node "$ROOT/tools/batches_test.mjs" "$FIRESTORE_PORT" "$PROJECT"

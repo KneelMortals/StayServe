@@ -11,7 +11,7 @@
 // The behaviour of the individual buttons is covered by the other test
 // files.
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -243,36 +243,30 @@ Future<void> auditScreen(
     routes: [
       GoRoute(
         path: '/base',
-        builder: (context, state) => const Scaffold(
-          body: Center(child: Text('audit base page')),
-        ),
+        builder: (context, state) =>
+            const Scaffold(body: Center(child: Text('audit base page'))),
         routes: [
-          GoRoute(
-            path: 'audit',
-            builder: (context, state) => build(context),
-          ),
+          GoRoute(path: 'audit', builder: (context, state) => build(context)),
         ],
       ),
       for (final path in kAuditRoutes)
         GoRoute(
           path: path,
-          builder: (context, state) => const Scaffold(
-            body: Center(child: Text('audit placeholder')),
-          ),
+          builder: (context, state) =>
+              const Scaffold(body: Center(child: Text('audit placeholder'))),
         ),
     ],
-    errorBuilder: (context, state) => const Scaffold(
-      body: Center(child: Text('audit error page')),
-    ),
+    errorBuilder: (context, state) =>
+        const Scaffold(body: Center(child: Text('audit error page'))),
   );
   // The router is **not** disposed by hand: the widget tree owns the
   // navigator of the router, and disposing the router as well would dispose
   // the navigator twice ("!_debugLocked" assertion).
 
   Widget app() => ProviderScope(
-        overrides: overrides,
-        child: MaterialApp.router(routerConfig: router),
-      );
+    overrides: overrides,
+    child: MaterialApp.router(routerConfig: router),
+  );
 
   /// Builds the screen and shows the tab [tab].
   Future<void> showTab(int tab) async {
@@ -290,7 +284,8 @@ Future<void> auditScreen(
     expect(
       tabBar.evaluate(),
       isNotEmpty,
-      reason: '$name: the screen should have $tabCount tabs, but it has no '
+      reason:
+          '$name: the screen should have $tabCount tabs, but it has no '
           'tab bar at all',
     );
     final controller = DefaultTabController.of(tester.element(tabBar));
@@ -309,7 +304,8 @@ Future<void> auditScreen(
     expect(
       buttons.length,
       greaterThanOrEqualTo(minButtons),
-      reason: '$name: the screen does not contain a single button — '
+      reason:
+          '$name: the screen does not contain a single button — '
           'the audit would not check anything at all',
     );
 
@@ -326,8 +322,9 @@ Future<void> auditScreen(
         reason: '$name: button #$index is gone after the rebuild',
       );
 
-      final finder =
-          find.byElementPredicate((e) => identical(e, current[index]));
+      final finder = find.byElementPredicate(
+        (e) => identical(e, current[index]),
+      );
       final description = _describe(current[index]);
 
       await tester.ensureVisible(finder);
@@ -340,7 +337,8 @@ Future<void> auditScreen(
       expect(
         error,
         isNull,
-        reason: '$name: the button $description ( #$index ) threw when it was '
+        reason:
+            '$name: the button $description ( #$index ) threw when it was '
             'tapped',
       );
     }
@@ -398,8 +396,7 @@ class FakeAdminController extends admin.AdminController {
     String requestId, {
     required bool approve,
     String? rejectionReason,
-  }) async =>
-      null;
+  }) async => null;
 
   @override
   Future<String?> markInvoicePaid(
@@ -407,8 +404,7 @@ class FakeAdminController extends admin.AdminController {
     String? paymentReference,
     String? paymentMethod,
     String? upiTransactionId,
-  }) async =>
-      null;
+  }) async => null;
 
   @override
   Future<String?> cancelInvoice(String invoiceId) async => null;
@@ -433,8 +429,7 @@ class FakeAdminController extends admin.AdminController {
     required List<String> enabledPincodes,
     required List<String> disabledPincodes,
     required String mode,
-  }) async =>
-      null;
+  }) async => null;
 }
 
 /// The statistics of the admin dashboard.
@@ -467,21 +462,23 @@ List<Override> commonOverrides({
     currentUserProvider.overrideWithValue(
       auditMockUser(uid: uid, email: user.email),
     ),
-    authStateProvider.overrideWith((ref) => Stream.value(auditMockUser(
-      uid: uid,
-      email: user.email,
-    ))),
+    authStateProvider.overrideWith(
+      (ref) => Stream.value(auditMockUser(uid: uid, email: user.email)),
+    ),
     authSessionProvider.overrideWith(
-      (ref) => Stream.value(AuthSession(
-        user: auditMockUser(uid: uid, email: user.email),
-        profile: user,
-      )),
+      (ref) => Stream.value(
+        AuthSession(
+          user: auditMockUser(uid: uid, email: user.email),
+          profile: user,
+        ),
+      ),
     ),
     authControllerProvider.overrideWith(() => FakeAuthController()),
     userProfileProvider.overrideWith((ref, id) async => user),
     userLocationProvider.overrideWith(() => FakeUserLocationNotifier()),
-    notificationsRepositoryProvider
-        .overrideWithValue(FakeNotificationsRepository()),
+    notificationsRepositoryProvider.overrideWithValue(
+      FakeNotificationsRepository(),
+    ),
     notificationsProvider.overrideWith(
       (ref) => Stream.value(<NotificationModel>[]),
     ),
@@ -509,8 +506,9 @@ void main() {
         build: (_) => const AdminDashboardScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          admin.adminStatsProvider
-              .overrideWith((ref) => Stream.value(auditStats())),
+          admin.adminStatsProvider.overrideWith(
+            (ref) => Stream.value(auditStats()),
+          ),
         ],
       );
     });
@@ -523,10 +521,10 @@ void main() {
         build: (_) => const AdminUsersScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
           admin.adminUsersProvider.overrideWith(
             (ref, roleFilter) => Stream.value([
               auditUser(uid: 'student-1'),
@@ -545,10 +543,10 @@ void main() {
         build: (_) => const AdminRoomsScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
           admin.adminRoomsProvider.overrideWith(
             (ref, statusFilter) => Stream.value([
               auditRoom(),
@@ -567,10 +565,10 @@ void main() {
         build: (_) => const AdminRequestsScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
           admin.adminJoinRequestsProvider.overrideWith(
             (ref, statusFilter) => Stream.value([
               auditRequest(),
@@ -593,10 +591,10 @@ void main() {
         tabCount: 3,
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
           admin.adminInvoicesProvider.overrideWith(
             (ref, statusFilter) => Stream.value([
               auditInvoice(),
@@ -619,10 +617,10 @@ void main() {
         tabCount: 3,
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
           admin.adminPaymentsProvider.overrideWith(
             (ref, statusFilter) => Stream.value([
               auditPayment(),
@@ -644,16 +642,17 @@ void main() {
         build: (_) => const AdminSettingsScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
-          admin.adminCommissionPercentageProvider
-              .overrideWith((ref) async => 30.0),
-          admin.adminMaintenanceModeProvider
-              .overrideWith((ref) async => false),
-          admin.adminNotificationsEnabledProvider
-              .overrideWith((ref) async => true),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
+          admin.adminCommissionPercentageProvider.overrideWith(
+            (ref) async => 30.0,
+          ),
+          admin.adminMaintenanceModeProvider.overrideWith((ref) async => false),
+          admin.adminNotificationsEnabledProvider.overrideWith(
+            (ref) async => true,
+          ),
           admin.adminFeePayerProvider.overrideWith((ref) async => 'student'),
         ],
       );
@@ -667,17 +666,19 @@ void main() {
         build: (_) => const AdminLaunchAreasScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          adminRepositoryProvider
-              .overrideWithValue(FakeAdminRepository()),
-          admin.adminControllerProvider
-              .overrideWith(() => FakeAdminController()),
+          adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
+          admin.adminControllerProvider.overrideWith(
+            () => FakeAdminController(),
+          ),
           admin.adminLaunchPincodeConfigProvider.overrideWith(
-            (ref) => Stream.value(const LaunchPincodeConfig(
-              enabledPincodes: ['560001'],
-              disabledPincodes: ['560002'],
-              mode: 'whitelist',
-              configured: true,
-            )),
+            (ref) => Stream.value(
+              const LaunchPincodeConfig(
+                enabledPincodes: ['560001'],
+                disabledPincodes: ['560002'],
+                mode: 'whitelist',
+                configured: true,
+              ),
+            ),
           ),
         ],
       );
@@ -691,8 +692,9 @@ void main() {
         build: (_) => const AdminAnalyticsScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.admin, uid: 'admin-1'),
-          admin.adminStatsProvider
-              .overrideWith((ref) => Stream.value(auditStats())),
+          admin.adminStatsProvider.overrideWith(
+            (ref) => Stream.value(auditStats()),
+          ),
           admin.adminInvoicesProvider.overrideWith(
             (ref, statusFilter) => Stream.value([
               auditInvoice(),
@@ -716,10 +718,10 @@ void main() {
         build: (_) => const OwnerDashboardScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.owner, uid: 'owner-1'),
-          ownerRepositoryProvider
-              .overrideWithValue(FakeOwnerRepository()),
-          owner.myRoomsProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
+          ownerRepositoryProvider.overrideWithValue(FakeOwnerRepository()),
+          owner.myRoomsProvider.overrideWith(
+            (ref) => Stream.value([auditOwnedRoom()]),
+          ),
           owner.myJoinRequestsProvider.overrideWith(
             (ref) => Stream.value([
               auditRequest(),
@@ -729,8 +731,9 @@ void main() {
               ),
             ]),
           ),
-          owner.myInvoicesProvider
-              .overrideWith((ref) => Stream.value([auditInvoice()])),
+          owner.myInvoicesProvider.overrideWith(
+            (ref) => Stream.value([auditInvoice()]),
+          ),
         ],
       );
     });
@@ -744,8 +747,7 @@ void main() {
         tabCount: 2,
         overrides: [
           ...commonOverrides(role: UserRole.owner, uid: 'owner-1'),
-          ownerRepositoryProvider
-              .overrideWithValue(FakeOwnerRepository()),
+          ownerRepositoryProvider.overrideWithValue(FakeOwnerRepository()),
           owner.myJoinRequestsProvider.overrideWith(
             (ref) => Stream.value([
               auditRequest(),
@@ -771,12 +773,11 @@ void main() {
         build: (_) => const MyRoomsScreen(),
         overrides: [
           ...commonOverrides(role: UserRole.owner, uid: 'owner-1'),
-          ownerRepositoryProvider
-              .overrideWithValue(FakeOwnerRepository()),
+          ownerRepositoryProvider.overrideWithValue(FakeOwnerRepository()),
           owner.myRoomsProvider.overrideWith(
             (ref) => Stream.value([
-              auditRoom(),
-              auditRoom(
+              auditOwnedRoom(),
+              auditOwnedRoom(
                 roomId: 'room-2',
                 title: 'Second Room',
                 status: RoomStatus.occupied,
@@ -828,8 +829,9 @@ void main() {
         overrides: [
           ...commonOverrides(role: UserRole.owner, uid: 'owner-1'),
           ownerRepositoryProvider.overrideWithValue(FakeOwnerRepository()),
-          owner.myRoomsProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
+          owner.myRoomsProvider.overrideWith(
+            (ref) => Stream.value([auditOwnedRoom()]),
+          ),
         ],
       );
     });
@@ -843,8 +845,9 @@ void main() {
         overrides: [
           ...commonOverrides(role: UserRole.owner, uid: 'owner-1'),
           ownerRepositoryProvider.overrideWithValue(FakeOwnerRepository()),
-          owner.myRoomsProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
+          owner.myRoomsProvider.overrideWith(
+            (ref) => Stream.value([auditOwnedRoom()]),
+          ),
         ],
       );
     });
@@ -859,12 +862,13 @@ void main() {
         build: (_) => const StudentHomeScreen(),
         overrides: [
           ...commonOverrides(),
-          studentRepositoryProvider
-              .overrideWithValue(FakeStudentRepository()),
-          student.roomsSearchProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
-          student.myJoinRequestsProvider
-              .overrideWith((ref) => Stream.value([auditRequest()])),
+          studentRepositoryProvider.overrideWithValue(FakeStudentRepository()),
+          student.roomsSearchProvider.overrideWith(
+            (ref) => Stream.value([auditRoom()]),
+          ),
+          student.myJoinRequestsProvider.overrideWith(
+            (ref) => Stream.value([auditRequest()]),
+          ),
         ],
       );
     });
@@ -877,10 +881,10 @@ void main() {
         build: (_) => const StudentSearchScreen(),
         overrides: [
           ...commonOverrides(),
-          studentRepositoryProvider
-              .overrideWithValue(FakeStudentRepository()),
-          student.filteredRoomsProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
+          studentRepositoryProvider.overrideWithValue(FakeStudentRepository()),
+          student.filteredRoomsProvider.overrideWith(
+            (ref) => Stream.value([auditRoom()]),
+          ),
         ],
       );
     });
@@ -906,12 +910,13 @@ void main() {
               ),
             ]),
           ),
-          student.roomProvider
-              .overrideWith((ref, roomId) => Stream.value(auditRoom())),
-          studentJoinRequestProvider
-              .overrideWithValue(FakeStudentJoinRequestRepository()),
-          paymentRepositoryProvider
-              .overrideWithValue(FakePaymentRepository()),
+          student.roomProvider.overrideWith(
+            (ref, roomId) => Stream.value(auditRoom()),
+          ),
+          studentJoinRequestProvider.overrideWithValue(
+            FakeStudentJoinRequestRepository(),
+          ),
+          paymentRepositoryProvider.overrideWithValue(FakePaymentRepository()),
           visitRepositoryProvider.overrideWithValue(FakeVisitRepository()),
         ],
       );
@@ -925,10 +930,10 @@ void main() {
         build: (_) => const SavedRoomsScreen(),
         overrides: [
           ...commonOverrides(),
-          studentRepositoryProvider
-              .overrideWithValue(FakeStudentRepository()),
-          student.savedRoomsProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
+          studentRepositoryProvider.overrideWithValue(FakeStudentRepository()),
+          student.savedRoomsProvider.overrideWith(
+            (ref) => Stream.value([auditRoom()]),
+          ),
         ],
       );
     });
@@ -942,14 +947,18 @@ void main() {
         tabCount: 2,
         overrides: [
           ...commonOverrides(),
-          student.myJoinedRoomsProvider
-              .overrideWith((ref) => Stream.value([auditRoom()])),
-          student.myJoinRequestsProvider
-              .overrideWith((ref) => Stream.value([auditRequest()])),
-          student.roomProvider
-              .overrideWith((ref, roomId) => Stream.value(auditRoom())),
-          studentJoinRequestProvider
-              .overrideWithValue(FakeStudentJoinRequestRepository()),
+          student.myJoinedRoomsProvider.overrideWith(
+            (ref) => Stream.value([auditRoom()]),
+          ),
+          student.myJoinRequestsProvider.overrideWith(
+            (ref) => Stream.value([auditRequest()]),
+          ),
+          student.roomProvider.overrideWith(
+            (ref, roomId) => Stream.value(auditRoom()),
+          ),
+          studentJoinRequestProvider.overrideWithValue(
+            FakeStudentJoinRequestRepository(),
+          ),
         ],
       );
     });
@@ -972,24 +981,27 @@ void main() {
         build: (_) => const RoomDetailScreen(roomId: 'room-1'),
         overrides: [
           ...commonOverrides(),
-          student.roomProvider
-              .overrideWith((ref, roomId) => Stream.value(auditRoom())),
-          student.myJoinRequestsProvider
-              .overrideWith((ref) => Stream.value([auditRequest()])),
-          studentRepositoryProvider
-              .overrideWithValue(FakeStudentRepository()),
-          studentJoinRequestProvider
-              .overrideWithValue(FakeStudentJoinRequestRepository()),
-          conversationRepositoryProvider
-              .overrideWithValue(FakeConversationRepository()),
+          student.roomProvider.overrideWith(
+            (ref, roomId) => Stream.value(auditRoom()),
+          ),
+          student.myJoinRequestsProvider.overrideWith(
+            (ref) => Stream.value([auditRequest()]),
+          ),
+          studentRepositoryProvider.overrideWithValue(FakeStudentRepository()),
+          studentJoinRequestProvider.overrideWithValue(
+            FakeStudentJoinRequestRepository(),
+          ),
+          conversationRepositoryProvider.overrideWithValue(
+            FakeConversationRepository(),
+          ),
           visitRepositoryProvider.overrideWithValue(FakeVisitRepository()),
-          reviewRepositoryProvider
-              .overrideWithValue(FakeReviewRepository()),
+          reviewRepositoryProvider.overrideWithValue(FakeReviewRepository()),
           roomReviewsProvider.overrideWith(
             (ref, roomId) => Stream.value([auditReview()]),
           ),
-          myRoomReviewProvider
-              .overrideWith((ref, roomId) => Stream.value(auditReview())),
+          myRoomReviewProvider.overrideWith(
+            (ref, roomId) => Stream.value(auditReview()),
+          ),
           platformSettingsProvider.overrideWith(
             (ref) async => const PlatformSettings(feePercentage: 30),
           ),
@@ -1012,13 +1024,13 @@ void main() {
               auditRequest(status: JoinRequestStatus.ownerConfirmed),
             ]),
           ),
-          reviewRepositoryProvider
-              .overrideWithValue(FakeReviewRepository()),
+          reviewRepositoryProvider.overrideWithValue(FakeReviewRepository()),
           roomReviewsProvider.overrideWith(
             (ref, roomId) => Stream.value([auditReview()]),
           ),
-          myRoomReviewProvider
-              .overrideWith((ref, roomId) => Stream.value(auditReview())),
+          myRoomReviewProvider.overrideWith(
+            (ref, roomId) => Stream.value(auditReview()),
+          ),
         ],
       );
     });
@@ -1031,8 +1043,9 @@ void main() {
         build: (_) => const NotificationsScreen(),
         overrides: [
           ...commonOverrides(),
-          notificationsRepositoryProvider
-              .overrideWithValue(FakeNotificationsRepository()),
+          notificationsRepositoryProvider.overrideWithValue(
+            FakeNotificationsRepository(),
+          ),
           notificationsProvider.overrideWith(
             (ref) => Stream.value([
               NotificationModel(
@@ -1058,10 +1071,12 @@ void main() {
         build: (_) => const ConversationsScreen(),
         overrides: [
           ...commonOverrides(),
-          conversationRepositoryProvider
-              .overrideWithValue(FakeConversationRepository()),
-          conversationsProvider
-              .overrideWith((ref) => Stream.value([auditConversation()])),
+          conversationRepositoryProvider.overrideWithValue(
+            FakeConversationRepository(),
+          ),
+          conversationsProvider.overrideWith(
+            (ref) => Stream.value([auditConversation()]),
+          ),
         ],
       );
     });
@@ -1108,10 +1123,12 @@ void main() {
         ),
         overrides: [
           ...commonOverrides(),
-          conversationRepositoryProvider
-              .overrideWithValue(FakeConversationRepository()),
-          conversationsProvider
-              .overrideWith((ref) => Stream.value([auditConversation()])),
+          conversationRepositoryProvider.overrideWithValue(
+            FakeConversationRepository(),
+          ),
+          conversationsProvider.overrideWith(
+            (ref) => Stream.value([auditConversation()]),
+          ),
           messagesProvider.overrideWith(
             (ref, conversationId) => Stream.value([auditMessage()]),
           ),
@@ -1181,9 +1198,7 @@ void main() {
           channel: OtpChannel.email,
           identifier: 'student@example.test',
         ),
-        overrides: [
-          otpServiceProvider.overrideWithValue(FakeOtpService()),
-        ],
+        overrides: [otpServiceProvider.overrideWithValue(FakeOtpService())],
       );
     });
 
@@ -1210,6 +1225,7 @@ void main() {
           ),
           adminRepositoryProvider.overrideWithValue(FakeAdminRepository()),
           locationServiceProvider.overrideWithValue(FakeLocationService()),
+          authRepositoryProvider.overrideWithValue(FakeAuthRepository()),
           authSessionProvider.overrideWith((ref) => Stream.value(null)),
         ],
       );

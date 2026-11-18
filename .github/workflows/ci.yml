@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            functions/package-lock.json
+
+      - name: Set up Java for the Firebase emulators
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+          cache: true
+
+      - name: Install JavaScript dependencies
+        run: |
+          # The root project is local Firebase CLI tooling only. Its optional
+          # native RE2 chain currently carries high advisories without an
+          # upstream-compatible patch; omitting optional packages keeps that
+          # non-runtime chain out of CI while retaining the JavaScript CLI.
+          npm ci --engine-strict --omit=optional
+          npm ci --prefix functions --engine-strict
+
+      - name: Audit JavaScript dependencies
+        run: |
+          # The root Firebase CLI currently has moderate transitive advisories.
+          # Fail CI for high/critical issues outside its optional native chain;
+          # npm's only suggested fix would be an unsafe firebase-tools downgrade.
+          npm audit --audit-level=high --omit=optional
+          # The deployed Functions runtime must have no known advisories.
+          npm audit --omit=dev --prefix functions
+
+      - name: Install Flutter dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Analyze the Flutter app
+        # Analyze the whole workspace, matching the Dart VS Code extension.
+        # The analyzer options exclude dependency templates, so this catches
+        # editor diagnostics outside lib/ and test/ without reporting the
+        # Firebase CLI's own sample projects.
+        run: flutter analyze
+
+      - name: Run the Flutter tests
+        run: flutter test
+
+      - name: Run the function and security-rules tests
+        run: npm test
+
+      - name: Lint the Android app
+        # Lint only the application module. Flutter plugins are separate
+        # Gradle projects and may carry their own upstream lint findings.
+        run: ./android/gradlew -p android :app:lintDebug
+
+      - name: Build the web release
+        run: flutter build web --release
+
+      - name: Build the Android release
+        run: flutter build apk --release

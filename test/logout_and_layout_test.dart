@@ -20,7 +20,7 @@
 import 'dart:async';
 
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -130,8 +130,7 @@ void main() {
         authControllerProvider.overrideWith(() => controller),
         currentUserProvider.overrideWithValue(user),
         adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
+        unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
       ],
     );
     addTearDown(container.dispose);
@@ -154,87 +153,89 @@ void main() {
     // The error page of the router must not show up — the user has to end
     // up on the login screen.
     expect(find.text('Page Not Found'), findsNothing);
-    expect(
-      router.routerDelegate.currentConfiguration.uri.path,
-      '/login',
-    );
+    expect(router.routerDelegate.currentConfiguration.uri.path, '/login');
     expect(router.routerDelegate.currentConfiguration.matches, isNotEmpty);
   });
 
   testWidgets(
-      'the admin logout lands on the login screen even when the session '
-      'is empty a moment later', (tester) async {
-    await tester.binding.setSurfaceSize(const Size(400, 900));
-    addTearDown(() => tester.binding.setSurfaceSize(null));
+    'the admin logout lands on the login screen even when the session '
+    'is empty a moment later',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(400, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    final user = MockUser(uid: 'admin-1', email: 'admin@example.com');
-    final profile = _profile(user.uid, UserRole.admin);
-    final session = StreamController<AuthSession?>();
-    addTearDown(session.close);
+      final user = MockUser(uid: 'admin-1', email: 'admin@example.com');
+      final profile = _profile(user.uid, UserRole.admin);
+      final session = StreamController<AuthSession?>();
+      addTearDown(session.close);
 
-    // The session of the real app is there while the user works — and it
-    // is empty a few milliseconds **after** the sign-out has finished. The
-    // router must not send the user back to the dashboard in that gap:
-    // that ended on the "Page Not Found" page.
-    final controller = _LateSigningOutController(() => session.add(null));
+      // The session of the real app is there while the user works — and it
+      // is empty a few milliseconds **after** the sign-out has finished. The
+      // router must not send the user back to the dashboard in that gap:
+      // that ended on the "Page Not Found" page.
+      final controller = _LateSigningOutController(() => session.add(null));
 
-    final container = ProviderContainer(
-      overrides: [
-        authSessionProvider.overrideWith((ref) => session.stream),
-        authControllerProvider.overrideWith(() => controller),
-        currentUserProvider.overrideWithValue(user),
-        adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
-      ],
-    );
-    addTearDown(container.dispose);
+      final container = ProviderContainer(
+        overrides: [
+          authSessionProvider.overrideWith((ref) => session.stream),
+          authControllerProvider.overrideWith(() => controller),
+          currentUserProvider.overrideWithValue(user),
+          adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
+          unreadNotificationCountProvider.overrideWith(
+            (ref) => Stream.value(0),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
 
-    final router = container.read(routerProvider);
-    router.go('/admin/dashboard');
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: MaterialApp.router(routerConfig: router),
-      ),
-    );
+      final router = container.read(routerProvider);
+      router.go('/admin/dashboard');
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: MaterialApp.router(routerConfig: router),
+        ),
+      );
 
-    // The session arrives — the user is signed in.
-    session.add(AuthSession(user: user, profile: profile));
-    await _pump(tester);
+      // The session arrives — the user is signed in.
+      session.add(AuthSession(user: user, profile: profile));
+      await _pump(tester);
 
-    expect(router.routerDelegate.currentConfiguration.uri.path,
-        '/admin/dashboard');
-    expect(find.byTooltip('Log out'), findsOneWidget);
+      expect(
+        router.routerDelegate.currentConfiguration.uri.path,
+        '/admin/dashboard',
+      );
+      expect(find.byTooltip('Log out'), findsOneWidget);
 
-    await tester.tap(find.byTooltip('Log out'));
+      await tester.tap(find.byTooltip('Log out'));
 
-    // The login screen has to show up **right away** — the user must not
-    // be sent back to the dashboard of the role while the session is still
-    // being emptied.
-    await tester.pump();
-    await tester.pump();
+      // The login screen has to show up **right away** — the user must not
+      // be sent back to the dashboard of the role while the session is still
+      // being emptied.
+      await tester.pump();
+      await tester.pump();
 
-    expect(
-      router.routerDelegate.currentConfiguration.uri.path,
-      '/login',
-      reason: 'the logout has to lead to the login screen right away',
-    );
-    expect(find.text('Page Not Found'), findsNothing);
+      expect(
+        router.routerDelegate.currentConfiguration.uri.path,
+        '/login',
+        reason: 'the logout has to lead to the login screen right away',
+      );
+      expect(find.text('Page Not Found'), findsNothing);
 
-    // The sign-out and the navigation that follows it.
-    for (var i = 0; i < 12; i++) {
-      await tester.pump(const Duration(milliseconds: 50));
-    }
+      // The sign-out and the navigation that follows it.
+      for (var i = 0; i < 12; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
 
-    expect(find.text('Page Not Found'), findsNothing);
-    expect(
-      router.routerDelegate.currentConfiguration.uri.path,
-      '/login',
-      reason: 'the logout has to end on the login screen',
-    );
-    expect(router.routerDelegate.currentConfiguration.matches, isNotEmpty);
-  });
+      expect(find.text('Page Not Found'), findsNothing);
+      expect(
+        router.routerDelegate.currentConfiguration.uri.path,
+        '/login',
+        reason: 'the logout has to end on the login screen',
+      );
+      expect(router.routerDelegate.currentConfiguration.matches, isNotEmpty);
+    },
+  );
 
   testWidgets('the login screen fits on a narrow phone', (tester) async {
     // The "Don't have an account? / Sign Up" row overflowed by 114 pixels
@@ -249,8 +250,7 @@ void main() {
       overrides: [
         authSessionProvider.overrideWith((ref) => session.stream),
         currentUserProvider.overrideWithValue(null),
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
+        unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
       ],
     );
     addTearDown(container.dispose);
@@ -276,8 +276,7 @@ void main() {
   // differently, so they are covered on their own.
   // -------------------------------------------------------------------------
 
-  testWidgets('the student logout lands on the login screen',
-      (tester) async {
+  testWidgets('the student logout lands on the login screen', (tester) async {
     await tester.binding.setSurfaceSize(const Size(400, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
@@ -295,8 +294,7 @@ void main() {
         currentUserProvider.overrideWithValue(user),
         authStateProvider.overrideWith((ref) => Stream.value(user)),
         userProfileProvider.overrideWith((ref, uid) async => profile),
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
+        unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
       ],
     );
     addTearDown(container.dispose);
@@ -349,8 +347,7 @@ void main() {
         currentUserProvider.overrideWithValue(user),
         authStateProvider.overrideWith((ref) => Stream.value(user)),
         userProfileProvider.overrideWith((ref, uid) async => profile),
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
+        unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
       ],
     );
     addTearDown(container.dispose);
@@ -401,8 +398,7 @@ void main() {
         currentUserProvider.overrideWithValue(user),
         authStateProvider.overrideWith((ref) => Stream.value(user)),
         userProfileProvider.overrideWith((ref, uid) async => profile),
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
+        unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
       ],
     );
     addTearDown(container.dispose);
@@ -410,9 +406,7 @@ void main() {
     await tester.pumpWidget(
       UncontrolledProviderScope(
         container: container,
-        child: const MaterialApp(
-          home: StudentProfileScreen(),
-        ),
+        child: const MaterialApp(home: StudentProfileScreen()),
       ),
     );
     session.add(AuthSession(user: user, profile: profile));
@@ -423,9 +417,7 @@ void main() {
     await tester.pumpWidget(
       UncontrolledProviderScope(
         container: container,
-        child: const MaterialApp(
-          home: OwnerProfileScreen(),
-        ),
+        child: const MaterialApp(home: OwnerProfileScreen()),
       ),
     );
     await _pump(tester);

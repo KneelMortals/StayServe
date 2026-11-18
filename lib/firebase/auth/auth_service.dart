@@ -1,9 +1,27 @@
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../../core/utils/app_logger.dart';
 import '../../models/user_model.dart';
+
+/// Makes sure that Firebase keeps the signed-in user across app restarts.
+///
+/// Native FlutterFire apps persist Auth state on the device by default and
+/// do not expose a persistence switch there. The web implementation does
+/// expose it, so the web build explicitly requests local persistence before
+/// the first frame is rendered.
+///
+/// [isWeb] is injectable for tests; production always uses the current
+/// platform.
+Future<void> configureAuthPersistence(
+  FirebaseAuth auth, {
+  bool isWeb = kIsWeb,
+}) async {
+  if (!isWeb) return;
+  await auth.setPersistence(Persistence.LOCAL);
+}
 
 final firebaseAuthProvider = Provider<FirebaseAuth>(
   (ref) => FirebaseAuth.instance,

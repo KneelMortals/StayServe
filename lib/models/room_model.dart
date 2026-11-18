@@ -1,6 +1,55 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+
 import '../../core/constants/enums.dart';
+import '../../core/constants/room_location_privacy.dart';
 import '../../core/utils/distance.dart';
+
+/// Reads a list of strings without letting one malformed field hide the
+/// whole room from the student.
+List<String> _stringList(dynamic value) {
+  if (value is! List) return const <String>[];
+  final result = <String>[];
+  for (final item in value) {
+    if (item is! String) continue;
+    final trimmed = item.trim();
+    if (trimmed.isEmpty || result.contains(trimmed)) continue;
+    result.add(trimmed);
+  }
+  return result;
+}
+
+/// The location which is safe to publish in a public room document.
+///
+/// The exact street address, pincode and coordinates are deliberately not
+/// part of this type. They live in the separate `RoomPrivateLocation` model
+/// and are released only to the owner or to an accepted student through a
+/// server-checked path.
+class Location {
+  final String city;
+  final String state;
+
+  const Location({required this.city, required this.state});
+
+  factory Location.fromJson(Map<String, dynamic> json) {
+    return Location(
+      city: json['city'] as String? ?? '',
+      state: json['state'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {'city': city, 'state': state};
+  }
+
+  /// The rough area of the room — what everybody may see.
+  String get shortAddress {
+    final parts = [
+      city,
+      state,
+    ].map((part) => part.trim()).where((part) => part.isNotEmpty).join(', ');
+    return parts.isEmpty ? 'Location not published' : parts;
+  }
+}
 
 class RoomModel {
   final String roomId;
@@ -21,6 +70,11 @@ class RoomModel {
   final RoomStatus status;
   final DateTime createdAt;
   final DateTime updatedAt;
+
+  /// The deliberately coarse public coordinate used for distance hints.
+  ///
+  /// It is parsed from `geoCell` whenever that field exists. The exact
+  /// coordinate is not represented by this public model.
   final double? latitude;
   final double? longitude;
 
@@ -60,14 +114,34 @@ class RoomModel {
     this.homeName,
   });
 
-  factory RoomModel.fromJson(Map<String, dynamic> json) {
-    final location = Location.fromJson(
-      (json['location'] as Map<dynamic, dynamic>?)?.cast<String, dynamic>() ??
-          const <String, dynamic>{},
+  factory RoomModel.fromJson(
+    Map<String, dynamic> json, {
+    required String documentId,
+  }) {
+    final canonicalDocumentId = documentId.trim();
+    if (canonicalDocumentId.isEmpty) {
+      throw ArgumentError.value(documentId, 'documentId', 'Must not be empty');
+    }
+    final rawLocation =
+        (json['location'] as Map<dynamic, dynamic>?)?.cast<String, dynamic>() ??
+        const <String, dynamic>{};
+    final location = Location.fromJson(rawLocation);
+    final geoCell = RoomLocationPrivacy.parseGeoCell(
+      json['geoCell'] as String?,
     );
 
+    // Transitional fallback for a listing which has not been migrated yet.
+    // As soon as the server writes `geoCell`, the rounded public coordinate
+    // wins over the legacy exact flat fields.
+    final legacyLatitude =
+        (json['latitude'] as num?)?.toDouble() ??
+        (rawLocation['latitude'] as num?)?.toDouble();
+    final legacyLongitude =
+        (json['longitude'] as num?)?.toDouble() ??
+        (rawLocation['longitude'] as num?)?.toDouble();
+
     return RoomModel(
-      roomId: json['roomId'] as String? ?? '',
+      roomId: canonicalDocumentId,
       ownerId: json['ownerId'] as String? ?? '',
       title: json['title'] as String? ?? '',
       description: json['description'] as String? ?? '',
@@ -83,18 +157,14 @@ class RoomModel {
         orElse: () => FurnishingType.unfurnished,
       ),
       availableFrom: _toDate(json['availableFrom']),
-      amenities:
-          (json['amenities'] as List<dynamic>?)?.whereType<String>().toList() ??
-          const [],
+      amenities: _stringList(json['amenities']),
       occupancy: (json['occupancy'] as num?)?.toInt() ?? 1,
       currentOccupancy: (json['currentOccupancy'] as num?)?.toInt() ?? 0,
       genderPreference: GenderPreference.values.firstWhere(
         (e) => e.name == json['genderPreference'],
         orElse: () => GenderPreference.any,
       ),
-      images:
-          (json['images'] as List<dynamic>?)?.whereType<String>().toList() ??
-          const [],
+      images: _stringList(json['images']),
       // An **unknown** status is not treated as "available" any more — a
       // room whose state the app does not understand must not be offered to
       // students. A *missing* status still falls back to `available`, which
@@ -107,10 +177,16 @@ class RoomModel {
             ),
       createdAt: _toDate(json['createdAt']),
       updatedAt: _toDate(json['updatedAt']),
-      // The coordinates live in the `location` sub-map; the flat fields are
-      // kept for backwards compatibility with the older documents.
-      latitude: (json['latitude'] as num?)?.toDouble() ?? location.latitude,
-      longitude: (json['longitude'] as num?)?.toDouble() ?? location.longitude,
+      latitude:
+          geoCell?.latitude ??
+          RoomLocationPrivacy.coarseCoordinate(legacyLatitude),
+      longitude:
+          geoCell?.longitude ??
+          RoomLocationPrivacy.coarseCoordinate(
+            legacyLongitude,
+            minimum: -180,
+            maximum: 180,
+          ),
       homeId: (json['homeId'] as String?)?.trim().isEmpty ?? true
           ? null
           : (json['homeId'] as String).trim(),
@@ -142,6 +218,10 @@ class RoomModel {
       'updatedAt': Timestamp.fromDate(updatedAt),
       'latitude': latitude,
       'longitude': longitude,
+      'geoCell': RoomLocationPrivacy.geoCell(
+        latitude: latitude,
+        longitude: longitude,
+      ),
       'homeId': homeId,
       'homeName': homeName,
     };
@@ -149,20 +229,23 @@ class RoomModel {
 
   /// The payload used when an owner publishes a **new** listing.
   ///
+  /// The exact location is not part of this payload. The owner repository
+  /// writes it through `setRoomPrivateLocation`, which stores the private
+  /// copy and the public compatibility fields in one server transaction.
+  ///
   /// `status` and `currentOccupancy` are the **initial** values of a fresh
   /// listing — `available` and `0`. Both fields are server-owned from the
   /// moment the listing exists: `setRoomListingAvailability` /
   /// `adminSetRoomListingStatus` change the status and the booking state
   /// machine changes the occupancy counter.
-  ///
-  /// The Firestore rules only accept exactly these two values on the
-  /// create, so a client can neither publish a listing as occupied nor
-  /// pretend that it already has tenants. The fields must not be left out
-  /// either: a Firestore equality query (`status == available`) never
-  /// matches a document that does not have the field, so a listing without
-  /// a status would be invisible in the student search.
   Map<String, dynamic> toCreateJson() {
-    return toJson();
+    final payload = toJson();
+    // The server writes the rounded geocell after the private location has
+    // been accepted. A client must not be able to forge that field.
+    payload.remove('latitude');
+    payload.remove('longitude');
+    payload.remove('geoCell');
+    return payload;
   }
 
   /// The owner-editable fields of an existing listing.
@@ -170,13 +253,15 @@ class RoomModel {
   /// This is used with an update (not a full `set`) so a stale edit can
   /// never overwrite a server-owned value that changed in the meantime —
   /// for example the occupancy counter after a booking was verified.
+  ///
+  /// Location fields are also server-owned: the owner calls
+  /// `setRoomPrivateLocation` before this update is committed.
   Map<String, dynamic> toOwnerUpdateJson() {
     return {
       'title': title,
       'description': description,
       'monthlyRent': monthlyRent,
       'securityDeposit': securityDeposit,
-      'location': location.toJson(),
       'roomType': roomType.name,
       'furnishing': furnishing.name,
       'availableFrom': Timestamp.fromDate(availableFrom),
@@ -185,8 +270,6 @@ class RoomModel {
       'genderPreference': genderPreference.name,
       'images': images,
       'updatedAt': Timestamp.fromDate(updatedAt),
-      'latitude': latitude,
-      'longitude': longitude,
       'homeId': homeId,
       'homeName': homeName,
     };
@@ -215,20 +298,19 @@ class RoomModel {
   /// The display name of the home.
   String get resolvedHomeName {
     if (homeName != null && homeName!.isNotEmpty) return homeName!;
-    if (location.address.isNotEmpty) return location.address;
     if (location.city.isNotEmpty) return location.city;
     return 'Other listings';
   }
 
   /// The distance between this room and the given position, in kilometres.
   ///
-  /// Returns `null` when the room has no coordinates.
+  /// Returns `null` when the room has no public coordinate.
   double? distanceFrom({double? latitude, double? longitude}) {
     return DistanceUtils.haversineKm(
       fromLat: latitude,
       fromLng: longitude,
-      toLat: this.latitude ?? location.latitude,
-      toLng: this.longitude ?? location.longitude,
+      toLat: this.latitude,
+      toLng: this.longitude,
     );
   }
 
@@ -285,66 +367,6 @@ class RoomModel {
   RoomModel copyWithUpdatedAt() => copyWith(updatedAt: DateTime.now());
 }
 
-class Location {
-  final String address;
-  final String city;
-  final String state;
-  final String pincode;
-  final double? latitude;
-  final double? longitude;
-
-  const Location({
-    required this.address,
-    required this.city,
-    required this.state,
-    required this.pincode,
-    this.latitude,
-    this.longitude,
-  });
-
-  factory Location.fromJson(Map<String, dynamic> json) {
-    return Location(
-      address: json['address'] as String? ?? '',
-      city: json['city'] as String? ?? '',
-      state: json['state'] as String? ?? '',
-      pincode: json['pincode'] as String? ?? '',
-      latitude: (json['latitude'] as num?)?.toDouble(),
-      longitude: (json['longitude'] as num?)?.toDouble(),
-    );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'address': address,
-      'city': city,
-      'state': state,
-      'pincode': pincode,
-      'latitude': latitude,
-      'longitude': longitude,
-    };
-  }
-
-  /// The address as one line.
-  ///
-  /// The parts that are empty are left out — otherwise a room without a
-  /// street address would show ", Bengaluru, Karnataka - 560001".
-  String get fullAddress => [
-    address,
-    city,
-    state,
-    pincode,
-  ].map((part) => part.trim()).where((part) => part.isNotEmpty).join(', ');
-
-  /// The rough area of the room — what everybody may see.
-  String get shortAddress {
-    final parts = [
-      city,
-      state,
-    ].map((part) => part.trim()).where((part) => part.isNotEmpty).join(', ');
-    return parts.isEmpty ? address.trim() : parts;
-  }
-}
-
 class TimestampConverter {
   const TimestampConverter();
   DateTime fromJson(Timestamp timestamp) => timestamp.toDate();
@@ -367,5 +389,5 @@ class TimestampConverterNullable {
   const TimestampConverterNullable();
   DateTime? fromJson(Timestamp? timestamp) => timestamp?.toDate();
   Timestamp? toJson(DateTime? date) =>
-      date != null ? Timestamp.fromDate(date) : null;
+      date == null ? null : Timestamp.fromDate(date);
 }

@@ -147,10 +147,9 @@ void main() {
     }
 
     test('the route depends on the role of the user', () {
-      final notification = build(
-        NotificationType.invoicePaid,
-        const {'requestId': 'JRQ-1'},
-      );
+      final notification = build(NotificationType.invoicePaid, const {
+        'requestId': 'JRQ-1',
+      });
 
       expect(notification.routeFor(UserRole.owner), '/owner/invoices');
       expect(notification.routeFor(UserRole.student), '/student/requests');
@@ -168,10 +167,7 @@ void main() {
       });
 
       expect(notification.type, NotificationType.general);
-      expect(
-        notification.routeFor(UserRole.student),
-        '/student/home',
-      );
+      expect(notification.routeFor(UserRole.student), '/student/home');
     });
 
     test('the account notifications are known', () {

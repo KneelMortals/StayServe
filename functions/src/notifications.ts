@@ -1,13 +1,13 @@
-import * as admin from 'firebase-admin';
-import * as functions from 'firebase-functions';
+import * as firestore from 'firebase-admin/firestore';
+import * as messaging from 'firebase-admin/messaging';
+import * as functions from 'firebase-functions/v1';
+import { callableHttps } from './appCheck';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-import { assertActiveAccount } from './accounts';
-
-const db = admin.firestore();
+const db = firestore.getFirestore();
 
 /**
  * Notifications.
@@ -40,10 +40,58 @@ export type NotificationType =
   | 'general';
 
 /**
+ * Whether a profile may still receive a notification.
+ *
+ * The live profile is read in the same transaction as every notification
+ * write. An account-deletion fence therefore conflicts with a delayed
+ * notification: either the notification commits first and is removed by the
+ * cleanup, or the fence commits first and the notification is refused.
+ */
+export function notificationRecipientAllows(
+  snapshot: firestore.DocumentSnapshot,
+  type: NotificationType | string,
+): boolean {
+  if (!snapshot.exists) return false;
+
+  const deletionState = String(snapshot.get('deletionState') || '').trim();
+  if (deletionState === 'deleting' || snapshot.get('deletionFencedAt')) {
+    return false;
+  }
+
+  // Account notices are the one exception: the profile is deliberately
+  // inactive while a deletion is scheduled or being restored. Every other
+  // notification belongs to a live account.
+  if (type === 'account') return true;
+  return snapshot.get('isActive') === true;
+}
+
+/** The server-owned fields of one in-app notification. */
+export function notificationDocumentData(
+  userId: string,
+  title: string,
+  body: string,
+  type: NotificationType | string,
+  data: Record<string, string> = {},
+): Record<string, unknown> {
+  return {
+    userId,
+    title,
+    body,
+    type,
+    data,
+    read: false,
+    createdAt: firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+/**
  * Writes an in-app notification and pushes it to the device.
  *
  * Never throws — a notification that cannot be delivered must never break
- * the action that triggered it (a booking, a payment, …).
+ * the action that triggered it (a booking, a payment, …). The return value
+ * says whether the in-app notification was actually committed, so a caller
+ * never sends a push for a notification which was rejected by the deletion
+ * fence.
  */
 export async function notify(
   userId: string,
@@ -51,22 +99,30 @@ export async function notify(
   body: string,
   type: NotificationType | string,
   data: Record<string, string> = {},
-): Promise<void> {
-  if (!userId) return;
+): Promise<boolean> {
+  if (!userId) return false;
 
+  const notificationRef = db.collection('notifications').doc();
+  let written = false;
   try {
-    await db.collection('notifications').add({
-      userId,
-      title,
-      body,
-      type,
-      data,
-      read: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    written = await db.runTransaction(async (transaction) => {
+      const profileSnapshot = await transaction.get(
+        db.collection('users').doc(userId),
+      );
+      if (!notificationRecipientAllows(profileSnapshot, type)) return false;
+
+      transaction.set(
+        notificationRef,
+        notificationDocumentData(userId, title, body, type, data),
+      );
+      return true;
     });
   } catch (error) {
     console.error('Failed to write notification:', error);
+    return false;
   }
+
+  if (!written) return false;
 
   // The type is part of the payload of the push message.
   //
@@ -75,6 +131,7 @@ export async function notify(
   // `roomId`, …). Every push message therefore said `general`, and the app
   // could not tell which screen the notification belonged to.
   await pushToDevice(userId, title, body, { ...data, type: String(type) });
+  return true;
 }
 
 /**
@@ -92,6 +149,18 @@ export async function pushToDevice(
 ): Promise<void> {
   try {
     const snapshot = await db.collection('users').doc(userId).get();
+    if (!snapshot.exists) return;
+
+    // Do not push a notification which was queued before the recipient's
+    // account was deleted. The in-app write has the same fence, but FCM is a
+    // separate system and needs the same live-profile check here.
+    const deletionState = String(snapshot.get('deletionState') || '').trim();
+    if (deletionState === 'deleting' || snapshot.get('deletionFencedAt')) {
+      return;
+    }
+    const type = String(data['type'] || 'general');
+    if (type !== 'account' && snapshot.get('isActive') !== true) return;
+
     const token = snapshot.get('fcmToken');
     if (typeof token !== 'string' || token.trim().length === 0) {
       // The app has not registered a device yet (or it is an old install).
@@ -99,7 +168,7 @@ export async function pushToDevice(
       return;
     }
 
-    await admin.messaging().send({
+    await messaging.getMessaging().send({
       token: token.trim(),
       notification: { title, body },
       data: {
@@ -153,7 +222,7 @@ export async function notifyAll(
  * server-owned, so the delete goes through this callable instead of a direct
  * client write.
  */
-export const deleteNotification = functions.https.onCall(
+export const deleteNotification = callableHttps.onCall(
   async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError(
@@ -171,22 +240,39 @@ export const deleteNotification = functions.https.onCall(
       );
     }
 
-    await assertActiveAccount(uid);
-
     const notificationRef = db.collection('notifications').doc(notificationId);
-    const snapshot = await notificationRef.get();
-    if (!snapshot.exists) {
-      return { success: true, deleted: false };
-    }
-
-    if (String(snapshot.get('userId') || '') !== uid) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'You can only delete your own notifications',
+    const deleted = await db.runTransaction(async (transaction) => {
+      // The live profile and the notification are read in the same
+      // transaction as the delete. A ban or deletion fence which commits
+      // first therefore rejects the late delete.
+      const profileSnapshot = await transaction.get(
+        db.collection('users').doc(uid),
       );
-    }
+      if (
+        !profileSnapshot.exists ||
+        profileSnapshot.get('registrationCompleted') !== true ||
+        profileSnapshot.get('isActive') !== true
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'This account is not allowed to delete notifications.',
+        );
+      }
 
-    await notificationRef.delete();
-    return { success: true, deleted: true };
+      const snapshot = await transaction.get(notificationRef);
+      if (!snapshot.exists) return false;
+
+      if (String(snapshot.get('userId') || '') !== uid) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'You can only delete your own notifications',
+        );
+      }
+
+      transaction.delete(notificationRef);
+      return true;
+    });
+
+    return { success: true, deleted };
   },
 );

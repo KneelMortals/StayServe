@@ -162,27 +162,21 @@ void main() {
 
     test('explains a missing account', () {
       expect(
-        readableAuthError(
-          FirebaseAuthException(code: 'user-not-found'),
-        ),
+        readableAuthError(FirebaseAuthException(code: 'user-not-found')),
         'No account found with this email.',
       );
     });
 
     test('explains an invalid e-mail address', () {
       expect(
-        readableAuthError(
-          FirebaseAuthException(code: 'invalid-email'),
-        ),
+        readableAuthError(FirebaseAuthException(code: 'invalid-email')),
         'Please enter a valid email address.',
       );
     });
 
     test('explains a disabled account', () {
       expect(
-        readableAuthError(
-          FirebaseAuthException(code: 'user-disabled'),
-        ),
+        readableAuthError(FirebaseAuthException(code: 'user-disabled')),
         'This account has been disabled.',
       );
     });

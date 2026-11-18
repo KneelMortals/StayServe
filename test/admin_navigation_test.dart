@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:go_router/go_router.dart';
@@ -65,8 +65,7 @@ Future<void> _pumpAdmin(
   await tester.pumpWidget(
     ProviderScope(
       overrides: [
-        unreadNotificationCountProvider
-            .overrideWith((ref) => Stream.value(0)),
+        unreadNotificationCountProvider.overrideWith((ref) => Stream.value(0)),
         if (controller != null)
           authControllerProvider.overrideWith(() => controller),
       ],
@@ -119,8 +118,9 @@ void main() {
       expect(adminDestinationIndex('/admin/analytics'), 6);
     });
 
-    testWidgets('every entry of the drawer opens the screen it names',
-        (tester) async {
+    testWidgets('every entry of the drawer opens the screen it names', (
+      tester,
+    ) async {
       final router = _adminRouter();
       addTearDown(router.dispose);
 
@@ -148,8 +148,9 @@ void main() {
       }
     });
 
-    testWidgets('the drawer highlights the screen the admin is on',
-        (tester) async {
+    testWidgets('the drawer highlights the screen the admin is on', (
+      tester,
+    ) async {
       final router = _adminRouter(initialLocation: '/admin/analytics');
       addTearDown(router.dispose);
 
@@ -166,8 +167,9 @@ void main() {
       );
     });
 
-    testWidgets('the quick actions of the dashboard open their screens',
-        (tester) async {
+    testWidgets('the quick actions of the dashboard open their screens', (
+      tester,
+    ) async {
       // A big screen, so that the whole dashboard is visible at once.
       await tester.binding.setSurfaceSize(const Size(900, 2000));
       addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -195,8 +197,9 @@ void main() {
         ProviderScope(
           overrides: [
             adminStatsProvider.overrideWith((ref) => Stream.value(_stats())),
-            unreadNotificationCountProvider
-                .overrideWith((ref) => Stream.value(0)),
+            unreadNotificationCountProvider.overrideWith(
+              (ref) => Stream.value(0),
+            ),
           ],
           child: MaterialApp.router(routerConfig: router),
         ),
@@ -276,14 +279,12 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(controller.signedOut, isTrue);
-      expect(
-        router.routerDelegate.currentConfiguration.uri.path,
-        '/login',
-      );
+      expect(router.routerDelegate.currentConfiguration.uri.path, '/login');
     });
 
-    testWidgets('the drawer does not pop the page off the stack',
-        (tester) async {
+    testWidgets('the drawer does not pop the page off the stack', (
+      tester,
+    ) async {
       // The drawer of a `Scaffold` is **not a route**. The old code closed
       // it with `Navigator.of(context).pop()`, which popped the *page* the
       // drawer belongs to. On the last page of the stack that leaves the

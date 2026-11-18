@@ -1,13 +1,14 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../../../core/index.dart';
 import '../../../../../firebase/owner/owner_repository.dart';
 import '../../../../../models/room_model.dart';
+import '../../../../../models/room_private_location.dart';
 import '../../../../../services/location_service.dart';
 
 /// Reusable form used to create and edit a room listing.
@@ -15,6 +16,11 @@ import '../../../../../services/location_service.dart';
 /// When [initialRoom] is supplied the form is pre-filled with that listing.
 class RoomForm extends ConsumerStatefulWidget {
   final RoomModel? initialRoom;
+
+  /// The exact owner-only location joined to [initialRoom].
+  ///
+  /// It is `null` only while a legacy listing has not been migrated yet.
+  final RoomPrivateLocation? initialPrivateLocation;
 
   /// The homes the owner already publishes rooms in.
   ///
@@ -31,6 +37,7 @@ class RoomForm extends ConsumerStatefulWidget {
   const RoomForm({
     required this.onSubmit,
     this.initialRoom,
+    this.initialPrivateLocation,
     this.homes = const [],
     this.initialHomeId,
     this.submitLabel = 'Save Listing',
@@ -84,6 +91,7 @@ class _RoomFormState extends ConsumerState<RoomForm> {
   void initState() {
     super.initState();
     final room = widget.initialRoom;
+    final privateLocation = widget.initialPrivateLocation;
 
     _titleController = TextEditingController(text: room?.title ?? '');
     _descriptionController = TextEditingController(
@@ -96,12 +104,16 @@ class _RoomFormState extends ConsumerState<RoomForm> {
       text: room == null ? '' : room.securityDeposit.toStringAsFixed(0),
     );
     _addressController = TextEditingController(
-      text: room?.location.address ?? '',
+      text: privateLocation?.address ?? '',
     );
-    _cityController = TextEditingController(text: room?.location.city ?? '');
-    _stateController = TextEditingController(text: room?.location.state ?? '');
+    _cityController = TextEditingController(
+      text: privateLocation?.city ?? room?.location.city ?? '',
+    );
+    _stateController = TextEditingController(
+      text: privateLocation?.state ?? room?.location.state ?? '',
+    );
     _pincodeController = TextEditingController(
-      text: room?.location.pincode ?? '',
+      text: privateLocation?.pincode ?? '',
     );
     _occupancyController = TextEditingController(
       text: '${room?.occupancy ?? 1}',
@@ -123,8 +135,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
               : ''),
     );
 
-    _latitude = room?.latitude ?? room?.location.latitude;
-    _longitude = room?.longitude ?? room?.location.longitude;
+    _latitude = privateLocation?.latitude;
+    _longitude = privateLocation?.longitude;
   }
 
   @override
@@ -165,12 +177,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
       monthlyRent: double.parse(_rentController.text.trim()),
       securityDeposit: double.parse(_depositController.text.trim()),
       location: Location(
-        address: _addressController.text.trim(),
         city: _cityController.text.trim(),
         state: _stateController.text.trim(),
-        pincode: _pincodeController.text.trim(),
-        latitude: _latitude,
-        longitude: _longitude,
       ),
       roomType: _roomType,
       furnishing: _furnishing,
@@ -186,8 +194,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
       status: existing?.status ?? RoomStatus.available,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
-      latitude: _latitude,
-      longitude: _longitude,
+      latitude: existing?.latitude,
+      longitude: existing?.longitude,
       homeId: homeId,
       homeName: homeName.isEmpty && homeId != null
           ? _homeNameFor(homeId)
@@ -199,6 +207,17 @@ class _RoomFormState extends ConsumerState<RoomForm> {
         RoomDraft(
           room: room,
           newImages: _newImages.map((p) => p.file).toList(),
+          originalImageUrls: existing?.images ?? const <String>[],
+          privateLocation: RoomPrivateLocation(
+            roomId: existing?.roomId ?? '',
+            ownerId: existing?.ownerId ?? '',
+            address: _addressController.text.trim(),
+            city: _cityController.text.trim(),
+            state: _stateController.text.trim(),
+            pincode: _pincodeController.text.trim(),
+            latitude: _latitude,
+            longitude: _longitude,
+          ),
         ),
       );
       if (!mounted) return;
@@ -277,8 +296,15 @@ class _RoomFormState extends ConsumerState<RoomForm> {
                   label: 'Rent (₹)',
                   hint: 'per month',
                   keyboardType: TextInputType.number,
-                  validator: (v) =>
-                      AppValidators.validateMinValue(v, 1000, 'Rent'),
+                  validator: (v) {
+                    final minimum = AppValidators.validateMinValue(
+                      v,
+                      1000,
+                      'Rent',
+                    );
+                    if (minimum != null) return minimum;
+                    return AppValidators.validateMaxValue(v, 1000000, 'Rent');
+                  },
                 ),
               ),
               const SizedBox(width: AppSpacing.md),
@@ -334,8 +360,8 @@ class _RoomFormState extends ConsumerState<RoomForm> {
             keyboardType: TextInputType.number,
             validator: (v) {
               final value = int.tryParse(v?.trim() ?? '');
-              if (value == null || value < 1) {
-                return 'Enter a valid occupancy';
+              if (value == null || value < 1 || value > 20) {
+                return 'Enter an occupancy between 1 and 20';
               }
               return null;
             },
