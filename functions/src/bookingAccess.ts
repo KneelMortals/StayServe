@@ -8,6 +8,19 @@ import './firebase';
 const db = firestore.getFirestore();
 
 /**
+ * The request statuses which represent an active, joined booking.
+ *
+ * These are the only requests which contribute to a room's occupancy and
+ * the only requests which make a room appear in a student's joined rooms.
+ */
+export const ACTIVE_BOOKING_STATUSES = [
+  'adminReviewed',
+  // Legacy spelling of `adminReviewed`; old joined rooms must keep their
+  // visit details and review access.
+  'admin_reviewed',
+];
+
+/**
  * The states of a join request in which the **owner has accepted** it.
  *
  * The owner accepts a request by moving it to `ownerConfirmed`. The student
@@ -24,10 +37,7 @@ const db = firestore.getFirestore();
 export const OWNER_ACCEPTED_STATUSES = [
   'ownerConfirmed',
   'studentConfirmed',
-  'adminReviewed',
-  // Legacy spelling of `adminReviewed`; old joined rooms must keep their
-  // visit details and review access.
-  'admin_reviewed',
+  ...ACTIVE_BOOKING_STATUSES,
 ];
 
 /**
@@ -145,6 +155,43 @@ export function paymentAlreadyMade(request: Record<string, any>): boolean {
 
   const status = String(request.advancePaymentStatus || '');
   return status === 'submitted' || status === 'verified';
+}
+
+/**
+ * The request states in which a student may still withdraw their request.
+ *
+ * The snake-case spellings are legacy documents which the Flutter model
+ * already normalizes to their canonical enum values. Accepting them here
+ * keeps the server in step with the action shown by the app.
+ */
+const STUDENT_CANCELLABLE_STATUSES = [
+  'pending',
+  'ownerConfirmed',
+  'owner_confirmed',
+  'studentConfirmed',
+  'student_confirmed',
+];
+
+/**
+ * Whether a student may withdraw their own request before joining a room.
+ *
+ * A student may cancel a request which is still pending, or one which has
+ * been confirmed by both sides but has not become an active booking yet.
+ * Once the booking is active (`adminReviewed`) the student has joined the
+ * room: only the room owner or an administrator may end it, and doing so must
+ * go through the room-status release path.
+ *
+ * A payment attempt always blocks a direct cancellation, even in one of the
+ * pre-join states above.
+ */
+export function canStudentCancelBooking(
+  status: string,
+  request: Record<string, any>,
+): boolean {
+  if (!STUDENT_CANCELLABLE_STATUSES.includes(status)) {
+    return false;
+  }
+  return !paymentAlreadyMade(request);
 }
 
 /**

@@ -14,7 +14,10 @@ import {
   assertLiveOwnerOrAdmin,
   canActAsAdmin,
 } from './accounts';
-import { canActAsRoomOwner } from './bookingAccess';
+import {
+  ACTIVE_BOOKING_STATUSES,
+  canActAsRoomOwner,
+} from './bookingAccess';
 import { isActiveBookingStatus } from './bookings';
 import {
   isValidCurrentOccupancy,
@@ -647,9 +650,10 @@ export const processRoomPhotoCleanupJobs = functions.pubsub
  *
  * The occupancy counter is deliberately a different concern:
  * `rooms.currentOccupancy` is server-owned and is changed only by booking
- * activation / rollback. Introducing a second listing-status field without
- * migrating the model, the queries and the admin path at the same time would
- * make the owner action invisible to part of the app.
+ * activation, rollback or an explicit owner/admin availability release.
+ * Introducing a second listing-status field without migrating the model, the
+ * queries and the admin path at the same time would make the owner action
+ * invisible to part of the app.
  */
 export type RoomListingStatus = 'available' | 'occupied';
 
@@ -657,8 +661,7 @@ export type RoomListingStatus = 'available' | 'occupied';
 export type RoomListingAvailabilityRejection =
   | 'invalid-capacity'
   | 'invalid-occupancy'
-  | 'already-full'
-  | 'has-occupants';
+  | 'already-full';
 
 /** The result of the pure availability decision. */
 export type RoomListingAvailabilityDecision =
@@ -672,8 +675,10 @@ export type RoomListingAvailabilityDecision =
  *
  *  - a full room is already occupied by the server and may not be marked
  *    occupied again by the owner;
- *  - a room with an active occupant may not be marked available again — the
- *    server releases that occupant when the booking itself is rolled back.
+ *  - a room with active occupants may be marked available. That is an explicit
+ *    release operation: the server ends the active bookings, clears the
+ *    occupancy and removes those students from their joined rooms in the same
+ *    transaction.
  *
  * Keeping those rules in a pure helper makes the important transition logic
  * testable without a Firestore emulator.
@@ -696,13 +701,140 @@ export function decideRoomListingAvailability(
   if (isOccupied && currentOccupancy >= occupancy) {
     return { allowed: false, reason: 'already-full' };
   }
-  if (!isOccupied && currentOccupancy > 0) {
-    return { allowed: false, reason: 'has-occupants' };
-  }
 
   return {
     allowed: true,
     status: isOccupied ? 'occupied' : 'available',
+  };
+}
+
+/** One active booking which was ended by an availability release. */
+interface ReleasedRoomBooking {
+  requestId: string;
+  studentId: string;
+}
+
+/** The result of releasing the active bookings of one room. */
+interface RoomBookingReleaseResult {
+  bookings: ReleasedRoomBooking[];
+  releasedRequests: number;
+  releasedStudents: number;
+}
+
+/** Who ended the bookings of a room. */
+interface RoomReleaseActor {
+  uid: string;
+  role: 'owner' | 'admin';
+}
+
+/**
+ * Makes a room available and ends every booking which has already been
+ * accepted for it.
+ *
+ * A joined room is represented by an `adminReviewed` request. Only those
+ * active bookings are cancelled here so that:
+ *
+ *  - the student's joined-room stream removes this room immediately;
+ *  - the room's occupancy returns to zero;
+ *  - requests which have not become active yet keep their own workflow;
+ *  - the student may keep every other room they joined.
+ *
+ * The request query and both document reads happen inside the caller's
+ * transaction. A booking activation writes the same room document, so the
+ * two operations are serialized: whichever one commits first, the other
+ * retries against the new state.
+ *
+ * Payment and invoice records are deliberately left untouched. Ending a
+ * booking does not claim that a refund happened; that remains a separate
+ * financial decision.
+ */
+async function releaseActiveBookingsForAvailableRoom(
+  transaction: firestore.Transaction,
+  roomRef: firestore.DocumentReference,
+  roomSnapshot: firestore.DocumentSnapshot,
+  actor: RoomReleaseActor,
+): Promise<RoomBookingReleaseResult> {
+  const room = roomSnapshot.data() as Record<string, any>;
+  const roomId = roomSnapshot.id;
+  const currentOccupancy = room.currentOccupancy;
+
+  if (!isValidCurrentOccupancy(currentOccupancy)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This room has an invalid occupancy',
+    );
+  }
+
+  // Read every active request of this room before the first write. The
+  // transaction query is re-run when a concurrent activation causes a retry.
+  const requestSnapshot = await transaction.get(
+    db
+      .collection('joinRequests')
+      .where('roomId', '==', roomId)
+      .where('status', 'in', ACTIVE_BOOKING_STATUSES),
+  );
+
+  const bookings: ReleasedRoomBooking[] = [];
+  const studentIds = new Set<string>();
+
+  for (const requestDocument of requestSnapshot.docs) {
+    const request = requestDocument.data() as Record<string, any>;
+    const studentId = String(request.studentId || '').trim();
+    const requestOwnerId = String(request.ownerId || '').trim();
+    const roomOwnerId = String(room.ownerId || '').trim();
+
+    if (!studentId || !requestOwnerId || requestOwnerId !== roomOwnerId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'One of this room\'s bookings has invalid ownership data and must be repaired first',
+      );
+    }
+
+    bookings.push({
+      requestId: requestDocument.id,
+      studentId,
+    });
+    studentIds.add(studentId);
+  }
+
+  if (bookings.length !== currentOccupancy) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This room\'s occupancy does not match its active bookings and must be repaired first',
+    );
+  }
+
+  const endedAt = firestore.FieldValue.serverTimestamp();
+  const reason =
+    actor.role === 'owner'
+      ? 'The room owner marked the listing available.'
+      : 'An administrator marked the listing available.';
+
+  for (const booking of bookings) {
+    transaction.update(db.collection('joinRequests').doc(booking.requestId), {
+      status: 'cancelled',
+      cancelledAt: endedAt,
+      cancelledBy: actor.uid,
+      cancelledByRole: actor.role,
+      cancellationReason: reason,
+      bookingEndedAt: endedAt,
+      bookingEndedBy: actor.uid,
+      bookingEndedByRole: actor.role,
+      bookingEndReason: reason,
+      updatedAt: endedAt,
+    });
+  }
+
+  transaction.update(roomRef, {
+    status: 'available',
+    currentOccupancy: 0,
+    updatedAt: endedAt,
+  });
+
+  return {
+    bookings,
+    releasedRequests: bookings.length,
+    releasedStudents: studentIds.size,
   };
 }
 
@@ -713,8 +845,9 @@ export function decideRoomListingAvailability(
  * a Firestore transaction, so the ownership check and the write are based on
  * the same document version.
  *
- * This function never writes `currentOccupancy`. Booking activation and its
- * rollback are the only paths that own that counter.
+ * Marking the listing available is an explicit release operation: active
+ * bookings are ended and `currentOccupancy` is cleared in the same
+ * transaction. Marking it occupied changes only the listing-status field.
  */
 export const setRoomListingAvailability = callableHttps.onCall(
   async (data, context) => {
@@ -748,7 +881,7 @@ export const setRoomListingAvailability = callableHttps.onCall(
 
     const roomRef = db.collection('rooms').doc(roomId);
 
-    const status = await db.runTransaction(async (transaction) => {
+    const outcome = await db.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(roomRef);
       if (!snapshot.exists) {
         throw new functions.https.HttpsError(
@@ -818,25 +951,49 @@ export const setRoomListingAvailability = callableHttps.onCall(
               'failed-precondition',
               'This room is already full; occupancy is managed by booking activation',
             );
-          case 'has-occupants':
-            throw new functions.https.HttpsError(
-              'failed-precondition',
-              'This room still has occupants; occupancy is managed by booking activation',
-            );
         }
       }
 
-      // Only the legacy listing-status field is changed. In particular,
-      // `currentOccupancy` is absent from this update on purpose.
+      if (decision.status === 'available') {
+        const release = await releaseActiveBookingsForAvailableRoom(
+          transaction,
+          roomRef,
+          snapshot,
+          { uid, role: 'owner' },
+        );
+        return { status: decision.status, release };
+      }
+
       transaction.update(roomRef, {
         status: decision.status,
         updatedAt: firestore.FieldValue.serverTimestamp(),
       });
 
-      return decision.status;
+      return { status: decision.status, release: null };
     });
 
-    return { success: true, status };
+    if (outcome.release) {
+      await Promise.all(
+        outcome.release.bookings.map((booking) =>
+          notify(
+            booking.studentId,
+            'Room booking ended',
+            'The room owner marked this listing available. You have been ' +
+              'removed from the room immediately. Payment and invoice history ' +
+              'is kept unchanged.',
+            'joinRequest',
+            { requestId: booking.requestId, roomId },
+          ),
+        ),
+      );
+    }
+
+    return {
+      success: true,
+      status: outcome.status,
+      releasedRequests: outcome.release?.releasedRequests || 0,
+      releasedStudents: outcome.release?.releasedStudents || 0,
+    };
   },
 );
 
@@ -1617,8 +1774,8 @@ export const deleteRoomListing = callableHttps.onCall(
  *
  * `status` and `currentOccupancy` are server-owned fields: from the moment
  * the listing exists they may only be changed by `setRoomListingAvailability`
- * / `adminSetRoomListingStatus` (the status) and by the booking state machine
- * (the counter).
+ * / `adminSetRoomListingStatus` (including an explicit availability release)
+ * and by the booking state machine.
  *
  * The trigger exists because the student search compares the listing status
  * with an **equality** (`status == available`). A Firestore equality query
@@ -1767,9 +1924,9 @@ export const onRoomUpdated = functions.firestore
 /**
  * Changes the listing status of any room as a live administrator.
  *
- * The occupancy counter is deliberately not touched. The status is a
- * listing/legacy compatibility field; actual tenants are represented by
- * `currentOccupancy`, which only the booking state machine may change.
+ * Marking a room available is an explicit release operation: active
+ * bookings are ended and `currentOccupancy` is cleared in the same
+ * transaction. The other status values change only the listing-status field.
  */
 export const adminSetRoomListingStatus = callableHttps.onCall(
   async (data, context) => {
@@ -1799,7 +1956,7 @@ export const adminSetRoomListingStatus = callableHttps.onCall(
     await assertLiveAdmin(context.auth.uid);
 
     const roomRef = db.collection('rooms').doc(roomId);
-    await db.runTransaction(async (transaction) => {
+    const outcome = await db.runTransaction(async (transaction) => {
       const snapshot = await transaction.get(roomRef);
       if (!snapshot.exists) {
         throw new functions.https.HttpsError(
@@ -1843,21 +2000,44 @@ export const adminSetRoomListingStatus = callableHttps.onCall(
         );
       }
 
-      // A room with tenants cannot be published as available. The server
-      // keeps the status consistent with the occupancy counter.
-      if (status === 'available' && currentOccupancy > 0) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'This room still has occupants and cannot be marked available',
+      if (status === 'available') {
+        const release = await releaseActiveBookingsForAvailableRoom(
+          transaction,
+          roomRef,
+          snapshot,
+          { uid: adminUid, role: 'admin' },
         );
+        return { release };
       }
 
       transaction.update(roomRef, {
         status,
         updatedAt: firestore.FieldValue.serverTimestamp(),
       });
+      return { release: null };
     });
 
-    return { success: true, status };
+    if (outcome.release) {
+      await Promise.all(
+        outcome.release.bookings.map((booking) =>
+          notify(
+            booking.studentId,
+            'Room booking ended',
+            'An administrator marked this listing available. You have been ' +
+              'removed from the room immediately. Payment and invoice history ' +
+              'is kept unchanged.',
+            'joinRequest',
+            { requestId: booking.requestId, roomId },
+          ),
+        ),
+      );
+    }
+
+    return {
+      success: true,
+      status,
+      releasedRequests: outcome.release?.releasedRequests || 0,
+      releasedStudents: outcome.release?.releasedStudents || 0,
+    };
   },
 );

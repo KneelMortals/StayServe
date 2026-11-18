@@ -526,9 +526,9 @@ class OwnerRepository {
   /// Marks a room's listing as occupied (or available again).
   ///
   /// The server verifies that the signed-in user is a live owner of this
-  /// listing and updates only the listing status. The occupancy counter is
-  /// server-owned: it is maintained by booking activation and is never
-  /// changed by this action.
+  /// listing. Making an occupied room available is an explicit release
+  /// operation: the server ends its active bookings, clears the occupancy
+  /// and removes those students from the room immediately.
   Future<void> setRoomOccupied(String roomId, {required bool occupied}) async {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');

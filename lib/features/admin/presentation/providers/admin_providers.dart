@@ -224,6 +224,8 @@ class AdminController extends AsyncNotifier<void> {
     );
     if (error == null) {
       ref.invalidate(adminRoomsProvider);
+      ref.invalidate(adminJoinRequestsProvider);
+      ref.invalidate(adminStatsProvider);
     }
     return error;
   }

@@ -65,6 +65,8 @@ const {
 const {
   deleteRoomListing,
   processRoomPhotoCleanupJobs,
+  setRoomListingAvailability,
+  adminSetRoomListingStatus,
 } = require(path.join(ROOT, 'lib', 'rooms.js'));
 const { registerUserRole } = require(path.join(ROOT, 'lib', 'otp.js'));
 const {
@@ -5928,6 +5930,393 @@ async function testListingDeletionPagesRequestsAndKeepsTheirIds() {
   );
 }
 
+async function testStudentCancellationStopsAfterJoining() {
+  section('a student cannot cancel after joining a room');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-1', 'owner-1');
+  await seedRequest('JRQ-NOT-JOINED', {
+    status: 'ownerConfirmed',
+  });
+  await seedRequest('JRQ-CONFIRMED-NOT-JOINED', {
+    status: 'studentConfirmed',
+  });
+  await seedRequest('JRQ-LEGACY-CONFIRMED-NOT-JOINED', {
+    status: 'owner_confirmed',
+  });
+
+  const pendingCancellation = await invoke(
+    cancelJoinRequest,
+    { requestId: 'JRQ-NOT-JOINED' },
+    'student-1',
+  );
+  check(
+    'a student may still cancel before the owner accepts the booking',
+    pendingCancellation.status,
+    'cancelled',
+  );
+
+  const confirmedCancellation = await invoke(
+    cancelJoinRequest,
+    { requestId: 'JRQ-CONFIRMED-NOT-JOINED' },
+    'student-1',
+  );
+  check(
+    'a student may still cancel a confirmed but inactive booking',
+    confirmedCancellation.status,
+    'cancelled',
+  );
+
+  const legacyConfirmedCancellation = await invoke(
+    cancelJoinRequest,
+    { requestId: 'JRQ-LEGACY-CONFIRMED-NOT-JOINED' },
+    'student-1',
+  );
+  check(
+    'a student may still cancel a legacy confirmed but inactive booking',
+    legacyConfirmedCancellation.status,
+    'cancelled',
+  );
+
+  await seedRequest('JRQ-JOINED', {
+    status: 'adminReviewed',
+  });
+  await expectDenied(
+    'a student cannot cancel after joining the room',
+    () =>
+      invoke(
+        cancelJoinRequest,
+        { requestId: 'JRQ-JOINED' },
+        'student-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the joined request was not cancelled by the student',
+    (await db.collection('joinRequests').doc('JRQ-JOINED').get()).get('status'),
+    'adminReviewed',
+  );
+}
+
+async function testStudentCanRequestDifferentRooms() {
+  section('one student may request more than one different room');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('owner-2', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-FIRST', 'owner-1');
+  await seedRoom('RM-SECOND', 'owner-2');
+
+  const first = await invoke(
+    createJoinRequest,
+    { roomId: 'RM-FIRST' },
+    'student-1',
+  );
+  const second = await invoke(
+    createJoinRequest,
+    { roomId: 'RM-SECOND' },
+    'student-1',
+  );
+
+  check('the first room request was created', first.success, true);
+  check('the second room request was created', second.success, true);
+  check('the two room requests have different ids', first.requestId !== second.requestId, true);
+
+  const requests = await db
+    .collection('joinRequests')
+    .where('studentId', '==', 'student-1')
+    .get();
+  check('the student has one request for each room', requests.size, 2);
+  check(
+    'the first room request was kept',
+    requests.docs.some((doc) => doc.get('roomId') === 'RM-FIRST'),
+    true,
+  );
+  check(
+    'the second room request was kept',
+    requests.docs.some((doc) => doc.get('roomId') === 'RM-SECOND'),
+    true,
+  );
+
+  await expectDenied(
+    'the student cannot create a second request for the same room',
+    () =>
+      invoke(
+        createJoinRequest,
+        { roomId: 'RM-FIRST' },
+        'student-1',
+      ),
+    'already-exists',
+  );
+  check(
+    'the duplicate request was not created',
+    (
+      await db
+        .collection('joinRequests')
+        .where('studentId', '==', 'student-1')
+        .get()
+    ).size,
+    2,
+  );
+}
+
+async function testOwnerAvailabilityReleaseEndsOnlyThisRoomsBookings() {
+  section('an owner can make an occupied room available and release its students');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedUser('student-2', 'student');
+  await seedUser('student-3', 'student');
+  await seedRoom('RM-RELEASE', 'owner-1', {
+    occupancy: 2,
+    currentOccupancy: 2,
+    status: 'occupied',
+  });
+  await seedRoom('RM-OTHER', 'owner-1', {
+    occupancy: 1,
+    currentOccupancy: 1,
+    status: 'occupied',
+  });
+
+  await seedRequest('JRQ-RELEASE-ACTIVE', {
+    roomId: 'RM-RELEASE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'adminReviewed',
+    advancePaid: true,
+    advancePaymentStatus: 'verified',
+    invoiceId: 'INV-JRQ-RELEASE-ACTIVE',
+  });
+  await seedRequest('JRQ-RELEASE-SECOND-ACTIVE', {
+    roomId: 'RM-RELEASE',
+    studentId: 'student-2',
+    ownerId: 'owner-1',
+    status: 'adminReviewed',
+    advancePaid: true,
+    advancePaymentStatus: 'verified',
+  });
+  await seedRequest('JRQ-RELEASE-NOT-JOINED', {
+    roomId: 'RM-RELEASE',
+    studentId: 'student-3',
+    ownerId: 'owner-1',
+    status: 'studentConfirmed',
+  });
+  await seedRequest('JRQ-OTHER-ROOM', {
+    roomId: 'RM-OTHER',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'adminReviewed',
+    advancePaid: true,
+    advancePaymentStatus: 'verified',
+  });
+
+  await db.collection('payments').doc('PAY-RELEASE').set({
+    requestId: 'JRQ-RELEASE-ACTIVE',
+    roomId: 'RM-RELEASE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'verified',
+  });
+  await db.collection('commissionInvoices').doc('INV-JRQ-RELEASE-ACTIVE').set({
+    invoiceId: 'INV-JRQ-RELEASE-ACTIVE',
+    joinRequestId: 'JRQ-RELEASE-ACTIVE',
+    roomId: 'RM-RELEASE',
+    tenantId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'pending',
+  });
+
+  const result = await invoke(
+    setRoomListingAvailability,
+    { roomId: 'RM-RELEASE', isOccupied: false },
+    'owner-1',
+  );
+  check('the owner availability release succeeded', result.success, true);
+  check('the released listing is available', result.status, 'available');
+  check('the owner released two active requests', result.releasedRequests, 2);
+  check('the owner released two students', result.releasedStudents, 2);
+
+  const releasedRoom = await db.collection('rooms').doc('RM-RELEASE').get();
+  const releasedRequest = await db
+    .collection('joinRequests')
+    .doc('JRQ-RELEASE-ACTIVE')
+    .get();
+  check('the released room has no occupants', releasedRoom.get('currentOccupancy'), 0);
+  check('the released room is available', releasedRoom.get('status'), 'available');
+  check(
+    'the active request in the released room was cancelled',
+    releasedRequest.get('status'),
+    'cancelled',
+  );
+  check(
+    'the released request keeps its verified payment status',
+    releasedRequest.get('advancePaymentStatus'),
+    'verified',
+  );
+  check(
+    'the released request keeps its paid marker',
+    releasedRequest.get('advancePaid'),
+    true,
+  );
+  check(
+    'the released request keeps its invoice reference',
+    releasedRequest.get('invoiceId'),
+    'INV-JRQ-RELEASE-ACTIVE',
+  );
+  check(
+    'the second active request in the released room was cancelled',
+    (await db.collection('joinRequests').doc('JRQ-RELEASE-SECOND-ACTIVE').get()).get('status'),
+    'cancelled',
+  );
+  check(
+    'the request which has not joined yet keeps its state',
+    (await db.collection('joinRequests').doc('JRQ-RELEASE-NOT-JOINED').get()).get('status'),
+    'studentConfirmed',
+  );
+  check(
+    'the student joined to another room keeps that subscription',
+    (await db.collection('joinRequests').doc('JRQ-OTHER-ROOM').get()).get('status'),
+    'adminReviewed',
+  );
+  const otherRoom = await db.collection('rooms').doc('RM-OTHER').get();
+  check('the other room keeps its occupant', otherRoom.get('currentOccupancy'), 1);
+  check('the other room keeps its status', otherRoom.get('status'), 'occupied');
+  check(
+    'the verified payment history was not rewritten',
+    (await db.collection('payments').doc('PAY-RELEASE').get()).get('status'),
+    'verified',
+  );
+  check(
+    'the invoice history was not rewritten',
+    (await db.collection('commissionInvoices').doc('INV-JRQ-RELEASE-ACTIVE').get()).get('status'),
+    'pending',
+  );
+  check(
+    'the release records the owner as the actor',
+    (await db.collection('joinRequests').doc('JRQ-RELEASE-ACTIVE').get()).get('cancelledByRole'),
+    'owner',
+  );
+
+  const releaseNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', 'student-1')
+    .get();
+  check(
+    'the released student was notified',
+    releaseNotifications.docs.some(
+      (doc) => doc.get('title') === 'Room booking ended',
+    ),
+    true,
+  );
+  check(
+    'the release notification keeps the payment history unchanged',
+    releaseNotifications.docs.some(
+      (doc) =>
+        String(doc.get('body') || '').includes(
+          'Payment and invoice history is kept unchanged',
+        ),
+    ),
+    true,
+  );
+}
+
+async function testAvailabilityReleaseRejectsUnauthorizedCallers() {
+  section('availability release rejects unauthorized callers');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('owner-1', 'owner');
+  await seedUser('owner-2', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-OWNER-1', 'owner-1');
+  await seedRoom('RM-OWNER-2', 'owner-2');
+
+  await expectDenied(
+    'an owner cannot release another owner listing',
+    () =>
+      invoke(
+        setRoomListingAvailability,
+        { roomId: 'RM-OWNER-2', isOccupied: false },
+        'owner-1',
+      ),
+  );
+  check(
+    'the other owner listing was not changed',
+    (await db.collection('rooms').doc('RM-OWNER-2').get()).get('status'),
+    'available',
+  );
+
+  await expectDenied(
+    'a student cannot release a room through the owner callable',
+    () =>
+      invoke(
+        setRoomListingAvailability,
+        { roomId: 'RM-OWNER-1', isOccupied: false },
+        'student-1',
+      ),
+  );
+  await expectDenied(
+    'a student cannot release a room through the admin callable',
+    () =>
+      invoke(
+        adminSetRoomListingStatus,
+        { roomId: 'RM-OWNER-1', status: 'available' },
+        'student-1',
+      ),
+  );
+  check(
+    'the unauthorized calls did not change the owner listing',
+    (await db.collection('rooms').doc('RM-OWNER-1').get()).get('status'),
+    'available',
+  );
+}
+
+async function testAdminAvailabilityReleaseEndsBookings() {
+  section('an admin can make an occupied room available and release its students');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-ADMIN-RELEASE', 'owner-1', {
+    occupancy: 1,
+    currentOccupancy: 1,
+    status: 'occupied',
+  });
+  await seedRequest('JRQ-ADMIN-RELEASE', {
+    roomId: 'RM-ADMIN-RELEASE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'adminReviewed',
+  });
+
+  const result = await invoke(
+    adminSetRoomListingStatus,
+    { roomId: 'RM-ADMIN-RELEASE', status: 'available' },
+    'admin-1',
+  );
+  check('the admin availability release succeeded', result.success, true);
+  check('the admin released one request', result.releasedRequests, 1);
+  check('the admin released one student', result.releasedStudents, 1);
+  const room = await db.collection('rooms').doc('RM-ADMIN-RELEASE').get();
+  check('the admin released the room occupancy', room.get('currentOccupancy'), 0);
+  check('the admin made the room available', room.get('status'), 'available');
+  check(
+    'the admin ended the active booking',
+    (await db.collection('joinRequests').doc('JRQ-ADMIN-RELEASE').get()).get('status'),
+    'cancelled',
+  );
+  check(
+    'the release records the admin as the actor',
+    (await db.collection('joinRequests').doc('JRQ-ADMIN-RELEASE').get()).get('cancelledByRole'),
+    'admin',
+  );
+}
+
 async function main() {
   await testOwnerApprovalAndCancellationUseLiveRole();
   await testRoleChangeCancelsOwnerSideRequests();
@@ -6012,6 +6401,11 @@ async function main() {
   await testListingDeletionRemovesOrphanReviews();
   await testPhotoCleanupKeepsAReAddedImage();
   await testListingDeletionPagesRequestsAndKeepsTheirIds();
+  await testStudentCancellationStopsAfterJoining();
+  await testStudentCanRequestDifferentRooms();
+  await testOwnerAvailabilityReleaseEndsOnlyThisRoomsBookings();
+  await testAvailabilityReleaseRejectsUnauthorizedCallers();
+  await testAdminAvailabilityReleaseEndsBookings();
 
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail) {

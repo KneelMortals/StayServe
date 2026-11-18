@@ -251,7 +251,19 @@ class _AdminRequestCard extends StatelessWidget {
     late final String title;
     late final String message;
 
-    if (request.status == JoinRequestStatus.adminReviewed) {
+    final paymentVerified =
+        request.advancePaid ||
+        request.advancePaymentStatus == PaymentStatus.verified;
+
+    if (request.status == JoinRequestStatus.cancelled &&
+        (paymentVerified || request.platformCutTaken)) {
+      icon = Icons.event_busy_outlined;
+      color = Colors.teal;
+      title = 'Booking ended — payment history retained';
+      message =
+          'This booking is no longer active. Payment and invoice history '
+          'remain unchanged; no refund is implied.';
+    } else if (request.status == JoinRequestStatus.adminReviewed) {
       icon = Icons.task_alt;
       color = Colors.teal;
       title = 'Payment verified — booking activated';

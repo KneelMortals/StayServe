@@ -126,11 +126,13 @@ flutter:
     - assets/icons/
 
 flutter_native_splash:
-  color: "#2E7D32"
+  color: "#FFFFFF"
+  color_dark: "#FFFFFF"
   image: assets/images/logo_minimal.png
   android_12:
     image: assets/images/logo_minimal.png
-    color: "#2E7D32"
+    color: "#FFFFFF"
+    color_dark: "#FFFFFF"
   ios: true
   web: false
 

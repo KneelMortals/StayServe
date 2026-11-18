@@ -130,7 +130,8 @@ class _AdminRoomsScreenState extends ConsumerState<AdminRoomsScreen> {
                     // The card itself opens the listing — the card used to
                     // carry an `InkWell` without an `onTap`, so it looked
                     // touchable but did nothing at all.
-                    onOpenRoom: () => context.push('/room/${visible[index].roomId}'),
+                    onOpenRoom: () =>
+                        context.push('/room/${visible[index].roomId}'),
                   ),
                 );
               },
@@ -211,7 +212,10 @@ class _AdminRoomsScreenState extends ConsumerState<AdminRoomsScreen> {
           'cannot be deleted.',
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
           TextButton(
             onPressed: () async {
               Navigator.pop(dialogContext);
@@ -280,7 +284,12 @@ class _AdminRoomCard extends ConsumerWidget {
                 child: room.hasImages
                     ? ClipRRect(
                         borderRadius: BorderRadius.circular(AppBorderRadius.md),
-                        child: Image.network(room.primaryImage, fit: BoxFit.cover, width: 72, height: 72),
+                        child: Image.network(
+                          room.primaryImage,
+                          fit: BoxFit.cover,
+                          width: 72,
+                          height: 72,
+                        ),
                       )
                     : const Icon(Icons.image, size: 28),
               ),
@@ -321,11 +330,15 @@ class _AdminRoomCard extends ConsumerWidget {
                           ),
                           decoration: BoxDecoration(
                             color: statusColor.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(AppBorderRadius.full),
+                            borderRadius: BorderRadius.circular(
+                              AppBorderRadius.full,
+                            ),
                           ),
                           child: Text(
                             room.status.label,
-                            style: theme.textTheme.labelSmall?.copyWith(color: statusColor),
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: statusColor,
+                            ),
                           ),
                         ),
                       ],
@@ -354,8 +367,14 @@ class _AdminRoomCard extends ConsumerWidget {
                   }
                 },
                 itemBuilder: (context) => [
-                  const PopupMenuItem(value: 'status', child: Text('Change Status')),
-                  const PopupMenuItem(value: 'delete', child: Text('Delete Room')),
+                  const PopupMenuItem(
+                    value: 'status',
+                    child: Text('Change Status'),
+                  ),
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: Text('Delete Room'),
+                  ),
                 ],
               ),
             ],
@@ -368,25 +387,61 @@ class _AdminRoomCard extends ConsumerWidget {
   void _showStatusDialog(BuildContext context) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Change Room Status'),
         content: RadioGroup<RoomStatus>(
           groupValue: room.status,
           onChanged: (value) {
             if (value != null) {
-              Navigator.pop(context);
-              onUpdateStatus(value);
+              Navigator.pop(dialogContext);
+              if (value == RoomStatus.available && room.currentOccupancy > 0) {
+                _confirmAvailabilityRelease(context, value);
+              } else {
+                onUpdateStatus(value);
+              }
             }
           },
           child: Column(
             mainAxisSize: MainAxisSize.min,
-            children: RoomStatus.values.map((status) => RadioListTile<RoomStatus>(
-              title: Text(status.label),
-              value: status,
-            )).toList(),
+            children: RoomStatus.values
+                .map(
+                  (status) => RadioListTile<RoomStatus>(
+                    title: Text(status.label),
+                    value: status,
+                  ),
+                )
+                .toList(),
           ),
         ),
       ),
     );
+  }
+
+  Future<void> _confirmAvailabilityRelease(
+    BuildContext context,
+    RoomStatus status,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Release the joined students?'),
+        content: const Text(
+          'Making this room available ends every active booking for it and '
+          'removes those students immediately. Their other joined rooms are '
+          'not affected. Payment and invoice history is kept unchanged.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Keep current bookings'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Make available'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && context.mounted) onUpdateStatus(status);
   }
 }

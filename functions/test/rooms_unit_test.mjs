@@ -60,9 +60,9 @@ check(
   { allowed: false, reason: 'already-full' },
 );
 check(
-  'a room with an occupant may not be marked available by the owner',
+  'a room with an occupant may be marked available so the server can release it',
   decideRoomListingAvailability(false, 2, 1),
-  { allowed: false, reason: 'has-occupants' },
+  { allowed: true, status: 'available' },
 );
 check(
   'an invalid capacity is refused',

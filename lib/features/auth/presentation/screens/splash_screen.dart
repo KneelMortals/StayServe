@@ -943,29 +943,17 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      backgroundColor: theme.colorScheme.primary,
+      backgroundColor: Colors.white,
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Container(
-              width: 120,
-              height: 120,
-              decoration: BoxDecoration(
-                color: theme.colorScheme.onPrimary,
-                borderRadius: BorderRadius.circular(AppBorderRadius.xl),
-              ),
-              child: const Icon(
-                Icons.home_outlined,
-                size: 60,
-                color: AppColors.primary,
-              ),
-            ),
+            const Icon(Icons.home_outlined, size: 56, color: AppColors.primary),
             const SizedBox(height: AppSpacing.xl),
             Text(
               AppConstants.appName,
               style: theme.textTheme.headlineLarge?.copyWith(
-                color: theme.colorScheme.onPrimary,
+                color: AppColors.textPrimary,
                 fontWeight: FontWeight.w700,
               ),
             ),
@@ -973,15 +961,15 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
             Text(
               'Find your perfect stay',
               style: theme.textTheme.bodyLarge?.copyWith(
-                color: theme.colorScheme.onPrimary.withValues(alpha: 0.8),
+                color: AppColors.textSecondary,
               ),
             ),
             const SizedBox(height: AppSpacing.xxl),
             if (_restoreFailed) ...[
-              Icon(
+              const Icon(
                 Icons.cloud_off_outlined,
                 size: 44,
-                color: theme.colorScheme.onPrimary,
+                color: AppColors.textPrimary,
               ),
               const SizedBox(height: AppSpacing.md),
               FilledButton.icon(
@@ -989,21 +977,19 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                 icon: const Icon(Icons.refresh),
                 label: const Text('Try again'),
                 style: FilledButton.styleFrom(
-                  backgroundColor: theme.colorScheme.onPrimary,
-                  foregroundColor: theme.colorScheme.primary,
+                  backgroundColor: AppColors.primary,
+                  foregroundColor: Colors.white,
                 ),
               ),
             ] else
-              CircularProgressIndicator(
-                valueColor: AlwaysStoppedAnimation<Color>(
-                  theme.colorScheme.onPrimary,
-                ),
+              const CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(AppColors.primary),
               ),
             const SizedBox(height: AppSpacing.lg),
             Text(
               _statusMessage,
               style: theme.textTheme.bodyMedium?.copyWith(
-                color: theme.colorScheme.onPrimary.withValues(alpha: 0.7),
+                color: AppColors.textSecondary,
               ),
               textAlign: TextAlign.center,
             ),

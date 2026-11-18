@@ -101,6 +101,36 @@ void main() {
       expect(roomIds, ['legacy-room']);
     });
 
+    test('one student may join more than one different room', () {
+      final roomIds = joinedRoomIdsFromRequests([
+        (
+          documentId: 'first-room',
+          data: _request(roomId: 'room-first', status: 'adminReviewed'),
+        ),
+        (
+          documentId: 'second-room',
+          data: _request(roomId: 'room-second', status: 'adminReviewed'),
+        ),
+      ]);
+
+      expect(roomIds, ['room-first', 'room-second']);
+    });
+
+    test('ending one joined room keeps the student other joined room', () {
+      final roomIds = joinedRoomIdsFromRequests([
+        (
+          documentId: 'released-room',
+          data: _request(roomId: 'room-released', status: 'cancelled'),
+        ),
+        (
+          documentId: 'kept-room',
+          data: _request(roomId: 'room-kept', status: 'adminReviewed'),
+        ),
+      ]);
+
+      expect(roomIds, ['room-kept']);
+    });
+
     test('one malformed request does not hide the other joined rooms', () {
       final roomIds = joinedRoomIdsFromRequests([
         (documentId: 'malformed', data: {'status': 123, 'roomId': 456}),

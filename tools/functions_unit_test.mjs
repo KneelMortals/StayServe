@@ -52,6 +52,7 @@ const {
 const {
   ownerHasAccepted,
   paymentAlreadyMade,
+  canStudentCancelBooking,
   canCreateBookingForRole,
   canBookAsStudent,
   canActAsRoomOwner,
@@ -528,6 +529,57 @@ check(
 check(
   'the advance is explicitly not paid',
   paymentAlreadyMade({ advancePaid: false, advancePaymentStatus: null }),
+  false,
+);
+
+// ---------------------------------------------------------------------------
+section('when a student may withdraw a booking request');
+
+check(
+  'a pending request may be withdrawn',
+  canStudentCancelBooking('pending', {}),
+  true,
+);
+check(
+  'an owner-confirmed request may be withdrawn',
+  canStudentCancelBooking('ownerConfirmed', {}),
+  true,
+);
+check(
+  'a confirmed but inactive request may be withdrawn',
+  canStudentCancelBooking('studentConfirmed', {}),
+  true,
+);
+check(
+  'a legacy owner-confirmed request may be withdrawn',
+  canStudentCancelBooking('owner_confirmed', {}),
+  true,
+);
+check(
+  'a legacy student-confirmed request may be withdrawn',
+  canStudentCancelBooking('student_confirmed', {}),
+  true,
+);
+check(
+  'an active joined booking may not be withdrawn by the student',
+  canStudentCancelBooking('adminReviewed', {}),
+  false,
+);
+check(
+  'a legacy active joined booking may not be withdrawn by the student',
+  canStudentCancelBooking('admin_reviewed', {}),
+  false,
+);
+check(
+  'a request with a submitted payment may not be withdrawn',
+  canStudentCancelBooking('studentConfirmed', {
+    advancePaymentStatus: 'submitted',
+  }),
+  false,
+);
+check(
+  'an unknown request state may not be withdrawn',
+  canStudentCancelBooking('unknown', {}),
   false,
 );
 

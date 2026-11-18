@@ -377,18 +377,52 @@ void main() {
       user: user,
     );
 
-    final cancelButton = find.widgetWithText(AppButton, 'Cancel booking');
-    expect(cancelButton, findsOneWidget);
-
-    await tester.ensureVisible(cancelButton);
-    await tester.pumpAndSettle();
-    await tester.tap(cancelButton);
-    await tester.pumpAndSettle();
-
-    // The button is locked — the server would refuse it anyway.
-    expect(find.text('Cancel booking?'), findsNothing);
+    // A non-cancellable request does not offer a misleading disabled action.
+    expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
+    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsNothing);
     expect(joinRequests.cancelledRequestId, isNull);
-    expect(find.textContaining('cannot be cancelled any more'), findsOneWidget);
+  });
+
+  testWidgets('a joined room shows You joined and has no cancel action', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository();
+    final studentRepository = _FakeStudentRepository()
+      ..requests = [
+        _request(status: JoinRequestStatus.adminReviewed, advancePaid: true),
+      ];
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
+
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
+
+    expect(find.text('You joined this room'), findsOneWidget);
+    expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
+    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsNothing);
+    expect(find.widgetWithText(AppButton, 'Visit the room'), findsOneWidget);
+  });
+
+  testWidgets('a confirmed but inactive booking can still be cancelled', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository();
+    final studentRepository = _FakeStudentRepository()
+      ..requests = [_request(status: JoinRequestStatus.studentConfirmed)];
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
+
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
+
+    expect(find.text('You joined this room'), findsNothing);
+    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsOneWidget);
   });
 
   testWidgets('a second request does not produce the error of the server', (

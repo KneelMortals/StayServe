@@ -130,6 +130,7 @@ class _StudentRequestsViewState extends ConsumerState<StudentRequestsView> {
           .read(studentJoinRequestProvider)
           .studentConfirmJoin(request.requestId);
       if (!mounted) return;
+      ref.invalidate(myJoinRequestsProvider);
       _showSnack(
         request.platformFeePayer == 'owner'
             ? 'Request confirmed — waiting for the owner to submit the platform fee'
@@ -161,6 +162,7 @@ class _StudentRequestsViewState extends ConsumerState<StudentRequestsView> {
 
     if (!mounted) return;
     if (submitted == true) {
+      ref.invalidate(myJoinRequestsProvider);
       _showSnack(
         'Payment submitted for verification — awaiting admin verification.',
         isError: false,
@@ -181,6 +183,7 @@ class _StudentRequestsViewState extends ConsumerState<StudentRequestsView> {
           .read(studentJoinRequestProvider)
           .cancelJoinRequest(request.requestId, reason: reason);
       if (!mounted) return;
+      ref.invalidate(myJoinRequestsProvider);
       _showSnack('Request cancelled', isError: false);
     } catch (e) {
       if (!mounted) return;
@@ -340,8 +343,9 @@ class _StudentRequestCard extends ConsumerWidget {
                   isBusy ? null : onPay,
                   ButtonType.primary,
                 ),
-              // The request can be walked away from as long as nothing was
-              // paid for it — also **after** the owner accepted it.
+              // A student may withdraw only before the booking is activated.
+              // After activation, the room owner or an administrator ends
+              // the joined room by making the listing available again.
               if (canCancel)
                 _actionButton(
                   'Cancel',
@@ -355,11 +359,11 @@ class _StudentRequestCard extends ConsumerWidget {
     );
   }
 
-  /// Whether the student may still cancel the booking.
+  /// Whether the student may still withdraw this booking request.
   ///
-  /// The acceptance of the owner is not a payment — the request can be
-  /// cancelled as long as no money changed hands.
-  bool get canCancel => request.canBeCancelled && !isClosed;
+  /// Once the booking is activated the room is joined and cannot be
+  /// cancelled from the student side.
+  bool get canCancel => request.canStudentCancel && !isClosed;
 
   /// Whether the request is over — it was declined or cancelled.
   bool get isClosed =>
@@ -476,6 +480,24 @@ class _PaymentStatusBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+
+    // An availability release ends an active booking without rewriting its
+    // payment history. The request is closed now; it is not waiting for an
+    // activation that will never happen again.
+    if (request.status == JoinRequestStatus.cancelled &&
+        (request.advancePaid ||
+            paymentStatus == PaymentStatus.verified ||
+            request.platformCutTaken)) {
+      return _banner(
+        context,
+        icon: Icons.event_busy_outlined,
+        color: Colors.teal,
+        title: 'Booking ended — payment history retained',
+        subtitle:
+            'This booking is no longer active. Payment and invoice history '
+            'remain unchanged; no refund is implied.',
+      );
+    }
 
     // `adminReviewed` is the only request state that makes the room joined.
     // The legacy `admin_reviewed` spelling is normalised by the model before

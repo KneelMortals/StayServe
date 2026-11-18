@@ -18,6 +18,7 @@ import {
 import {
   canActAsRoomOwner,
   canBookAsStudent,
+  canStudentCancelBooking,
   hasValidBookingParties,
   paymentAlreadyMade,
 } from './bookingAccess';
@@ -880,14 +881,39 @@ export const cancelJoinRequest = callableHttps.onCall(async (data, context) => {
     }
 
     // -------------------------------------------------------------------
+    // A student may withdraw only before the booking becomes active.
+    //
+    // After the booking is activated, the student has joined the room until
+    // the owner or an administrator explicitly makes the room available
+    // again. That server-owned release path removes the joined-room
+    // subscription immediately and keeps every other booking of the same
+    // student untouched.
+    // -------------------------------------------------------------------
+    const bookingIsActive = isActiveBookingStatus(status);
+    if (!callerIsOwner && bookingIsActive) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This booking is already joined and can no longer be cancelled by the student. ' +
+          'The room owner or an administrator must make the room available again.',
+      );
+    }
+
+    // -------------------------------------------------------------------
     // Money has already changed hands — the booking can no longer simply be
     // walked away from.
     // -------------------------------------------------------------------
-    if (isActiveBookingStatus(status) || paymentAlreadyMade(data)) {
+    if (bookingIsActive || paymentAlreadyMade(data)) {
       throw new functions.https.HttpsError(
         'failed-precondition',
         'This booking can no longer be cancelled because a payment has already ' +
           'been made. Please contact support.',
+      );
+    }
+
+    if (!callerIsOwner && !canStudentCancelBooking(status, data)) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This booking request cannot be cancelled by the student.',
       );
     }
 

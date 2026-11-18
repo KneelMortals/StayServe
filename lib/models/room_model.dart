@@ -236,8 +236,9 @@ class RoomModel {
   /// `status` and `currentOccupancy` are the **initial** values of a fresh
   /// listing — `available` and `0`. Both fields are server-owned from the
   /// moment the listing exists: `setRoomListingAvailability` /
-  /// `adminSetRoomListingStatus` change the status and the booking state
-  /// machine changes the occupancy counter.
+  /// `adminSetRoomListingStatus` change the status, an explicit availability
+  /// release also clears the occupancy, and the booking state machine changes
+  /// the counter during activation and rollback.
   Map<String, dynamic> toCreateJson() {
     final payload = toJson();
     // The server writes the rounded geocell after the private location has

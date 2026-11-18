@@ -291,6 +291,24 @@ class JoinRequestModel {
       advancePaymentStatus != PaymentStatus.submitted &&
       advancePaymentStatus != PaymentStatus.verified;
 
+  /// Whether the **student** may still withdraw this request.
+  ///
+  /// The student may cancel while the request is pending or confirmed but not
+  /// activated yet. Once the booking is `adminReviewed`, the student has
+  /// joined the room and only the room owner or an administrator can end it
+  /// by making the room available again.
+  ///
+  /// This is deliberately separate from [canBeCancelled]: that property is
+  /// also used for owner-side cancellation before a payment is made.
+  bool get canStudentCancel =>
+      (status == JoinRequestStatus.pending ||
+          status == JoinRequestStatus.ownerConfirmed ||
+          status == JoinRequestStatus.studentConfirmed) &&
+      !advancePaid &&
+      !platformCutTaken &&
+      advancePaymentStatus != PaymentStatus.submitted &&
+      advancePaymentStatus != PaymentStatus.verified;
+
   double get commissionAmount =>
       monthlyRentAtJoin * commissionPercentageAtJoin / 100;
 

@@ -107,6 +107,7 @@ class _FirebaseInitErrorApp extends StatelessWidget {
         useMaterial3: true,
       ),
       home: Scaffold(
+        backgroundColor: Colors.white,
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(24),

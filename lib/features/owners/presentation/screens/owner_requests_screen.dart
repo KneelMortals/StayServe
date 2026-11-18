@@ -454,10 +454,19 @@ class _JoinRequestCard extends StatelessWidget {
         subtitle = 'This request is closed and no longer needs a payment.';
         break;
       case JoinRequestStatus.cancelled:
-        icon = Icons.cancel_outlined;
-        color = Colors.grey;
-        title = 'Request cancelled';
-        subtitle = 'This request is closed and no longer needs a payment.';
+        if (paymentVerified || request.platformCutTaken) {
+          icon = Icons.event_busy_outlined;
+          color = Colors.teal;
+          title = 'Booking ended — payment history retained';
+          subtitle =
+              'This booking is no longer active. Payment and invoice history '
+              'remain unchanged; no refund is implied.';
+        } else {
+          icon = Icons.cancel_outlined;
+          color = Colors.grey;
+          title = 'Request cancelled';
+          subtitle = 'This request is closed and no longer needs a payment.';
+        }
         break;
     }
 

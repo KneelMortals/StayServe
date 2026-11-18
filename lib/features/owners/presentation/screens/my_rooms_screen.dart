@@ -165,7 +165,8 @@ class _RoomManagementCard extends ConsumerStatefulWidget {
   const _RoomManagementCard({required this.room});
 
   @override
-  ConsumerState<_RoomManagementCard> createState() => _RoomManagementCardState();
+  ConsumerState<_RoomManagementCard> createState() =>
+      _RoomManagementCardState();
 }
 
 class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
@@ -201,7 +202,9 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
             placeholder: Container(
               height: 120,
               color: theme.colorScheme.surfaceContainerHighest,
-              child: const Center(child: Icon(Icons.bedroom_parent_outlined, size: 36)),
+              child: const Center(
+                child: Icon(Icons.bedroom_parent_outlined, size: 36),
+              ),
             ),
           ),
           Padding(
@@ -245,15 +248,19 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
                         ],
                       ),
                     ),
-                    Icon(Icons.chevron_right, color: theme.colorScheme.onSurfaceVariant),
+                    Icon(
+                      Icons.chevron_right,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ],
                 ),
                 const SizedBox(height: AppSpacing.md),
                 const Divider(height: 1),
                 const SizedBox(height: AppSpacing.sm),
-                // The owner can take a listing off the market. The tenant
-                // count is maintained by the server when a booking is
-                // verified; this action changes only the listing status.
+                // The owner can take a listing off the market. The server
+                // maintains the tenant count and, when a listing with joined
+                // students is made available, ends those bookings in the
+                // same transaction.
                 //
                 // A `Wrap` is used instead of a `Row`: the button has an
                 // intrinsic width, and next to the text it did not fit on a
@@ -264,25 +271,31 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
                   crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
                     ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 220),
+                      constraints: const BoxConstraints(maxWidth: 260),
                       child: Text(
                         // An inactive listing is **not** available: students
                         // cannot find it and they cannot book it. The old
                         // wording claimed the opposite.
                         room.status == RoomStatus.inactive
                             ? 'This listing is inactive — students cannot book it.'
+                            : room.currentOccupancy > 0
+                            ? 'This room has joined students. Making it available ends their bookings immediately.'
                             : isOccupied
-                                ? 'This listing is marked occupied and is not accepting requests.'
-                                : 'This room is available for booking.',
+                            ? 'This listing is marked occupied and is not accepting requests.'
+                            : 'This room is available for booking.',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
                     ),
                     FilledButton.tonalIcon(
-                      onPressed: _busy ? null : () => _toggleOccupied(context, ref),
+                      onPressed: _busy
+                          ? null
+                          : () => _toggleOccupied(context, ref),
                       icon: Icon(
-                        isOccupied ? Icons.lock_open : Icons.lock,
+                        room.currentOccupancy > 0 || isOccupied
+                            ? Icons.lock_open
+                            : Icons.lock,
                         size: 18,
                       ),
                       label: _busy
@@ -291,7 +304,13 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
                               height: 16,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : Text(isOccupied ? 'Mark available' : 'Mark occupied'),
+                          : Text(
+                              room.currentOccupancy > 0
+                                  ? 'Make available & release students'
+                                  : isOccupied
+                                  ? 'Mark available'
+                                  : 'Mark occupied',
+                            ),
                     ),
                   ],
                 ),
@@ -305,26 +324,53 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
 
   Future<void> _toggleOccupied(BuildContext context, WidgetRef ref) async {
     if (_busy) return;
-    final occupied = !room.isOccupied;
+
+    final hasOccupants = room.currentOccupancy > 0;
+    final makeAvailable = hasOccupants || room.isOccupied;
+
+    if (hasOccupants) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Make this room available?'),
+          content: const Text(
+            'This ends every active booking for this room and removes the '
+            'joined students immediately. Their other joined rooms are not '
+            'affected. Payment and invoice history is kept unchanged.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Keep current bookings'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Make available'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
 
     setState(() => _busy = true);
     try {
-      await ref.read(ownerRepositoryProvider).setRoomOccupied(
-            room.roomId,
-            occupied: occupied,
-          );
+      await ref
+          .read(ownerRepositoryProvider)
+          .setRoomOccupied(room.roomId, occupied: !makeAvailable);
       ref.invalidate(myRoomsProvider);
+      ref.invalidate(myJoinRequestsProvider);
       if (!context.mounted) return;
       context.showSuccessSnackBar(
-        occupied
-            ? 'The room is marked as occupied.'
-            : 'The room is available again.',
+        makeAvailable
+            ? hasOccupants
+                  ? 'The room is available again and its joined students were removed.'
+                  : 'The room is available again.'
+            : 'The room is marked as occupied.',
       );
     } catch (e) {
       if (!context.mounted) return;
-      context.showErrorSnackBar(
-        e.toString().replaceFirst('Exception: ', ''),
-      );
+      context.showErrorSnackBar(e.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _busy = false);
     }

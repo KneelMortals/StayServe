@@ -59,8 +59,8 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
   /// The request that was sent from this screen.
   ///
   /// The stream of the requests needs a moment to deliver the new request.
-  /// The button has to turn into "Cancel booking" **right away**, so the
-  /// room and the id of the request are remembered here.
+  /// The room and the id of the request are remembered here so the request
+  /// state can be shown **right away**.
   String? _requestSentForRoomId;
   String? _requestSentRequestId;
 
@@ -177,10 +177,18 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     // -------------------------------------------------------------------
     // The request of this student for this room.
     //
-    // As long as it exists, the button of the room says "Cancel booking"
-    // instead of "Request to Book" — the request must not be sent twice.
+    // As long as it exists, the room does not offer a second booking
+    // request. A student may withdraw it only before the booking is
+    // activated; afterwards the room shows that the student has joined.
     // -------------------------------------------------------------------
     final activeRequest = _activeRequestFor(requests, room.roomId);
+    final sentRequestWasClosed =
+        _requestSentRequestId != null &&
+        requests.any(
+          (request) =>
+              request.requestId == _requestSentRequestId &&
+              (request.isCancelled || request.isRejected),
+        );
 
     return Scaffold(
       body: CustomScrollView(
@@ -210,6 +218,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
                     isAvailable,
                     isAccepted,
                     activeRequest,
+                    sentRequestWasClosed,
                   ),
                 ],
               ),
@@ -721,6 +730,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     bool isAvailable,
     bool isAccepted,
     JoinRequestModel? activeRequest,
+    bool sentRequestWasClosed,
   ) {
     final theme = Theme.of(context);
 
@@ -841,21 +851,21 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     // -------------------------------------------------------------------
     // A request for this room already exists.
     //
-    // The button says **"Cancel booking"** — not "Request to Book". The
-    // request may only be sent once: the server refuses a second one with
-    // "You have already requested to join this room", which the user saw
-    // as a strange error message when they tapped the button a second
-    // time.
+    // The room does not offer a second booking request. A request which is
+    // still cancellable shows **"Cancel booking"**; an active booking shows
+    // **"You joined this room"** instead.
     //
     // The request that was sent from this screen is remembered, so the
     // button turns around **right away** — the stream of the requests
     // needs a moment to deliver it.
     // -------------------------------------------------------------------
     final requestExists =
-        activeRequest != null || _requestSentForRoomId == room.roomId;
+        activeRequest != null ||
+        (_requestSentForRoomId == room.roomId && !sentRequestWasClosed);
 
     if (requestExists) {
-      final canCancel = activeRequest?.canBeCancelled ?? true;
+      final canCancel = activeRequest?.canStudentCancel ?? true;
+      final hasJoined = activeRequest?.isAdminReviewed == true;
 
       // The id of the request that was sent from this screen is known even
       // before the stream delivers it — the button can cancel it right
@@ -864,6 +874,34 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
 
       return Column(
         children: [
+          if (hasJoined) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(AppSpacing.md),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(AppBorderRadius.lg),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.check_circle_outline,
+                    color: theme.colorScheme.onPrimaryContainer,
+                  ),
+                  const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: Text(
+                      'You joined this room',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        color: theme.colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+          ],
           // The owner accepted the request — the student may now see where
           // the room is and get there.
           if (isAccepted) ...[
@@ -875,51 +913,39 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
             ),
             const SizedBox(height: AppSpacing.sm),
           ],
-          AppButton(
-            label: 'Cancel booking',
-            icon: const Icon(Icons.close),
-            // A booking that already has money in it cannot be walked away
-            // from — the button says so instead of letting the server
-            // refuse it with an error.
-            onPressed: _busy || requestId == null || !canCancel
-                ? null
-                : () => _cancelBooking(
-                    context,
-                    activeRequest ??
-                        JoinRequestModel(
-                          requestId: requestId,
-                          roomId: room.roomId,
-                          studentId: currentUser.uid,
-                          ownerId: room.ownerId,
-                          status: JoinRequestStatus.pending,
-                          createdAt: DateTime.now(),
-                          updatedAt: DateTime.now(),
-                          monthlyRentAtJoin: room.monthlyRent,
-                          commissionPercentageAtJoin: 30,
-                        ),
-                  ),
-            isLoading: _busy,
-            isFullWidth: true,
-            type: ButtonType.danger,
-          ),
-          const SizedBox(height: AppSpacing.sm),
+          if (canCancel) ...[
+            AppButton(
+              label: 'Cancel booking',
+              icon: const Icon(Icons.close),
+              onPressed: _busy || requestId == null
+                  ? null
+                  : () => _cancelBooking(
+                      context,
+                      activeRequest ??
+                          JoinRequestModel(
+                            requestId: requestId,
+                            roomId: room.roomId,
+                            studentId: currentUser.uid,
+                            ownerId: room.ownerId,
+                            status: JoinRequestStatus.pending,
+                            createdAt: DateTime.now(),
+                            updatedAt: DateTime.now(),
+                            monthlyRentAtJoin: room.monthlyRent,
+                            commissionPercentageAtJoin: 30,
+                          ),
+                    ),
+              isLoading: _busy,
+              isFullWidth: true,
+              type: ButtonType.danger,
+            ),
+            const SizedBox(height: AppSpacing.sm),
+          ],
           AppButton(
             label: 'Contact Owner',
             onPressed: () => _openChat(context, room),
             isFullWidth: true,
             type: ButtonType.secondary,
           ),
-          if (!canCancel && activeRequest != null) ...[
-            const SizedBox(height: AppSpacing.sm),
-            Text(
-              'This booking cannot be cancelled any more — the money has '
-              'already changed hands.',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
         ],
       );
     }

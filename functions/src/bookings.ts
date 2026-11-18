@@ -5,7 +5,10 @@ import * as functions from 'firebase-functions/v1';
 // see the comment in `./firebase.ts`.
 import './firebase';
 
-import { hasValidBookingParties } from './bookingAccess';
+import {
+  ACTIVE_BOOKING_STATUSES,
+  hasValidBookingParties,
+} from './bookingAccess';
 import {
   isValidMonthlyRent,
   readRoomCapacityState,
@@ -40,7 +43,7 @@ export const INVOICE_PREFIX = 'INV-';
  * includes the tenant.
  */
 export function isActiveBookingStatus(status: string): boolean {
-  return status === 'adminReviewed' || status === 'admin_reviewed';
+  return ACTIVE_BOOKING_STATUSES.indexOf(status) >= 0;
 }
 
 /**
