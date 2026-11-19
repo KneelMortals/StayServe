@@ -123,7 +123,6 @@ flutter:
     - assets/images/logo.png
     - assets/images/logo_minimal.png
     - assets/images/
-    - assets/icons/
 
 flutter_native_splash:
   color: "#FFFFFF"
