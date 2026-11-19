@@ -1,6 +1,6 @@
 {
-    "name": "stayserve",
-    "short_name": "stayserve",
+    "name": "StayServe",
+    "short_name": "StayServe",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#FFFFFF",

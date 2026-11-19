@@ -12,8 +12,9 @@ request.
 - Debug builds use the App Check **debug** provider.
 - Release Android builds use **Play Integrity**.
 - Release iOS builds use **App Attest**, with DeviceCheck as a fallback.
-- Web App Check is inactive until a Web Firebase app and a reCAPTCHA v3 site
-  key exist.
+- Web App Check remains inactive until a reCAPTCHA v3 site key is configured.
+  The Web Firebase app itself is registered and can be published before that
+  provider is enabled.
 - Every callable uses one shared server-side switch:
   `APP_CHECK_ENFORCE=true`.
 - The switch defaults to `false`, so the emulator and existing clients remain
@@ -28,7 +29,9 @@ In Firebase Console → App Check → Apps, register:
 1. the Android app
    `1:96035616668:android:cfc3cf3dab21aa9488fa59`;
 2. the iOS app
-   `1:96035616668:ios:e77e14184c868cd688fa59`.
+   `1:96035616668:ios:e77e14184c868cd688fa59`;
+3. the Web app
+   `1:96035616668:web:21b41ac4b3224e4d88fa59`.
 
 For Android, add the SHA-256 certificate fingerprints used by every build
 variant (debug and release). For iOS, enable the App Attest/DeviceCheck
@@ -98,16 +101,19 @@ After the updated mobile app has reached the required adoption level:
 2. enable App Check enforcement for Cloud Storage;
 3. test registration, login, listing reads, photo upload/download and every
    callable from real Android and iOS builds;
-4. keep the web deployment disabled until a Web Firebase app and reCAPTCHA
-   key are configured.
+4. keep browser App Check disabled until the reCAPTCHA v3 provider and site
+   key are configured. Publishing the web client does not by itself enable
+   App Check enforcement.
 
 Do not enable a Firebase service in enforcement mode while a supported client
 version can still call it without an App Check token.
 
 ## Web configuration
 
-The project currently has no Web Firebase app. When one is registered, add
-its `FirebaseOptions` to `lib/firebase/firebase_config.dart` and build with:
+The Web Firebase app is registered as
+`1:96035616668:web:21b41ac4b3224e4d88fa59`, and its `FirebaseOptions` live in
+`lib/firebase/firebase_config.dart`. Build with the reCAPTCHA v3 provider once
+its site key is configured:
 
 ```bash
 flutter build web \
@@ -115,7 +121,8 @@ flutter build web \
 ```
 
 Without that key the Flutter client intentionally skips web App Check rather
-than failing startup.
+than failing startup. Callable enforcement must also remain disabled until
+browser tokens have been validated.
 
 ## Rollback
 

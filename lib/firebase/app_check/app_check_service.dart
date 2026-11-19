@@ -9,8 +9,9 @@ class AppCheckService {
 
   /// The reCAPTCHA v3 key used by the web build.
   ///
-  /// The web Firebase app is not registered yet, so the key is optional.
-  /// Once a web app exists, pass it at build time:
+  /// The web Firebase app is registered, but the reCAPTCHA site key remains
+  /// optional while browser App Check is not enabled. Pass it at build time
+  /// when the provider is configured:
   ///
   /// ```sh
   /// flutter build web \

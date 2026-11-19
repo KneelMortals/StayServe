@@ -25,14 +25,14 @@ the root `npm ci`, run them as `npx firebase ...` from the repository root.
 
 ## 2. Firebase configuration lives in the repo
 
-`lib/firebase/firebase_config.dart` contains separate Android and iOS
+`lib/firebase/firebase_config.dart` contains separate Android, iOS and Web
 Firebase options.
 
-> **Known limitation:** the Firebase project has no registered Web app. The
-> current web target falls back to the Android options, so the web bundle can
-> be compiled but browser authentication is not production-ready. Register a
-> Web app in the Firebase console and add its options before publishing the
-> site.
+The project has separate Android, iOS and Web Firebase apps. The Web app is
+`1:96035616668:web:21b41ac4b3224e4d88fa59`; its options are selected by
+`kIsWeb` in `lib/firebase/firebase_config.dart`. Browser App Check remains
+disabled until a reCAPTCHA v3 site key is configured, but authentication and
+the normal Firebase services are ready for the published Hosting site.
 
 ---
 
@@ -630,6 +630,17 @@ flutter build apk --debug
 
 Output: `build/app/outputs/flutter-apk/app-debug.apk`
 
+Build and publish the web client separately:
+
+```bash
+flutter build web --release
+firebase deploy --only hosting --project myfirstapp-fa30f52b
+```
+
+The web build selects the registered Web Firebase app automatically. Do not
+pass a reCAPTCHA site key until browser App Check has been registered and
+validated; without one, the client intentionally skips browser App Check.
+
 There is **no `build_runner` step**. The models are hand-written, so code
 generation is not part of the build.
 
@@ -767,10 +778,11 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    optional contact information. This is deliberate: SMS costs roughly
    INR 0.25–7 per message and the feature is not paid for yet. Turning it
    back on is documented in section 3.3.
-2. **The web target is not production-configured.** Android and iOS options
-   are present, but the Firebase project has no registered Web app. The web
-   bundle compiles with the Android fallback, but browser authentication needs
-   a real Web-app configuration before publishing.
+2. **Browser App Check is not enabled yet.** The Web Firebase app is
+   registered and the Hosting build uses its own configuration, but a
+   reCAPTCHA v3 site key is still required before browser App Check can be
+   activated. The shared callable-enforcement switch remains `false` until
+   every supported client has a valid token.
 3. **The UPI VPA is duplicated in two places** — the `PLATFORM_UPI_VPA`
    environment variable of the Cloud Function and
    `AppConstants.platformUpiVpa` in the app. The client asserts that both
@@ -790,7 +802,7 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    itself has **0** production advisories. The audit's suggested fix is an
    unsafe downgrade of `firebase-tools`, so it is intentionally not applied.
 7. **Some end-to-end paths still depend on external services.** The local
-   suite contains 303 Dart/widget tests, 416 backend callable
+   suite contains 309 Dart/widget tests, 461 backend callable
    state-machine/security checks, 170 Firestore-rules assertions and 30
    Storage-rules assertions. The private-location operator CLI has its own
    regression suite. Against production, the deployed-rules check reports 46
@@ -798,35 +810,31 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    remove their disposable artifacts before exiting. The OTP sign-up flow is
    additionally covered end to end by `tools/signup_e2e.mjs` (real mail → code
    → verify → profile written).
-8. **The repair diff is currently local and uncommitted.** The project is
-   under Git control on `main`, but no commit or push has been made. Several
-   audited artifacts have been deployed to production; review and commit the
-   complete diff before treating the repository as a reproducible release.
-9. **The custom claims are attached asynchronously.** `completeRegistration`
+8. **The custom claims are attached asynchronously.** `completeRegistration`
    and the revision-aware role-claim jobs publish the `role` / `admin` claims
    after the authoritative Firestore profile changes, so the token issued at
    sign-up may not carry them immediately. The app refreshes the token after
    registration, on session start and after a role change, but a third-party
    client that talks to the project directly would have to do the same.
-10. **Old clients need a minimum-version or force-update transition.** The
+9. **Old clients need a minimum-version or force-update transition.** The
     production location rollout is finalized: exact addresses live only in
     `roomPrivate/{roomId}`, public listings retain city/state and the rounded
     `geoCell`, and the durable privacy latch prevents the legacy exact-write
     window from reopening. An old client can therefore no longer save an exact
     public location or create a conversation directly. Distribution should
     require a current client version before old builds are retired.
-11. **A live mailbox bearer token was committed in `.mail_inbox.json`.** The
+10. **A live mailbox bearer token was committed in `.mail_inbox.json`.** The
     file has been deleted and is git-ignored, but the token is still valid at
     the mail provider: **rotate/revoke it there.** Anyone who read the old
     repository can read the OTP inbox until it is revoked.
-12. **The stricter rules and legacy backfills are live.** All five production
+11. **The stricter rules and legacy backfills are live.** All five production
     profiles are active and registration-complete. The two pre-existing
     listings received the server-owned `status` / `currentOccupancy` values,
     and both now have exactly one matching private location. A newly created
     legacy-shaped profile would still need the documented backfill or the
     temporary legacy window, but there is no remaining production profile in
     that state.
-13. **The new Firestore rules and all 43 Cloud Functions are deployed.** The
+12. **The new Firestore rules and all 43 Cloud Functions are deployed.** The
     deployed Firestore and Storage rules match the tested local files, every
     function is `ACTIVE` on Node.js 22, and the complete private-location
     verification reports `publicExactRemaining = 0`. The `onRoomCreated`
