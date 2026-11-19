@@ -17,11 +17,21 @@ import 'package:flutter/foundation.dart'
 class DefaultFirebaseOptions {
   const DefaultFirebaseOptions._();
 
-  static FirebaseOptions get currentPlatform {
-    if (kIsWeb) {
+  static FirebaseOptions get currentPlatform =>
+      optionsForPlatform(isWeb: kIsWeb, platform: defaultTargetPlatform);
+
+  /// Selects the Firebase options for a platform.
+  ///
+  /// The explicit inputs keep platform selection testable on the Dart VM as
+  /// well as in the browser-specific CI test.
+  static FirebaseOptions optionsForPlatform({
+    required bool isWeb,
+    required TargetPlatform platform,
+  }) {
+    if (isWeb) {
       return web;
     }
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
+    if (platform == TargetPlatform.iOS) {
       return ios;
     }
     return android;
@@ -36,7 +46,7 @@ class DefaultFirebaseOptions {
   );
 
   static const FirebaseOptions ios = FirebaseOptions(
-    apiKey: 'AIzaSyD0T834EU7hL2bvpLiIbMc2SFUOyLKz1OL',
+    apiKey: 'AIzaSyD0T834EW7hL_kbvpLitImc2SF5OyKNzOQ',
     appId: '1:96035616668:ios:e77e14184c868cd688fa59',
     messagingSenderId: '96035616668',
     projectId: 'myfirstapp-fa30f52b',

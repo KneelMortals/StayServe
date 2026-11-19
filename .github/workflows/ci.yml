@@ -71,6 +71,9 @@ jobs:
       - name: Run the Flutter tests
         run: flutter test
 
+      - name: Run the browser Firebase configuration test
+        run: flutter test --platform chrome test/web_firebase_config_test.dart
+
       - name: Run the function and security-rules tests
         run: npm test
 

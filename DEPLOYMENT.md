@@ -802,7 +802,7 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    itself has **0** production advisories. The audit's suggested fix is an
    unsafe downgrade of `firebase-tools`, so it is intentionally not applied.
 7. **Some end-to-end paths still depend on external services.** The local
-   suite contains 309 Dart/widget tests, 461 backend callable
+   suite contains 340 Dart/widget tests, 461 backend callable
    state-machine/security checks, 170 Firestore-rules assertions and 30
    Storage-rules assertions. The private-location operator CLI has its own
    regression suite. Against production, the deployed-rules check reports 46

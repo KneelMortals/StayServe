@@ -163,9 +163,10 @@ profile; a fresh dry run reports `Already complete: 1, Legacy candidates: 0`).
 
 ```bash
 flutter analyze lib test      # expect: No issues found!
-flutter test                  # the Dart/widget regression suite (303 tests)
+flutter test                  # the Dart/widget regression suite (340 tests)
+flutter test --platform chrome test/web_firebase_config_test.dart # browser Firebase selection
 npm run test:functions        # backend unit/security and room checks
-npm run test:callables        # backend callable state-machine suite (416)
+npm run test:callables        # backend callable state-machine suite (461)
 tools/test_firestore_rules.sh # Firestore rules, against the emulator (170)
 tools/test_storage_rules.sh   # Storage rules, against both emulators (30)
 tools/test_private_location_cli.sh # private-location operator CLI regression
