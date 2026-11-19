@@ -77,13 +77,15 @@ jobs:
       - name: Run the function and security-rules tests
         run: npm test
 
-      - name: Lint the Android app
-        # Lint only the application module. Flutter plugins are separate
-        # Gradle projects and may carry their own upstream lint findings.
-        run: ./android/gradlew -p android :app:lintDebug
-
       - name: Build the web release
         run: flutter build web --release
 
       - name: Build the Android release
+        # A clean checkout does not track Flutter's generated Gradle wrapper.
+        # The Flutter build restores it before the lint step runs below.
         run: flutter build apk --release
+
+      - name: Lint the Android app
+        # Lint only the application module. Flutter plugins are separate
+        # Gradle projects and may carry their own upstream lint findings.
+        run: ./android/gradlew -p android :app:lintDebug
