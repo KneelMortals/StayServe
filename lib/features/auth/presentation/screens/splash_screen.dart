@@ -62,13 +62,13 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   /// do with the page they are on.
   bool _hasLeftSplash = false;
 
-  /// Whether the start-up failed while Firebase Auth still reports a
-  /// signed-in user.
+  /// Whether the splash should offer a retry after a recoverable start-up or
+  /// session-restore failure.
   ///
-  /// A network or profile-read failure must not be treated as a logout. The
-  /// user stays on the splash screen and can retry instead of being sent to
-  /// the login screen every time the app is opened with a flaky connection.
-  bool _restoreFailed = false;
+  /// A failure must not be treated as a logout. The user stays on the splash
+  /// screen and can retry instead of being sent to the login screen every
+  /// time the app is opened with a flaky connection.
+  bool _retryActionVisible = false;
 
   /// Prevents two start-up attempts from running at the same time when the
   /// user taps **Try again**.
@@ -84,8 +84,8 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     if (!mounted || _isInitializing) return;
     _isInitializing = true;
 
-    if (_restoreFailed && mounted) {
-      setState(() => _restoreFailed = false);
+    if (_retryActionVisible && mounted) {
+      setState(() => _retryActionVisible = false);
     }
 
     User? authenticatedUser;
@@ -171,27 +171,11 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
       AppLogger.warning('The start-up failed', error: e);
       if (!mounted) return;
 
-      // Never turn a server/network failure into a logout. If Firebase Auth
-      // still has a user, keep the session and offer a retry. Reading the
-      // cached user can itself fail (for example when the Firebase app is
-      // unavailable), so that lookup must not escape this catch block.
-      User? stillAuthenticated = authenticatedUser;
-      if (stillAuthenticated == null) {
-        try {
-          stillAuthenticated = ref.read(authRepositoryProvider).currentUser;
-        } catch (error) {
-          AppLogger.warning(
-            'Could not read the cached Auth user while recovering from a '
-            'start-up failure',
-            error: error,
-          );
-        }
-      }
-      if (stillAuthenticated != null) {
-        _showSessionRestoreFailure();
-      } else {
-        _navigateToLogin();
-      }
+      // Never turn a start-up failure into a logout or silently skip the
+      // launch-area check. Keep the user on the splash screen with a retry
+      // action; the message deliberately does not claim that the connection
+      // failed because an internal/platform error reaches this block too.
+      _showStartupFailure();
     } finally {
       _isInitializing = false;
     }
@@ -256,11 +240,17 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
 
   void _showSessionRestoreFailure() {
     if (!mounted) return;
-    setState(() => _restoreFailed = true);
+    setState(() => _retryActionVisible = true);
     _updateStatus(
       'Your session is still saved, but it could not be restored. '
       'Check your connection and try again.',
     );
+  }
+
+  void _showStartupFailure() {
+    if (!mounted) return;
+    setState(() => _retryActionVisible = true);
+    _updateStatus('StayServe could not finish starting. Please try again.');
   }
 
   void _retryStartup() {
@@ -409,6 +399,31 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     while (mounted && !_hasLeftSplash) {
       _updateStatus('Checking your location...');
 
+      if (!locationService.supportsReverseGeocoding) {
+        // A browser reports coordinates but not a postal code. If the user
+        // has already confirmed an allowed pincode (or their profile has
+        // one), use it for the launch-area check instead of asking them to
+        // enter the same pincode on every visit.
+        String? savedPincode;
+        try {
+          savedPincode = await locationService.getStoredPincode();
+        } catch (e) {
+          AppLogger.warning('Could not read the saved pincode', error: e);
+        }
+        final fallbackPincode = _firstNonEmptyPincode([
+          session?.profile?.pincode,
+          savedPincode,
+        ]);
+        if (fallbackPincode != null && config.allows(fallbackPincode)) {
+          AppLogger.info(
+            'Launch-area check: using the saved pincode '
+            '($fallbackPincode) — allowed',
+          );
+          await _syncProfilePincode(fallbackPincode);
+          return true;
+        }
+      }
+
       final result = await locationService.getUserLocation();
       if (!mounted || _hasLeftSplash) return false;
 
@@ -445,22 +460,34 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         }
 
         // The position is known but the pincode could not be derived from
-        // it — fall back to the pincode of the profile.
+        // it. A browser cannot derive a postal code from its coordinates,
+        // so use the last pincode the user confirmed (or the pincode on the
+        // profile) and check it against the same launch-area configuration.
+        String? savedPincode;
+        try {
+          savedPincode = await locationService.getStoredPincode();
+        } catch (e) {
+          AppLogger.warning('Could not read the saved pincode', error: e);
+        }
         final profilePincode = session?.profile?.pincode;
-        if (profilePincode != null && profilePincode.trim().isNotEmpty) {
-          if (config.allows(profilePincode)) {
+        final fallbackPincode = _firstNonEmptyPincode([
+          profilePincode,
+          savedPincode,
+        ]);
+        if (fallbackPincode != null) {
+          if (config.allows(fallbackPincode)) {
             AppLogger.info(
-              'Launch-area check: using the pincode of the profile '
-              '($profilePincode) — allowed',
+              'Launch-area check: using the saved pincode '
+              '($fallbackPincode) — allowed',
             );
-            await _syncProfilePincode(profilePincode);
+            await _syncProfilePincode(fallbackPincode);
             return true;
           }
           AppLogger.info(
-            'Launch-area check: using the pincode of the profile '
-            '($profilePincode) — NOT allowed',
+            'Launch-area check: using the saved pincode '
+            '($fallbackPincode) — NOT allowed',
           );
-          final action = await _showNotLaunchedDialog(pincode: profilePincode);
+          final action = await _showNotLaunchedDialog(pincode: fallbackPincode);
           if (action == _LaunchGateAction.exit) {
             await quitApp();
             return false;
@@ -475,10 +502,12 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
 
       // The location could not be determined at all.
       AppLogger.info(
-        'Launch-area check: the location could not be determined '
-        '(${result.error ?? "no reason given"})',
+        'Launch-area check: the area could not be determined '
+        '(${result.error ?? "no pincode available"})',
       );
-      final action = await _showLocationUnavailableDialog();
+      final action = await _showLocationUnavailableDialog(
+        locationService: locationService,
+      );
       if (action == _LaunchGateAction.exit) {
         await quitApp();
         return false;
@@ -529,6 +558,14 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     AppLogger.info(
       'Launch-area check: the manually entered pincode $pincode is allowed',
     );
+    try {
+      await ref.read(locationServiceProvider).storePincode(pincode);
+    } catch (e) {
+      AppLogger.warning(
+        'Could not save the manually entered pincode',
+        error: e,
+      );
+    }
     await _syncProfilePincode(pincode);
     await _applyManualPincodeLocation(pincode);
     return true;
@@ -775,10 +812,17 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   ///
   /// The user can try again, type the location by hand, open the system
   /// settings or leave the app.
-  Future<_LaunchGateAction> _showLocationUnavailableDialog() async {
+  Future<_LaunchGateAction> _showLocationUnavailableDialog({
+    required LocationService locationService,
+  }) async {
     if (_hasLeftSplash) return _LaunchGateAction.exit;
 
-    _updateStatus('Could not detect your location');
+    final needsPincodeOnly = !locationService.supportsReverseGeocoding;
+    _updateStatus(
+      needsPincodeOnly
+          ? 'Could not determine your area'
+          : 'Could not detect your location',
+    );
 
     final action = await showDialog<_LaunchGateAction>(
       context: context,
@@ -789,11 +833,18 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
           size: 40,
           color: Theme.of(dialogContext).colorScheme.primary,
         ),
-        title: const Text('Location access needed'),
-        content: const Text(
-          'StayServe needs your location to check whether the service is '
-          'running in your area. Please turn on your location services and '
-          'allow the app to use them — or type your pincode by hand.',
+        title: Text(
+          needsPincodeOnly ? 'Pincode needed' : 'Location access needed',
+        ),
+        content: Text(
+          needsPincodeOnly
+              ? 'StayServe needs your pincode to check whether the service is '
+                    'running in your area. You can allow location access and '
+                    'try again, or type your pincode by hand.'
+              : 'StayServe needs your location to check whether the service '
+                    'is running in your area. Please turn on your location '
+                    'services and allow the app to use them — or type your '
+                    'pincode by hand.',
         ),
         actions: [
           TextButton(
@@ -806,11 +857,12 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                 Navigator.pop(dialogContext, _LaunchGateAction.manualLocation),
             child: const Text('Enter location manually'),
           ),
-          TextButton(
-            onPressed: () =>
-                Navigator.pop(dialogContext, _LaunchGateAction.openSettings),
-            child: const Text('Open settings'),
-          ),
+          if (locationService.supportsSystemSettings)
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, _LaunchGateAction.openSettings),
+              child: const Text('Open settings'),
+            ),
           FilledButton.icon(
             onPressed: () =>
                 Navigator.pop(dialogContext, _LaunchGateAction.retry),
@@ -933,6 +985,14 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     }
   }
 
+  String? _firstNonEmptyPincode(List<String?> values) {
+    for (final value in values) {
+      final normalised = LaunchPincodeConfig.normalise(value);
+      if (normalised.isNotEmpty) return normalised;
+    }
+    return null;
+  }
+
   void _updateStatus(String message) {
     if (mounted) {
       setState(() => _statusMessage = message);
@@ -974,9 +1034,9 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
               ),
             ),
             const SizedBox(height: AppSpacing.xxl),
-            if (_restoreFailed) ...[
+            if (_retryActionVisible) ...[
               const Icon(
-                Icons.cloud_off_outlined,
+                Icons.error_outline,
                 size: 44,
                 color: AppColors.textPrimary,
               ),

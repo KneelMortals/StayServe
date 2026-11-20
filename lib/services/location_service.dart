@@ -3,12 +3,15 @@ import 'dart:convert';
 
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
+import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/utils/app_logger.dart';
 
-final locationServiceProvider = Provider<LocationService>((ref) => LocationService());
+final locationServiceProvider = Provider<LocationService>(
+  (ref) => LocationService(),
+);
 
 /// The place the device is currently in.
 ///
@@ -46,14 +49,14 @@ class UserLocation {
   }
 
   Map<String, dynamic> toJson() => {
-        'latitude': latitude,
-        'longitude': longitude,
-        'pincode': pincode,
-        'address': address,
-        'city': city,
-        'state': state,
-        'updatedAt': updatedAt.toIso8601String(),
-      };
+    'latitude': latitude,
+    'longitude': longitude,
+    'pincode': pincode,
+    'address': address,
+    'city': city,
+    'state': state,
+    'updatedAt': updatedAt.toIso8601String(),
+  };
 
   factory UserLocation.fromJson(Map<String, dynamic> json) {
     return UserLocation(
@@ -63,7 +66,8 @@ class UserLocation {
       address: json['address'] as String?,
       city: json['city'] as String?,
       state: json['state'] as String?,
-      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
+      updatedAt:
+          DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
           DateTime.fromMillisecondsSinceEpoch(0),
     );
   }
@@ -92,7 +96,49 @@ class LocationService {
   /// which used to freeze the app on the splash screen forever.
   static const Duration geocodingTimeout = Duration(seconds: 8);
 
-  final Geocoding _geocoding = Geocoding();
+  /// Whether native reverse geocoding is available.
+  ///
+  /// The `geocoding` plugin implements Android, iOS and macOS only. Its
+  /// constructor force-unwraps the registered platform implementation, so
+  /// creating it in a browser throws `Unexpected null value`. The web build
+  /// therefore uses browser coordinates without a native geocoder and falls
+  /// back to manual pincode entry when a pincode is required.
+  bool get supportsReverseGeocoding => _geocoding != null;
+
+  /// Whether the platform exposes the device's location-settings screen.
+  ///
+  /// Browsers do not allow an app to open those settings, so the web UI must
+  /// not offer a button that can only fail.
+  bool get supportsSystemSettings => !_isWeb;
+
+  final Geocoding? _geocoding;
+  final bool _isWeb;
+
+  LocationService()
+    : _isWeb = kIsWeb,
+      _geocoding = kIsWeb ? null : _createGeocoding();
+
+  @visibleForTesting
+  LocationService.forTesting({
+    required bool isWeb,
+    Geocoding Function()? geocodingFactory,
+  }) : _isWeb = isWeb,
+       _geocoding = isWeb ? null : _createGeocoding(geocodingFactory);
+
+  static Geocoding? _createGeocoding([Geocoding Function()? geocodingFactory]) {
+    try {
+      return (geocodingFactory ?? () => Geocoding())();
+    } catch (e) {
+      // A platform without a registered geocoder must still be able to use
+      // the rest of the location service. Reverse geocoding is best-effort;
+      // the caller falls back to a manual pincode when it is unavailable.
+      AppLogger.warning(
+        'Native reverse geocoding is not available on this platform',
+        error: e,
+      );
+      return null;
+    }
+  }
 
   /// Check if location permission has been asked before
   Future<bool> hasAskedForPermission() async {
@@ -162,6 +208,26 @@ class LocationService {
   /// "the location could not be determined" even though the app knew
   /// perfectly well where the device was.
   Future<Position?> getCurrentPosition() async {
+    if (_isWeb) {
+      // The browser owns the permission prompt and can still return a
+      // position when its Permissions API is unavailable. Asking the
+      // permission manager first can therefore deny a valid browser fix.
+      try {
+        return await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 10),
+          ),
+        );
+      } catch (e) {
+        AppLogger.warning(
+          'The browser could not determine the current position',
+          error: e,
+        );
+        return null;
+      }
+    }
+
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       return null;
@@ -264,13 +330,18 @@ class LocationService {
 
   /// Get pincode from coordinates using reverse geocoding
   Future<String?> getPincodeFromPosition(Position position) async {
+    final geocoding = _geocoding;
+    if (geocoding == null) {
+      AppLogger.info(
+        'A pincode cannot be derived without native reverse geocoding',
+      );
+      return null;
+    }
+
     try {
       // The timeout is essential — see [geocodingTimeout].
-      final placemarks = await _geocoding
-          .placemarkFromCoordinates(
-            position.latitude,
-            position.longitude,
-          )
+      final placemarks = await geocoding
+          .placemarkFromCoordinates(position.latitude, position.longitude)
           .timeout(geocodingTimeout);
 
       if (placemarks.isNotEmpty) {
@@ -288,12 +359,15 @@ class LocationService {
 
   /// Get pincode from address string (fallback)
   Future<String?> getPincodeFromAddress(String address) async {
+    final geocoding = _geocoding;
+    if (geocoding == null) return null;
+
     try {
-      final locations = await _geocoding
+      final locations = await geocoding
           .locationFromAddress(address)
           .timeout(geocodingTimeout);
       if (locations.isNotEmpty) {
-        final placemarks = await _geocoding
+        final placemarks = await geocoding
             .placemarkFromCoordinates(
               locations.first.latitude,
               locations.first.longitude,
@@ -317,8 +391,11 @@ class LocationService {
   /// owner picks their location and the address, city, state and pincode are
   /// filled in for them.
   Future<Placemark?> reverseGeocode(double latitude, double longitude) async {
+    final geocoding = _geocoding;
+    if (geocoding == null) return null;
+
     try {
-      final placemarks = await _geocoding
+      final placemarks = await geocoding
           .placemarkFromCoordinates(latitude, longitude)
           .timeout(geocodingTimeout);
       return placemarks.isEmpty ? null : placemarks.first;
@@ -349,8 +426,17 @@ class LocationService {
     final clean = pincode.trim();
     if (clean.isEmpty) return null;
 
+    final geocoding = _geocoding;
+    if (geocoding == null) {
+      AppLogger.info(
+        'The pincode $clean cannot be turned into coordinates without native '
+        'reverse geocoding',
+      );
+      return null;
+    }
+
     try {
-      final locations = await _geocoding
+      final locations = await geocoding
           .locationFromAddress('$clean, India')
           .timeout(geocodingTimeout);
 
@@ -367,7 +453,7 @@ class LocationService {
       String? city;
       String? state;
       try {
-        final placemarks = await _geocoding
+        final placemarks = await geocoding
             .placemarkFromCoordinates(point.latitude, point.longitude)
             .timeout(geocodingTimeout);
         if (placemarks.isNotEmpty) {
@@ -504,7 +590,10 @@ class LocationService {
       );
     }
 
-    final placemark = await reverseGeocode(position.latitude, position.longitude);
+    final placemark = await reverseGeocode(
+      position.latitude,
+      position.longitude,
+    );
 
     final pincode = _firstNonEmpty([
       placemark?.postalCode,
@@ -569,11 +658,7 @@ class LocationResult {
   final String? pincode;
   final String? error;
 
-  LocationResult({
-    required this.success,
-    this.pincode,
-    this.error,
-  });
+  LocationResult({required this.success, this.pincode, this.error});
 }
 
 /// The outcome of a full location lookup.
