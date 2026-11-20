@@ -44,6 +44,15 @@ flutter {
     source = "../.."
 }
 
+dependencies {
+    // Firebase Components 18.0.1 explicitly keeps the no-argument
+    // constructors used to discover ComponentRegistrar implementations.
+    // AGP 9's strict R8 semantics require that constructor to be listed;
+    // firebase-components 18.0.0 only keeps the registrar classes and
+    // therefore breaks Firebase App Check in optimized release builds.
+    implementation("com.google.firebase:firebase-components:18.0.1")
+}
+
 // Firebase Auth 23.2.1 introduced encrypted session persistence backed by
 // the Android Keystore. On affected devices/firmware the key cannot be read
 // after the app is closed, so Firebase silently restores no user and StayServe
