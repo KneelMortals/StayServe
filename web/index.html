@@ -40,7 +40,62 @@
       min-height: 100%;
       background: #FFFFFF;
     }
+
+    #stayserve-loader {
+      position: fixed;
+      inset: 0;
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #FFFFFF;
+      transition: opacity 160ms ease;
+    }
+
+    #stayserve-loader img {
+      width: 144px;
+      height: 144px;
+      border-radius: 28px;
+      box-shadow: 0 18px 48px rgba(31, 14, 61, 0.14);
+    }
+
+    #stayserve-loader.is-hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
   </style>
+  <div id="stayserve-loader" role="status" aria-label="Loading StayServe">
+    <img src="icons/Icon-192.png" width="144" height="144" alt="StayServe">
+  </div>
+  <script>
+    (() => {
+      const loader = document.getElementById('stayserve-loader');
+      if (!loader) return;
+
+      const hideLoader = () => {
+        if (loader.classList.contains('is-hidden')) return;
+        loader.classList.add('is-hidden');
+        window.setTimeout(() => loader.remove(), 160);
+      };
+
+      window.addEventListener('flutter-first-frame', hideLoader, {once: true});
+      window.addEventListener('flutter:view-ready', hideLoader, {once: true});
+
+      const flutterViewObserver = new MutationObserver(() => {
+        if (!document.querySelector('flutter-view, flt-glass-pane')) return;
+        flutterViewObserver.disconnect();
+        hideLoader();
+      });
+      flutterViewObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+
+      // Never leave the branded loader covering the app if Flutter reports an
+      // initialization error before it can mount a view.
+      window.setTimeout(hideLoader, 15000);
+    })();
+  </script>
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader

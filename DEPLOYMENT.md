@@ -616,6 +616,34 @@ The rules are **fail-closed**: a profile without `registrationCompleted: true`
 or with `isActive: false` has no access at all. Backfill the legacy profiles
 (section 5.1.2) before the first deployment of these rules.
 
+### 5.6 Storage bucket CORS for the web client
+
+Storage rules and bucket CORS are separate Firebase configurations.
+`firebase deploy --only storage` updates the rules but **does not update the
+bucket's CORS metadata**. The Flutter web client needs CORS response headers
+to decode room photos; mobile clients work without them.
+
+The checked-in policy is `storage.cors.json`. It permits read-only `GET` and
+`HEAD` requests from the published Hosting domains and the local Flutter-web
+development origins on port 8080. Run local web development with
+`flutter run -d chrome --web-port=8080`. Verify the live bucket without
+changing it:
+
+```bash
+npm run storage:cors:check
+```
+
+After explicitly approving the production bucket change, apply the policy:
+
+```bash
+npm run storage:cors:apply
+```
+
+The apply command uses the bucket metageneration as a precondition, so it
+fails instead of overwriting a concurrent bucket-metadata update. It changes
+only CORS metadata; it does not modify Storage rules, room images, or Firestore
+data.
+
 ---
 
 ## 6. Building the app
@@ -802,7 +830,7 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    itself has **0** production advisories. The audit's suggested fix is an
    unsafe downgrade of `firebase-tools`, so it is intentionally not applied.
 7. **Some end-to-end paths still depend on external services.** The local
-   suite contains 340 Dart/widget tests, 461 backend callable
+   suite contains 311 Dart/widget tests, 461 backend callable
    state-machine/security checks, 170 Firestore-rules assertions and 30
    Storage-rules assertions. The private-location operator CLI has its own
    regression suite. Against production, the deployed-rules check reports 46

@@ -1,0 +1,17 @@
+[
+  {
+    "origin": [
+      "https://myfirstapp-fa30f52b.web.app",
+      "https://myfirstapp-fa30f52b.firebaseapp.com",
+      "http://localhost:8080",
+      "http://127.0.0.1:8080"
+    ],
+    "method": ["GET", "HEAD"],
+    "responseHeader": [
+      "Content-Type",
+      "Content-Encoding",
+      "Content-Length"
+    ],
+    "maxAgeSeconds": 3600
+  }
+]

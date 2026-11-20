@@ -14,7 +14,9 @@
     "test:callables": "tools/test_backend_callables.sh",
     "test:location-cli": "tools/test_private_location_cli.sh",
     "test:rules": "tools/test_firestore_rules.sh",
-    "test:storage-rules": "tools/test_storage_rules.sh"
+    "test:storage-rules": "tools/test_storage_rules.sh",
+    "storage:cors:check": "node tools/configure_storage_cors.mjs",
+    "storage:cors:apply": "node tools/configure_storage_cors.mjs --apply"
   },
   "keywords": [],
   "author": "",

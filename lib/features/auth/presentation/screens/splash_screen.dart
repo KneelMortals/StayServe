@@ -948,7 +948,16 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.home_outlined, size: 56, color: AppColors.primary),
+            Semantics(
+              label: 'StayServe logo',
+              image: true,
+              child: Image.asset(
+                'assets/images/logo.png',
+                width: 120,
+                height: 120,
+                fit: BoxFit.cover,
+              ),
+            ),
             const SizedBox(height: AppSpacing.xl),
             Text(
               AppConstants.appName,

@@ -156,6 +156,7 @@ profile; a fresh dry run reports `Already complete: 1, Legacy candidates: 0`).
 | `functions/src/` | the Cloud Functions |
 | `tools/` | maintenance scripts (admin promotion, rules tests, end-to-end checks) |
 | `firestore.rules`, `storage.rules` | the deployed security rules |
+| `storage.cors.json` | the bucket CORS policy used by the published web client |
 
 ---
 
@@ -163,7 +164,7 @@ profile; a fresh dry run reports `Already complete: 1, Legacy candidates: 0`).
 
 ```bash
 flutter analyze lib test      # expect: No issues found!
-flutter test                  # the Dart/widget regression suite (340 tests)
+flutter test                  # the Dart/widget regression suite (311 tests)
 flutter test --platform chrome test/web_firebase_config_test.dart # browser Firebase selection
 npm run test:functions        # backend unit/security and room checks
 npm run test:callables        # backend callable state-machine suite (461)
@@ -199,6 +200,10 @@ node tools/backfill_registration.mjs --apply   # legacy profiles get the marker
 firebase deploy --only functions
 firebase deploy --only firestore:rules,firestore:indexes
 firebase deploy --only storage
+
+# Bucket CORS is separate from Storage rules; required for web room photos.
+npm run storage:cors:check
+npm run storage:cors:apply
 
 flutter build apk --release
 ```
