@@ -4,10 +4,15 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Firebase Auth's saved session is encrypted with a device-bound
+         Android Keystore key. Backing up that ciphertext without the key
+         makes the session permanently unreadable after restore, causing the
+         user to be logged out on every launch. -->
     <application
         android:label="stayserve"
         android:name="${applicationName}"
-        android:icon="@mipmap/launcher_icon">
+        android:icon="@mipmap/launcher_icon"
+        android:allowBackup="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

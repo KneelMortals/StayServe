@@ -43,3 +43,15 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+// Firebase Auth 23.2.1 introduced encrypted session persistence backed by
+// the Android Keystore. On affected devices/firmware the key cannot be read
+// after the app is closed, so Firebase silently restores no user and StayServe
+// sends the user to the login screen on every cold start.
+//
+// Keep the last stable pre-encryption Auth artifact until the upstream
+// Keystore regression is fixed for every supported Android device.
+// https://github.com/firebase/firebase-android-sdk/issues/7651
+configurations.configureEach {
+    resolutionStrategy.force("com.google.firebase:firebase-auth:23.1.0")
+}
