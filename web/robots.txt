@@ -1,0 +1,23 @@
+User-agent: *
+Allow: /
+
+# Authentication and account areas contain no public search content.
+Disallow: /splash
+Disallow: /login
+Disallow: /register
+Disallow: /forgot-password
+Disallow: /role-selection
+Disallow: /verify-otp
+Disallow: /student/
+Disallow: /owner/
+Disallow: /admin/
+
+# Conversations, invoices, notifications, and authenticated room views are
+# private. Public legal and informational pages remain crawlable.
+Disallow: /chat/
+Disallow: /conversations
+Disallow: /invoice/
+Disallow: /notifications
+Disallow: /room/
+
+Sitemap: https://myfirstapp-fa30f52b.web.app/sitemap.xml

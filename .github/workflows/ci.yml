@@ -83,6 +83,9 @@ jobs:
       - name: Build the web release
         run: flutter build web --release
 
+      - name: Verify the web SEO assets
+        run: npm run web:seo:check
+
       - name: Build the Android release
         # A clean checkout does not track Flutter's generated Gradle wrapper.
         # The Flutter build restores it before the lint step runs below.

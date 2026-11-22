@@ -16,7 +16,8 @@
     "test:rules": "tools/test_firestore_rules.sh",
     "test:storage-rules": "tools/test_storage_rules.sh",
     "storage:cors:check": "node tools/configure_storage_cors.mjs",
-    "storage:cors:apply": "node tools/configure_storage_cors.mjs --apply"
+    "storage:cors:apply": "node tools/configure_storage_cors.mjs --apply",
+    "web:seo:check": "node tools/verify_web_seo.mjs build/web"
   },
   "keywords": [],
   "author": "",

@@ -662,12 +662,18 @@ Build and publish the web client separately:
 
 ```bash
 flutter build web --release
+npm run web:seo:check
 firebase deploy --only hosting --project myfirstapp-fa30f52b
 ```
 
-The web build selects the registered Web Firebase app automatically. Do not
-pass a reCAPTCHA site key until browser App Check has been registered and
-validated; without one, the client intentionally skips browser App Check.
+The web build selects the registered Web Firebase app automatically. The
+canonical-domain, robots, sitemap, Search Console, and custom-domain cutover
+procedure is documented in
+[`docs/DOMAIN_AND_SEARCH_READINESS.md`](docs/DOMAIN_AND_SEARCH_READINESS.md).
+Do not deploy Hosting until the approved custom-domain and canonical-origin
+cutover is complete. Do not pass a reCAPTCHA site key until browser App Check
+has been registered and validated; without one, the client intentionally skips
+browser App Check.
 
 There is **no `build_runner` step**. The models are hand-written, so code
 generation is not part of the build.
