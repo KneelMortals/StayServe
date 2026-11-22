@@ -19,7 +19,7 @@
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="StayServe helps students discover rooms, contact property owners, request bookings, and manage accommodation enquiries securely.">
-  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="robots" content="noindex, follow, max-image-preview:large">
   <meta name="application-name" content="StayServe">
   <meta name="theme-color" content="#FFFFFF">
 
@@ -32,13 +32,13 @@
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="StayServe">
-  <meta property="og:title" content="StayServe | Student Accommodation & Room Booking">
+  <meta property="og:title" content="StayServe | Student Accommodation and Room Booking">
   <meta property="og:description" content="Discover student rooms, contact property owners, request bookings, and manage your accommodation enquiries in one place.">
   <meta property="og:url" content="https://myfirstapp-fa30f52b.web.app/">
   <meta property="og:image" content="https://myfirstapp-fa30f52b.web.app/icons/Icon-512.png">
   <meta property="og:image:alt" content="StayServe logo">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="StayServe | Student Accommodation & Room Booking">
+  <meta name="twitter:title" content="StayServe | Student Accommodation and Room Booking">
   <meta name="twitter:description" content="Discover student rooms, contact property owners, request bookings, and manage your accommodation enquiries in one place.">
   <meta name="twitter:image" content="https://myfirstapp-fa30f52b.web.app/icons/Icon-512.png">
 
@@ -60,12 +60,19 @@
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
-  <link rel="icon" type="image/png" href="favicon.png"/>
+  <link rel="icon" type="image/png" href="favicon.png">
 
-  <title>StayServe | Student Accommodation & Room Booking</title>
+  <title>StayServe | Student Accommodation and Room Booking</title>
   <link rel="manifest" href="manifest.json">
-</head>
-<body>
+
+  <noscript>
+    <style>
+      #stayserve-loader {
+        display: none;
+      }
+    </style>
+  </noscript>
+
   <style>
     html, body {
       margin: 0;
@@ -95,10 +102,27 @@
       opacity: 0;
       pointer-events: none;
     }
+
+    .noscript-message {
+      max-width: 720px;
+      margin: 48px auto;
+      padding: 24px;
+      color: #172019;
+      font: 16px/1.6 system-ui, sans-serif;
+      text-align: center;
+    }
   </style>
+</head>
+<body>
   <div id="stayserve-loader" role="status" aria-label="Loading StayServe">
     <img src="icons/Icon-192.png" width="144" height="144" alt="StayServe">
   </div>
+  <noscript>
+    <div class="noscript-message">
+      StayServe needs JavaScript for the sign-in and accommodation workspace.
+      <a href="/home/">Read about StayServe</a> or enable JavaScript to continue.
+    </div>
+  </noscript>
   <script>
     (() => {
       const loader = document.getElementById('stayserve-loader');

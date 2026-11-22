@@ -80,6 +80,9 @@ jobs:
       - name: Run the function and security-rules tests
         run: npm test
 
+      - name: Validate the public HTML
+        run: npm run web:html:check
+
       - name: Build the web release
         run: flutter build web --release
 

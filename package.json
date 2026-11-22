@@ -9,21 +9,27 @@
     "test": "test"
   },
   "scripts": {
-    "test": "npm run test:functions && npm run test:callables && npm run test:location-cli && npm run test:rules && npm run test:storage-rules",
+    "test": "npm run test:functions && npm run test:callables && npm run test:location-cli && npm run test:rules && npm run test:storage-rules && npm run test:domain",
     "test:functions": "npm --prefix functions run build && node tools/functions_unit_test.mjs && node functions/test/rooms_unit_test.mjs && node functions/test/room_location_unit_test.mjs && node functions/test/otp_atomicity_test.mjs && tools/test_batches.sh",
     "test:callables": "tools/test_backend_callables.sh",
     "test:location-cli": "tools/test_private_location_cli.sh",
     "test:rules": "tools/test_firestore_rules.sh",
     "test:storage-rules": "tools/test_storage_rules.sh",
+    "test:domain": "node --test tools/domain_cutover_test.mjs",
     "storage:cors:check": "node tools/configure_storage_cors.mjs",
     "storage:cors:apply": "node tools/configure_storage_cors.mjs --apply",
-    "web:seo:check": "node tools/verify_web_seo.mjs build/web"
+    "web:html:check": "html-validate web/index.html web/home/index.html web/terms/index.html web/privacy-policy/index.html",
+    "web:seo:check": "node tools/verify_web_seo.mjs build/web",
+    "domain:status": "node tools/domain_cutover.mjs status",
+    "domain:attach": "node tools/domain_cutover.mjs attach",
+    "domain:align": "node tools/domain_cutover.mjs align"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
-    "firebase-tools": "^15.36.0"
+    "firebase-tools": "^15.36.0",
+    "html-validate": "^11.21.1"
   }
 }

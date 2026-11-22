@@ -33,6 +33,7 @@ if (!fs.existsSync(outputDirectory)) {
 const robots = read('robots.txt');
 const sitemap = read('sitemap.xml');
 const index = read('index.html');
+const landing = read(path.join('home', 'index.html'));
 const terms = read(path.join('terms', 'index.html'));
 const privacy = read(path.join('privacy-policy', 'index.html'));
 
@@ -60,6 +61,26 @@ if (!sitemapMatch) {
     'index.html Open Graph metadata',
   );
   requireText(
+    index,
+    'name="robots" content="noindex, follow',
+    'index.html robots metadata',
+  );
+  requireText(
+    landing,
+    `<link rel="canonical" href="${origin}/home/">`,
+    'home/index.html canonical metadata',
+  );
+  requireText(
+    landing,
+    `<meta property="og:url" content="${origin}/home/">`,
+    'home/index.html Open Graph metadata',
+  );
+  requireText(
+    landing,
+    'name="robots" content="index, follow',
+    'home/index.html robots metadata',
+  );
+  requireText(
     terms,
     `<link rel="canonical" href="${origin}/terms/">`,
     'terms/index.html canonical metadata',
@@ -73,18 +94,28 @@ if (!sitemapMatch) {
   const locations = [...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map(
     (match) => new URL(match[1]),
   );
-  const expectedPaths = new Set(['/', '/terms/', '/privacy-policy/']);
+  const expectedPaths = new Set(['/home/', '/terms/', '/privacy-policy/']);
   if (locations.length !== expectedPaths.size) {
     failures.push(
       `sitemap.xml must contain ${expectedPaths.size} public URLs; found ${locations.length}`,
     );
   }
+  const foundPaths = new Set();
   for (const location of locations) {
     if (location.origin !== origin) {
       failures.push(`Sitemap URL uses a different origin: ${location.href}`);
     }
     if (!expectedPaths.has(location.pathname)) {
       failures.push(`Sitemap contains an unexpected URL: ${location.href}`);
+    }
+    if (foundPaths.has(location.pathname)) {
+      failures.push(`Sitemap contains a duplicate URL: ${location.href}`);
+    }
+    foundPaths.add(location.pathname);
+  }
+  for (const expectedPath of expectedPaths) {
+    if (!foundPaths.has(expectedPath)) {
+      failures.push(`Sitemap is missing the public URL path ${expectedPath}`);
     }
   }
 }
@@ -125,6 +156,11 @@ if (baseUrl) {
       path: '/sitemap.xml',
       expectedContentType: /(application|text)\/xml/,
       expectedBody: sitemap,
+    },
+    {
+      path: '/home/',
+      expectedContentType: /text\/html/,
+      expectedBody: landing,
     },
     {
       path: '/terms/',

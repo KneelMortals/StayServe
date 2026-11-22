@@ -23,7 +23,32 @@ void main() {
     expect(index, contains('<html lang="en">'));
     expect(index, contains('<link rel="canonical" href="$origin/">'));
     expect(index, contains('<meta property="og:url" content="$origin/">'));
-    expect(index, contains('name="robots" content="index, follow'));
+    expect(index, contains('name="robots" content="noindex, follow'));
+
+    final landing = await File('web/home/index.html').readAsString();
+    expect(landing, contains('<link rel="canonical" href="$origin/home/">'));
+    expect(
+      landing,
+      contains('<meta property="og:url" content="$origin/home/">'),
+    );
+    expect(landing, contains('name="robots" content="index, follow'));
+    expect(landing, contains('<h1>Find your next student room'));
+    expect(landing, contains('href="/terms/"'));
+    expect(landing, contains('href="/privacy-policy/"'));
+
+    final landingStructuredDataMatch = RegExp(
+      r'<script type="application/ld\+json">\s*([\s\S]*?)\s*</script>',
+    ).firstMatch(landing);
+    expect(landingStructuredDataMatch, isNotNull);
+    final landingStructuredData =
+        jsonDecode(landingStructuredDataMatch!.group(1)!)
+            as Map<String, dynamic>;
+    final graph = (landingStructuredData['@graph'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    expect(
+      graph.map((entry) => entry['@type']),
+      containsAll(['WebSite', 'Organization', 'WebPage']),
+    );
 
     final structuredDataMatch = RegExp(
       r'<script type="application/ld\+json">\s*([\s\S]*?)\s*</script>',
@@ -60,8 +85,9 @@ void main() {
       r'<loc>([^<]+)</loc>',
     ).allMatches(sitemap).map((match) => Uri.parse(match.group(1)!)).toList();
 
-    expect(locations.map((uri) => uri.path), {
-      '/',
+    expect(locations, hasLength(3));
+    expect(locations.map((uri) => uri.path).toSet(), {
+      '/home/',
       '/terms/',
       '/privacy-policy/',
     });

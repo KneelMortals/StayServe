@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Find Student Accommodation and Book Rooms | StayServe</title>
+<meta name="description" content="StayServe helps students discover rooms, send booking enquiries, chat with property owners, and manage accommodation requests in one place.">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="application-name" content="StayServe">
+<meta name="theme-color" content="#1B5E20">
+<link rel="canonical" href="https://myfirstapp-fa30f52b.web.app/home/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="StayServe">
+<meta property="og:title" content="Find Student Accommodation and Book Rooms | StayServe">
+<meta property="og:description" content="Discover student rooms, contact property owners, request bookings, and manage your accommodation enquiries in one place.">
+<meta property="og:url" content="https://myfirstapp-fa30f52b.web.app/home/">
+<meta property="og:image" content="https://myfirstapp-fa30f52b.web.app/icons/Icon-512.png">
+<meta property="og:image:alt" content="StayServe logo">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Find Student Accommodation and Book Rooms | StayServe">
+<meta name="twitter:description" content="Discover student rooms, contact property owners, request bookings, and manage your accommodation enquiries in one place.">
+<meta name="twitter:image" content="https://myfirstapp-fa30f52b.web.app/icons/Icon-512.png">
+<link rel="icon" type="image/png" href="../icons/Icon-512.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://myfirstapp-fa30f52b.web.app/#website",
+      "url": "https://myfirstapp-fa30f52b.web.app/",
+      "name": "StayServe",
+      "description": "A student accommodation and room booking platform.",
+      "inLanguage": "en"
+    },
+    {
+      "@type": "Organization",
+      "@id": "https://myfirstapp-fa30f52b.web.app/#organization",
+      "url": "https://myfirstapp-fa30f52b.web.app/",
+      "name": "StayServe",
+      "logo": {
+        "@type": "ImageObject",
+        "url": "https://myfirstapp-fa30f52b.web.app/icons/Icon-512.png"
+      }
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://myfirstapp-fa30f52b.web.app/home/#webpage",
+      "url": "https://myfirstapp-fa30f52b.web.app/home/",
+      "name": "Find Student Accommodation & Book Rooms | StayServe",
+      "description": "Discover student rooms, contact property owners, request bookings, and manage your accommodation enquiries in one place.",
+      "isPartOf": {
+        "@id": "https://myfirstapp-fa30f52b.web.app/#website"
+      },
+      "about": {
+        "@id": "https://myfirstapp-fa30f52b.web.app/#organization"
+      },
+      "inLanguage": "en"
+    }
+  ]
+}
+</script>
+<style>
+:root {
+  --green-900: #123f18;
+  --green-800: #1b5e20;
+  --green-700: #2e7d32;
+  --green-100: #e8f5e9;
+  --blue-700: #1565c0;
+  --blue-100: #e3f2fd;
+  --ink: #172019;
+  --muted: #536158;
+  --surface: #ffffff;
+  --surface-soft: #f4f8f4;
+  --line: #dce7de;
+  --shadow: 0 18px 48px rgba(27, 94, 32, 0.12);
+}
+* {
+  box-sizing: border-box;
+}
+html {
+  scroll-behavior: smooth;
+}
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--surface-soft);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.65;
+}
+a {
+  color: var(--green-800);
+}
+img {
+  display: block;
+  max-width: 100%;
+}
+.container {
+  width: min(1120px, calc(100% - 40px));
+  margin: 0 auto;
+}
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  border-bottom: 1px solid rgba(220, 231, 222, 0.85);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(12px);
+}
+.header-inner {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  color: var(--green-900);
+  font-size: 1.18rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+.brand img {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  box-shadow: 0 8px 20px rgba(27, 94, 32, 0.14);
+}
+.header-actions,
+.hero-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.button {
+  display: inline-flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 18px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+.button:hover {
+  transform: translateY(-1px);
+}
+.button-primary {
+  color: #ffffff;
+  background: var(--green-800);
+  box-shadow: 0 10px 24px rgba(27, 94, 32, 0.2);
+}
+.button-secondary {
+  color: var(--green-900);
+  border-color: #b9cfbc;
+  background: #ffffff;
+}
+.button:focus-visible,
+a:focus-visible {
+  outline: 3px solid rgba(21, 101, 192, 0.45);
+  outline-offset: 3px;
+}
+.hero {
+  position: relative;
+  overflow: hidden;
+  padding: 86px 0 76px;
+  background:
+    radial-gradient(circle at 90% 12%, rgba(21, 101, 192, 0.14), transparent 31%),
+    radial-gradient(circle at 8% 90%, rgba(76, 175, 80, 0.18), transparent 33%),
+    linear-gradient(180deg, #ffffff 0%, #f4f8f4 100%);
+}
+.hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.12fr) minmax(320px, 0.88fr);
+  align-items: center;
+  gap: 68px;
+}
+.eyebrow {
+  margin: 0 0 14px;
+  color: var(--green-700);
+  font-size: 0.86rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+h1,
+h2,
+h3 {
+  margin-top: 0;
+  color: var(--green-900);
+  line-height: 1.16;
+}
+h1 {
+  max-width: 780px;
+  margin-bottom: 22px;
+  font-size: clamp(2.35rem, 6vw, 4.55rem);
+  letter-spacing: -0.045em;
+}
+.lead {
+  max-width: 720px;
+  margin: 0 0 30px;
+  color: var(--muted);
+  font-size: clamp(1.05rem, 2.2vw, 1.25rem);
+}
+.hero-card {
+  padding: 30px;
+  border: 1px solid rgba(185, 207, 188, 0.8);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow);
+}
+.hero-card h2 {
+  margin-bottom: 20px;
+  font-size: 1.35rem;
+}
+.journey {
+  display: grid;
+  gap: 17px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.journey li {
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  align-items: start;
+  gap: 12px;
+}
+.journey-number {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--green-900);
+  background: var(--green-100);
+  font-weight: 800;
+}
+.journey strong {
+  display: block;
+  color: var(--ink);
+}
+.journey span {
+  color: var(--muted);
+  font-size: 0.96rem;
+}
+.section {
+  padding: 76px 0;
+}
+.section-white {
+  background: var(--surface);
+}
+.section-heading {
+  max-width: 720px;
+  margin-bottom: 38px;
+}
+.section-heading h2 {
+  margin-bottom: 12px;
+  font-size: clamp(1.85rem, 4vw, 2.65rem);
+  letter-spacing: -0.025em;
+}
+.section-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.05rem;
+}
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+.feature-card {
+  padding: 25px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: #ffffff;
+}
+.feature-icon {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  margin-bottom: 18px;
+  place-items: center;
+  border-radius: 14px;
+  color: var(--green-900);
+  background: var(--green-100);
+  font-size: 1.35rem;
+}
+.feature-card h3 {
+  margin-bottom: 8px;
+  font-size: 1.12rem;
+}
+.feature-card p {
+  margin: 0;
+  color: var(--muted);
+}
+.privacy-callout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 30px;
+  padding: 30px 34px;
+  border-radius: 20px;
+  color: #ffffff;
+  background: linear-gradient(135deg, var(--green-900), var(--green-700));
+}
+.privacy-callout h2 {
+  margin-bottom: 8px;
+  color: #ffffff;
+  font-size: 1.65rem;
+}
+.privacy-callout p {
+  max-width: 760px;
+  margin: 0;
+  color: rgba(255, 255, 255, 0.84);
+}
+.privacy-callout .button {
+  color: var(--green-900);
+  background: #ffffff;
+}
+.owner-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+  align-items: center;
+  gap: 54px;
+  padding: 38px;
+  border: 1px solid #cddff2;
+  border-radius: 24px;
+  background: linear-gradient(135deg, #ffffff, var(--blue-100));
+}
+.owner-panel h2 {
+  margin-bottom: 12px;
+  font-size: clamp(1.8rem, 4vw, 2.5rem);
+}
+.owner-panel p {
+  color: var(--muted);
+}
+.owner-list {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.owner-list li {
+  padding: 14px 16px;
+  border: 1px solid #d7e5f3;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  font-weight: 650;
+}
+.faq {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.faq article {
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #ffffff;
+}
+.faq h3 {
+  margin-bottom: 8px;
+  font-size: 1.08rem;
+}
+.faq p {
+  margin: 0;
+  color: var(--muted);
+}
+.cta {
+  padding: 70px 0;
+  text-align: center;
+}
+.cta h2 {
+  margin-bottom: 10px;
+  font-size: clamp(1.9rem, 4vw, 2.7rem);
+}
+.cta p {
+  max-width: 660px;
+  margin: 0 auto 26px;
+  color: var(--muted);
+}
+.cta .hero-actions {
+  justify-content: center;
+}
+.site-footer {
+  padding: 38px 0 28px;
+  border-top: 1px solid var(--line);
+  background: #ffffff;
+}
+.footer-grid {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 30px;
+}
+.footer-copy {
+  max-width: 520px;
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 18px;
+}
+.footer-links a {
+  font-weight: 650;
+}
+.footer-bottom {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-align: center;
+}
+@media (max-width: 900px) {
+  .hero-grid,
+  .owner-panel {
+    grid-template-columns: 1fr;
+  }
+  .hero-grid {
+    gap: 42px;
+  }
+  .feature-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .privacy-callout {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 640px) {
+  .container {
+    width: min(100% - 28px, 1120px);
+  }
+  .header-inner {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 14px 0;
+  }
+  .header-actions {
+    width: 100%;
+  }
+  .header-actions .button {
+    flex: 1;
+  }
+  .hero {
+    padding: 58px 0 52px;
+  }
+  .section {
+    padding: 58px 0;
+  }
+  .feature-grid,
+  .faq {
+    grid-template-columns: 1fr;
+  }
+  .hero-card,
+  .owner-panel,
+  .privacy-callout {
+    padding: 22px;
+  }
+  .footer-grid {
+    flex-direction: column;
+  }
+  .footer-links {
+    justify-content: flex-start;
+  }
+}
+</style>
+</head>
+<body>
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="/home/" aria-label="StayServe home">
+      <img src="../icons/Icon-512.png" width="42" height="42" alt="">
+      <span>StayServe</span>
+    </a>
+    <nav class="header-actions" aria-label="Account actions">
+      <a class="button button-secondary" href="/login" rel="nofollow">Sign in</a>
+      <a class="button button-primary" href="/register" rel="nofollow">Create account</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="container hero-grid">
+      <div>
+        <p class="eyebrow">Student accommodation, organised</p>
+        <h1>Find your next student room with less searching and more clarity.</h1>
+        <p class="lead">StayServe brings room discovery, booking enquiries, owner conversations, payment status, and request tracking into one calm, secure workflow.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="/register" rel="nofollow">Get started</a>
+          <a class="button button-secondary" href="#how-it-works">See how it works</a>
+        </div>
+      </div>
+      <aside class="hero-card" aria-labelledby="journey-title">
+        <h2 id="journey-title">A clearer accommodation journey</h2>
+        <ol class="journey">
+          <li>
+            <span class="journey-number">1</span>
+            <div><strong>Discover a room</strong><span>Search by location, budget, and the features that matter to you.</span></div>
+          </li>
+          <li>
+            <span class="journey-number">2</span>
+            <div><strong>Request and discuss</strong><span>Send a booking enquiry and keep the conversation with the owner in StayServe.</span></div>
+          </li>
+          <li>
+            <span class="journey-number">3</span>
+            <div><strong>Track the outcome</strong><span>Follow request, payment, and activation status without chasing separate threads.</span></div>
+          </li>
+        </ol>
+      </aside>
+    </div>
+  </section>
+
+  <section class="section section-white" id="features">
+    <div class="container">
+      <div class="section-heading">
+        <h2>Everything you need after the room search starts</h2>
+        <p>StayServe is designed around the real handoffs between students and property owners, so each next step stays visible and actionable.</p>
+      </div>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <div class="feature-icon" aria-hidden="true">⌂</div>
+          <h3>Room discovery</h3>
+          <p>Browse available student rooms and review the listing details before you make an enquiry.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon" aria-hidden="true">✦</div>
+          <h3>Booking requests</h3>
+          <p>Send a request for the room you want and see each stage of the owner’s response.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon" aria-hidden="true">☏</div>
+          <h3>Direct conversations</h3>
+          <p>Keep questions and decisions tied to the room and request they belong to.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon" aria-hidden="true">₹</div>
+          <h3>Payment visibility</h3>
+          <p>Record the payment reference and follow the verification status from one place.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon" aria-hidden="true">✓</div>
+          <h3>Request tracking</h3>
+          <p>Understand whether a request is pending, accepted, cancelled, paid, or activated.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon" aria-hidden="true">◉</div>
+          <h3>Private location details</h3>
+          <p>Exact addresses stay protected and become available to an accepted student when needed.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="how-it-works">
+    <div class="container">
+      <div class="privacy-callout">
+        <div>
+          <h2>Your accommodation search should not feel like a spreadsheet.</h2>
+          <p>StayServe keeps the room, conversation, request, and payment trail connected so students and owners always know what happens next.</p>
+        </div>
+        <a class="button" href="/register" rel="nofollow">Create your account</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-white" id="owners">
+    <div class="container">
+      <div class="owner-panel">
+        <div>
+          <h2>List a room without losing sight of every enquiry.</h2>
+          <p>Owners can publish room details and photos, respond to booking requests, manage conversations, and follow payment and occupancy state from a dedicated workspace.</p>
+          <a class="button button-primary" href="/register" rel="nofollow">Register as an owner</a>
+        </div>
+        <ul class="owner-list">
+          <li>Publish and update room listings</li>
+          <li>Review interested students and their requests</li>
+          <li>Accept or decline enquiries with a clear record</li>
+          <li>Manage room availability and occupancy</li>
+          <li>Track invoices and payment verification</li>
+          <li>Protect private location information</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="questions">
+    <div class="container">
+      <div class="section-heading">
+        <h2>Questions before you begin</h2>
+        <p>StayServe keeps the workflow explicit so students and owners can make informed decisions.</p>
+      </div>
+      <div class="faq">
+        <article>
+          <h3>Do I need an account to browse?</h3>
+          <p>Browsing and account actions are part of the protected application experience, so use an account to access listings and submit an enquiry.</p>
+        </article>
+        <article>
+          <h3>Does a request guarantee a booking?</h3>
+          <p>No. A request starts an enquiry. The room becomes yours only after the relevant owner and booking steps are confirmed.</p>
+        </article>
+        <article>
+          <h3>How is my exact address protected?</h3>
+          <p>Public listings show only the coarse location information needed for discovery. Exact location details are restricted to the appropriate owner and accepted student.</p>
+        </article>
+        <article>
+          <h3>Can I block an unwanted conversation?</h3>
+          <p>Yes. Blocking keeps existing message history available while preventing new messages and further booking progression between the two accounts.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta">
+    <div class="container">
+      <h2>Ready to find a place that works for your student life?</h2>
+      <p>Create a StayServe account to discover rooms and manage your accommodation journey from the first enquiry onwards.</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="/register" rel="nofollow">Create account</a>
+        <a class="button button-secondary" href="/login" rel="nofollow">Sign in</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div>
+        <a class="brand" href="/home/">
+          <img src="../icons/Icon-512.png" width="38" height="38" alt="">
+          <span>StayServe</span>
+        </a>
+        <p class="footer-copy">A student accommodation platform for discovering rooms, requesting bookings, and keeping every accommodation conversation connected.</p>
+      </div>
+      <nav class="footer-links" aria-label="Legal and information links">
+        <a href="/home/">About StayServe</a>
+        <a href="/terms/">Terms of Service</a>
+        <a href="/privacy-policy/">Privacy Policy</a>
+      </nav>
+    </div>
+    <div class="footer-bottom">© 2026 StayServe. All rights reserved.</div>
+  </div>
+</footer>
+</body>
+</html>

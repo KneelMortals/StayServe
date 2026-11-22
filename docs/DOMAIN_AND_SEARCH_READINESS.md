@@ -27,22 +27,33 @@ The web source now contains:
 
 - `web/robots.txt`, with private application routes disallowed and an
   absolute sitemap declaration;
-- `web/sitemap.xml`, containing only the public home, terms, and privacy
+- `web/sitemap.xml`, containing only the public landing, terms, and privacy
   URLs;
+- `web/home/index.html`, a responsive, static public landing page with
+  meaningful student and owner content, account links, and legal links;
 - one self-referential canonical URL per public HTML page;
-- Open Graph and Twitter metadata for the app shell and legal pages;
-- `WebSite` structured data in `web/index.html`;
+- Open Graph and Twitter metadata for the landing, app shell, and legal pages;
+- `WebSite`, `Organization`, and `WebPage` structured data for the landing;
+- a `noindex, follow` directive on the authenticated app shell, so it cannot
+  compete with the public landing page;
 - a language declaration and crawl directives on every public HTML page;
 - cache headers for the crawler files in `firebase.json`;
 - `test/web_seo_test.dart`, which keeps canonical URLs, sitemap entries,
   robots rules, and the Storage CORS allowlist consistent;
 - `tools/verify_web_seo.mjs`, which verifies the actual Flutter web build
-  output after `flutter build web --release`.
+  output after `flutter build web --release`;
+- HTML5 validation for every public HTML page;
+- `tools/domain_cutover.mjs`, an idempotent helper that reports Firebase's
+  exact DNS records, attaches the canonical domain and optional `www` redirect,
+  and updates checked-in canonical URLs only after remote readiness checks;
+- unit tests for the cutover helper's safety gates and idempotent behavior.
 
 Validate the source and build output with:
 
 ```bash
 flutter test test/web_seo_test.dart
+npm run test:domain
+npm run web:html:check
 flutter build web --release
 npm run web:seo:check
 ```
@@ -100,44 +111,77 @@ During checkout:
 Do not change nameservers or DNS records as part of the purchase. Firebase must
 issue the exact records for this Hosting site first.
 
-### 2. Choose the canonical hostname
+### 2. Confirm the canonical hostname
 
-Choose either the apex or `www` as the canonical hostname. Prefer the apex
-(`https://stayserve.co.in`) unless there is a specific reason not to. The
-other hostname should redirect permanently to the canonical host.
+Use the apex (`https://stayserve.co.in`) as the canonical hostname. The
+`www` hostname must redirect permanently to the apex.
 
 ### 3. Attach the domain to Firebase Hosting
 
-In the Firebase console, open **Hosting → myfirstapp-fa30f52b → Add custom
-domain**.
+After the registrar confirms the registration, inspect Firebase's current
+state without changing anything:
 
-- Use **Quick Setup** for `stayserve.co.in`, because it is a new domain that
-  does not currently receive traffic.
-- Use **Advanced Setup** only if the domain becomes an existing live site
-  before the cutover, so the old host can remain online until Firebase has
-  verified ownership and provisioned TLS.
+```bash
+npm run domain:status
+```
 
-Follow the exact records displayed by the Firebase wizard. A typical setup
-includes:
+Then attach the canonical domain and the permanent `www` redirect. The attach
+operation is idempotent: running it again when the mappings already exist
+makes no remote change.
+
+```bash
+npm run domain:attach -- \
+  --confirm-domain=stayserve.co.in \
+  --include-www
+```
+
+The helper attaches only the domain mappings. It does **not** change DNS,
+apply Storage CORS, or deploy Hosting. It prints the exact records Firebase
+requires. Apply each row according to its `ACTION` value: `ADD` means add the
+record, `REMOVE` means remove the conflicting record, and `NONE` means no DNS
+change is required. A setup commonly includes:
 
 1. a Firebase-provided TXT ownership record at the apex;
-2. the Firebase-provided A/AAAA records for the chosen hostname;
-3. a CNAME for `www` when it is used as a separate hostname.
+2. the Firebase-provided A/AAAA records for each hostname;
+3. any additional record type Firebase explicitly requests for that hostname.
 
-Keep the Firebase ownership TXT record permanently so Firebase can renew the
-managed certificate. Remove conflicting A, CNAME, and AAAA records only when
-the selected setup mode says it is safe to do so. DNS propagation and managed
-certificate provisioning can take up to 24 hours.
+Use only the current records printed by Firebase; do not assume that every
+hostname uses the same record type. Keep the Firebase ownership TXT record
+permanently so Firebase can renew the managed certificate. Remove conflicting
+A, CNAME, and AAAA records only when Firebase says it is safe to do so. DNS
+propagation and managed certificate provisioning can take up to 24 hours.
 
-Firebase provisions and renews the TLS certificate automatically. The domain
-must show **Connected** before the cutover is considered complete.
+If the CLI session lacks the required permission, use the Firebase console
+instead: **Hosting → myfirstapp-fa30f52b → Add custom domain**. Use **Quick
+Setup** for the new domain. Use **Advanced Setup** only if the domain becomes
+an existing live site before the cutover.
+
+Run `npm run domain:status` again while DNS propagates. Firebase provisions
+and renews the TLS certificate automatically. The domain is ready only when
+DNS ownership, host routing, and the TLS certificate all report active.
 
 ### 4. Align all checked-in public URLs
 
-After the hostname is attached, update the canonical origin in every file
-below before building or deploying:
+After Firebase reports the domain fully active, preview the local changes:
+
+```bash
+npm run domain:align -- --confirm-domain=stayserve.co.in
+```
+
+Review the listed files, then apply the same idempotent operation:
+
+```bash
+npm run domain:align -- \
+  --confirm-domain=stayserve.co.in \
+  --apply
+```
+
+The helper refuses to align anything until Firebase reports DNS ownership,
+host routing, and TLS certificate as active. It updates the canonical origin
+in:
 
 - `web/index.html`
+- `web/home/index.html`
 - `web/terms/index.html`
 - `web/privacy-policy/index.html`
 - `web/robots.txt`
@@ -145,7 +189,15 @@ below before building or deploying:
 - `storage.cors.json` (the canonical origin must be allowed to read room
   photos)
 
-The SEO tests and `npm run web:seo:check` fail if these values drift apart.
+It changes checked-in files only. It does not apply the production Storage
+CORS policy or deploy Hosting. After the source is aligned, validate it with:
+
+```bash
+flutter test test/web_seo_test.dart
+npm run test:domain
+npm run web:html:check
+```
+
 Keep the Firebase-generated domain as a fallback only while the custom domain
 is unavailable; do not publish conflicting canonicals.
 
@@ -153,8 +205,19 @@ is unavailable; do not publish conflicting canonicals.
 
 ```bash
 flutter test test/web_seo_test.dart
+npm run test:domain
+npm run web:html:check
 flutter build web --release
 npm run web:seo:check
+```
+
+After separately approving the production Storage CORS change, check and then
+apply the checked-in policy. The first command is read-only; the second
+changes production bucket metadata:
+
+```bash
+npm run storage:cors:check
+npm run storage:cors:apply
 ```
 
 After an explicitly approved Hosting release, verify:
@@ -163,6 +226,7 @@ After an explicitly approved Hosting release, verify:
 curl -I https://THE-CANONICAL-HOST/
 curl -I https://THE-CANONICAL-HOST/robots.txt
 curl -I https://THE-CANONICAL-HOST/sitemap.xml
+curl -I https://THE-CANONICAL-HOST/home/
 curl -I https://THE-CANONICAL-HOST/terms/
 curl -I https://THE-CANONICAL-HOST/privacy-policy/
 ```
@@ -187,9 +251,9 @@ Domain property covers the apex, `www`, and both HTTP and HTTPS variants.
 4. Wait until the property is verified.
 5. In **Sitemaps**, submit:
    `https://THE-CANONICAL-HOST/sitemap.xml`
-6. Use **URL Inspection** on the canonical home page and the two legal URLs.
-   Confirm that each URL is fetchable, has the expected canonical, and is
-   allowed for indexing, then request indexing for the home page.
+6. Use **URL Inspection** on the public landing page (`/home/`) and the two
+   legal URLs. Confirm that each URL is fetchable, has the expected canonical,
+   and is allowed for indexing, then request indexing for the landing page.
 7. Monitor **Pages** and **Sitemaps** for fetch, rendering, and canonical
    errors. A manual indexing request is a hint, not a guarantee, and may take
    days.
@@ -199,17 +263,17 @@ confirm ownership in the Search Console UI. The current Firebase CLI session
 can manage the Firebase project, but that does not grant Search Console
 property access.
 
-## Important SPA limitation
+## Authenticated app versus public search content
 
-Google can render JavaScript, but StayServe is an authenticated Flutter
-single-page application. Its root currently leads into the startup/login
-flow, while private routes are deliberately excluded from crawling. The static
-title, description, canonical, structured data, sitemap, and legal pages make
-the site technically crawlable, but they do not create a substantial public
-landing page.
+Google can render JavaScript, but StayServe's root is an authenticated Flutter
+application shell. It therefore carries `noindex, follow`, and all private
+application routes remain excluded from crawling and the sitemap.
 
-For meaningful organic search traffic, add a public, indexable landing page
-with real descriptive content and crawlable links before requesting indexing.
-That page should use the same canonical origin and should not require an
-account. Do not represent authenticated listings or profiles as public pages
-unless their content is intentionally public and rendered for crawlers.
+Meaningful public search content is served separately at `/home/` as static,
+responsive HTML. It does not require an account, has its own canonical and
+structured data, and links to the terms and privacy pages. The authenticated
+app shell remains available at `/` without competing with that landing page in
+search results.
+
+Do not represent authenticated listings or profiles as public pages unless
+their content is intentionally public and rendered for crawlers.
