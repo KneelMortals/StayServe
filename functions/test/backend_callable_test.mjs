@@ -54,6 +54,13 @@ const {
   verifyPayment,
 } = require(path.join(ROOT, 'lib', 'payments.js'));
 const {
+  getConversationInteractionDetails,
+  getBookingInteractionDetails,
+  getRoomContactDetails,
+  blockUser,
+  unblockUser,
+} = require(path.join(ROOT, 'lib', 'interactions.js'));
+const {
   setUserRole,
   banUser,
   unbanUser,
@@ -294,7 +301,16 @@ async function reset() {
   for (const conversation of conversations.docs) {
     const messages = await conversation.ref.collection('messages').get();
     await Promise.all(messages.docs.map((message) => message.ref.delete()));
+    const contexts = await conversation.ref.collection('contexts').get();
+    await Promise.all(contexts.docs.map((context) => context.ref.delete()));
   }
+
+  // Personal blocks live in a subcollection whose parent document is never
+  // created. A collection-group query is therefore required; listing only
+  // `userBlocks` would leave the directional blocks behind and contaminate
+  // the next test.
+  const blocks = await db.collectionGroup('blockedUsers').get();
+  await Promise.all(blocks.docs.map((block) => block.ref.delete()));
 
   const collections = [
     'users',
@@ -316,6 +332,7 @@ async function reset() {
     'otpCodes',
     'otpSendQuota',
     'conversations',
+    'userBlocks',
   ];
   for (const collection of collections) {
     const snapshot = await db.collection(collection).get();
@@ -758,7 +775,75 @@ async function testAuthDeleteCleanupIsDurableAndRetryable() {
 
   await reset();
   await seedUser('target-1', 'student');
+  await seedUser('peer-1', 'owner');
   await seedRoom('RM-ACCOUNT-DELETE', 'target-1');
+
+  const cleanupConversationId = ['target-1', 'peer-1'].sort().join('_');
+  const cleanupConversationRef = db
+    .collection('conversations')
+    .doc(cleanupConversationId);
+  const cleanupContextRef = cleanupConversationRef
+    .collection('contexts')
+    .doc('JRQ-CLEANUP-CONTEXT');
+  const outgoingBlockRef = db
+    .collection('userBlocks')
+    .doc('target-1')
+    .collection('blockedUsers')
+    .doc('peer-1');
+  const incomingBlockRef = db
+    .collection('userBlocks')
+    .doc('peer-1')
+    .collection('blockedUsers')
+    .doc('target-1');
+  const malformedIncomingBlockRef = db
+    .collection('userBlocks')
+    .doc('malformed-blocker')
+    .collection('blockedUsers')
+    .doc('target-1');
+  await cleanupConversationRef.set({
+    conversationId: cleanupConversationId,
+    participantIds: ['peer-1', 'target-1'],
+    participantNames: {
+      'peer-1': 'Peer Owner',
+      'target-1': 'Target Student',
+    },
+    roomId: 'RM-ACCOUNT-DELETE',
+    roomTitle: 'Cleanup Room',
+    createdByServer: true,
+    lastMessage: '',
+    lastMessageAt: firestore.Timestamp.now(),
+    createdAt: firestore.Timestamp.now(),
+    updatedAt: firestore.Timestamp.now(),
+    unreadCount: {},
+  });
+  await cleanupContextRef.set({
+    contextId: 'JRQ-CLEANUP-CONTEXT',
+    roomId: 'RM-ACCOUNT-DELETE',
+    roomTitle: 'Cleanup Room',
+    requestId: 'JRQ-CLEANUP-CONTEXT',
+    capturedAt: firestore.Timestamp.now(),
+  });
+  await outgoingBlockRef.set({
+    blockerId: 'target-1',
+    blockedUserId: 'peer-1',
+    scope: 'person',
+    blockedAt: firestore.Timestamp.now(),
+  });
+  await incomingBlockRef.set({
+    blockerId: 'peer-1',
+    blockedUserId: 'target-1',
+    scope: 'person',
+    blockedAt: firestore.Timestamp.now(),
+  });
+  // The canonical document path names the deleted account, while the
+  // duplicated field is inconsistent. The rules use the path, so cleanup
+  // must remove this record too.
+  await malformedIncomingBlockRef.set({
+    blockerId: 'malformed-blocker',
+    blockedUserId: 'different-user',
+    scope: 'person',
+    blockedAt: firestore.Timestamp.now(),
+  });
   await db.collection('roomPrivate').doc('RM-ACCOUNT-DELETE').set({
     roomId: 'RM-ACCOUNT-DELETE',
     // Deliberately inconsistent: account deletion must remove the private
@@ -895,6 +980,31 @@ async function testAuthDeleteCleanupIsDurableAndRetryable() {
     check(
       'the account OTP quota was removed',
       (await uidQuotaRef.get()).exists,
+      false,
+    );
+    check(
+      'the outgoing personal block was removed with the account',
+      (await outgoingBlockRef.get()).exists,
+      false,
+    );
+    check(
+      'the incoming personal block was removed with the account',
+      (await incomingBlockRef.get()).exists,
+      false,
+    );
+    check(
+      'an incoming block with a malformed field was removed by its canonical path',
+      (await malformedIncomingBlockRef.get()).exists,
+      false,
+    );
+    check(
+      'the conversation was removed with the account',
+      (await cleanupConversationRef.get()).exists,
+      false,
+    );
+    check(
+      'the server-owned conversation context was removed with the account',
+      (await cleanupContextRef.get()).exists,
       false,
     );
   } finally {
@@ -6317,7 +6427,1161 @@ async function testAdminAvailabilityReleaseEndsBookings() {
   );
 }
 
+async function testInteractionMetadataUsesRealParticipantNames() {
+  section('interaction metadata uses the real participant and listing names');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await db.collection('users').doc('owner-1').update({ name: 'Meera Nair' });
+  await db.collection('users').doc('student-1').update({ name: 'Arjun Shah' });
+  await seedRoom('RM-NAMES', 'owner-1', { title: 'Sunset Studio' });
+
+  const created = await invoke(
+    createJoinRequest,
+    { roomId: 'RM-NAMES' },
+    'student-1',
+  );
+  const requestId = created.requestId;
+  const request = await db.collection('joinRequests').doc(requestId).get();
+
+  check('the request records the real student name', request.get('studentName'), 'Arjun Shah');
+  check('the request records the real owner name', request.get('ownerName'), 'Meera Nair');
+  check('the request records the real room title', request.get('roomTitle'), 'Sunset Studio');
+  check(
+    'the request keeps an immutable student-name snapshot',
+    request.get('studentNameAtRequest'),
+    'Arjun Shah',
+  );
+  check(
+    'the request keeps an immutable owner-name snapshot',
+    request.get('ownerNameAtRequest'),
+    'Meera Nair',
+  );
+  check(
+    'the request keeps an immutable room-title snapshot',
+    request.get('roomTitleAtRequest'),
+    'Sunset Studio',
+  );
+
+  const studentDetails = await invoke(
+    getBookingInteractionDetails,
+    { requestId },
+    'student-1',
+  );
+  check('the student sees the real owner name', studentDetails.ownerName, 'Meera Nair');
+  check('the student sees the real listing title', studentDetails.roomTitle, 'Sunset Studio');
+  check('the student is not blocked initially', studentDetails.canSend, true);
+
+  const ownerDetails = await invoke(
+    getBookingInteractionDetails,
+    { requestId },
+    'owner-1',
+  );
+  check('the owner sees the real student name', ownerDetails.studentName, 'Arjun Shah');
+  check('the owner sees the real listing title', ownerDetails.roomTitle, 'Sunset Studio');
+
+  const adminDetails = await invoke(
+    getBookingInteractionDetails,
+    { requestId },
+    'admin-1',
+  );
+  check('the admin sees the real student name', adminDetails.studentName, 'Arjun Shah');
+  check('the admin sees the real owner name', adminDetails.ownerName, 'Meera Nair');
+
+  const contact = await invoke(
+    getRoomContactDetails,
+    { roomId: 'RM-NAMES' },
+    'student-1',
+  );
+  check('the room contact resolves the real owner name', contact.ownerName, 'Meera Nair');
+  check('the room contact resolves the real listing title', contact.roomTitle, 'Sunset Studio');
+
+  // The owner opens the conversation through the verified request. This is
+  // the path which lets an owner reply to a student without guessing a uid.
+  const opened = await invoke(
+    openConversation,
+    {
+      otherUserId: 'student-1',
+      roomId: 'RM-NAMES',
+      requestId,
+    },
+    'owner-1',
+  );
+  const conversationId = ['owner-1', 'student-1'].sort().join('_');
+  check('the owner opened the deterministic conversation', opened.conversationId, conversationId);
+  check('the owner sees the real student name in chat', opened.peerName, 'Arjun Shah');
+  check('the chat identifies the peer role', opened.peerRole, 'student');
+  check('the chat carries the real listing title', opened.roomTitle, 'Sunset Studio');
+
+  const conversation = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .get();
+  check(
+    'the server conversation stores both real names',
+    conversation.get('participantNames'),
+    { 'owner-1': 'Meera Nair', 'student-1': 'Arjun Shah' },
+  );
+  check('the server conversation stores the listing title', conversation.get('roomTitle'), 'Sunset Studio');
+  const capturedContext = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .collection('contexts')
+    .doc(requestId)
+    .get();
+  check(
+    'the server stored a request-scoped listing context',
+    capturedContext.get('roomTitle'),
+    'Sunset Studio',
+  );
+  check(
+    'the request-scoped context records its original capture time',
+    capturedContext.get('capturedAt') instanceof firestore.Timestamp,
+    true,
+  );
+
+  const conversationBeforeDetails = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .get();
+  const conversationVersionBeforeDetails =
+    conversationBeforeDetails.updateTime?.toMillis() ?? 0;
+
+  const chatDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId, requestId },
+    'student-1',
+  );
+  check('the chat resolves the real peer name', chatDetails.peerName, 'Meera Nair');
+  check('the chat resolves the real listing title', chatDetails.roomTitle, 'Sunset Studio');
+
+  const ownerChatDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId, roomId: 'RM-NAMES', requestId },
+    'owner-1',
+  );
+  check(
+    'the owner-side chat resolves the real student name',
+    ownerChatDetails.peerName,
+    'Arjun Shah',
+  );
+  check(
+    'the owner-side chat resolves the real listing title',
+    ownerChatDetails.roomTitle,
+    'Sunset Studio',
+  );
+
+  const ownerConversationListDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId, roomId: 'RM-NAMES' },
+    'owner-1',
+  );
+  check(
+    'the owner-side conversation-list context resolves the real student name',
+    ownerConversationListDetails.peerName,
+    'Arjun Shah',
+  );
+  const conversationAfterDetails = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .get();
+  check(
+    'read-only chat details did not create a new conversation version',
+    conversationAfterDetails.updateTime?.toMillis() ?? 0,
+    conversationVersionBeforeDetails,
+  );
+
+  // Current display data and request-time snapshots are deliberately
+  // separate. A profile rename or listing rename updates what users see,
+  // while the request-time values remain an immutable record of what the
+  // parties agreed when the request was created.
+  await db.collection('users').doc('student-1').update({
+    name: 'Arjun Shah Updated',
+  });
+  await db.collection('rooms').doc('RM-NAMES').update({
+    title: 'Sunset Studio Renamed',
+  });
+
+  const reopened = await invoke(
+    openConversation,
+    {
+      otherUserId: 'owner-1',
+      roomId: 'RM-NAMES',
+      requestId,
+    },
+    'student-1',
+  );
+  check(
+    'reopening the conversation keeps the captured listing context',
+    reopened.roomTitle,
+    'Sunset Studio Renamed',
+  );
+
+  const contextAfterReopen = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .collection('contexts')
+    .doc(requestId)
+    .get();
+  check(
+    'reopening the conversation does not replace the captured title',
+    contextAfterReopen.get('roomTitle'),
+    'Sunset Studio',
+  );
+  check(
+    'reopening the conversation does not reset the capture time',
+    contextAfterReopen.get('capturedAt')?.toMillis(),
+    capturedContext.get('capturedAt')?.toMillis(),
+  );
+
+  const refreshedBooking = await invoke(
+    getBookingInteractionDetails,
+    { requestId },
+    'owner-1',
+  );
+  check(
+    'the booking shows the current participant name',
+    refreshedBooking.studentName,
+    'Arjun Shah Updated',
+  );
+  check(
+    'the booking shows the current listing title',
+    refreshedBooking.roomTitle,
+    'Sunset Studio Renamed',
+  );
+
+  const refreshedRequest = await db
+    .collection('joinRequests')
+    .doc(requestId)
+    .get();
+  check(
+    'the request stores the current participant name separately',
+    refreshedRequest.get('studentName'),
+    'Arjun Shah Updated',
+  );
+  check(
+    'the request stores the current listing title separately',
+    refreshedRequest.get('roomTitle'),
+    'Sunset Studio Renamed',
+  );
+  check(
+    'the student-name request-time snapshot remains immutable',
+    refreshedRequest.get('studentNameAtRequest'),
+    'Arjun Shah',
+  );
+  check(
+    'the owner-name request-time snapshot remains immutable',
+    refreshedRequest.get('ownerNameAtRequest'),
+    'Meera Nair',
+  );
+  check(
+    'the listing-title request-time snapshot remains immutable',
+    refreshedRequest.get('roomTitleAtRequest'),
+    'Sunset Studio',
+  );
+
+  const refreshedChat = await invoke(
+    getConversationInteractionDetails,
+    { conversationId, requestId },
+    'student-1',
+  );
+  check(
+    'the request-backed chat keeps its captured listing context',
+    refreshedChat.roomTitle,
+    'Sunset Studio',
+  );
+  check(
+    'the request-backed chat resolves the current participant name',
+    refreshedChat.peerName,
+    'Meera Nair',
+  );
+
+  // Whitespace-only current values are not display values. The immutable
+  // request-time snapshots must still be available as the final fallback.
+  await db.collection('users').doc('student-1').update({ name: '   ' });
+  await db.collection('users').doc('owner-1').update({ name: '   ' });
+  await db.collection('rooms').doc('RM-NAMES').update({ title: '   ' });
+  await db.collection('joinRequests').doc(requestId).update({
+    studentName: '   ',
+    ownerName: '   ',
+    roomTitle: '   ',
+  });
+  const snapshotFallback = await invoke(
+    getBookingInteractionDetails,
+    { requestId },
+    'owner-1',
+  );
+  check(
+    'a whitespace-only current name falls back to the immutable snapshot',
+    snapshotFallback.studentName,
+    'Arjun Shah',
+  );
+  check(
+    'a whitespace-only current title falls back to the immutable snapshot',
+    snapshotFallback.roomTitle,
+    'Sunset Studio',
+  );
+
+  // Chat metadata follows the same fallback order. A missing profile and
+  // missing current conversation metadata must not hide the immutable
+  // request-time name.
+  await db.collection('conversations').doc(conversationId).update({
+    participantNames: { 'owner-1': '', 'student-1': '' },
+  });
+  const chatSnapshotFallback = await invoke(
+    getConversationInteractionDetails,
+    { conversationId, requestId },
+    'owner-1',
+  );
+  check(
+    'a chat without current metadata falls back to the immutable participant snapshot',
+    chatSnapshotFallback.peerName,
+    'Arjun Shah',
+  );
+  const reopenedOwnerChat = await invoke(
+    openConversation,
+    {
+      otherUserId: 'student-1',
+      roomId: 'RM-NAMES',
+      requestId,
+    },
+    'owner-1',
+  );
+  check(
+    'reopening a chat stores the immutable participant snapshot when current metadata is missing',
+    reopenedOwnerChat.peerName,
+    'Arjun Shah',
+  );
+  const reopenedStudentChat = await invoke(
+    openConversation,
+    {
+      otherUserId: 'owner-1',
+      roomId: 'RM-NAMES',
+      requestId,
+    },
+    'student-1',
+  );
+  check(
+    'the opposite chat direction also stores the immutable participant snapshot',
+    reopenedStudentChat.peerName,
+    'Meera Nair',
+  );
+}
+
+async function testInteractionMetadataChecksLiveRolesInTheTransaction() {
+  section('interaction metadata checks the live participant role in its transaction');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await db.collection('users').doc('owner-1').update({ name: 'Meera Nair' });
+  await db.collection('users').doc('student-1').update({ name: 'Arjun Shah' });
+  await seedRoom('RM-LIVE-ROLE', 'owner-1', { title: 'Live Role Room' });
+  await seedRequest('JRQ-LIVE-ROLE', {
+    roomId: 'RM-LIVE-ROLE',
+    studentName: 'Arjun Shah',
+    ownerName: 'Meera Nair',
+    roomTitle: 'Live Role Room',
+  });
+
+  const conversation = await invoke(
+    openConversation,
+    {
+      otherUserId: 'owner-1',
+      roomId: 'RM-LIVE-ROLE',
+      requestId: 'JRQ-LIVE-ROLE',
+    },
+    'student-1',
+  );
+  check(
+    'the live student can initially read the booking details',
+    (
+      await invoke(
+        getBookingInteractionDetails,
+        { requestId: 'JRQ-LIVE-ROLE' },
+        'student-1',
+      )
+    ).studentName,
+    'Arjun Shah',
+  );
+  check(
+    'the live owner can initially read the booking details',
+    (
+      await invoke(
+        getBookingInteractionDetails,
+        { requestId: 'JRQ-LIVE-ROLE' },
+        'owner-1',
+      )
+    ).ownerName,
+    'Meera Nair',
+  );
+
+  await db.collection('users').doc('owner-1').update({ role: 'student' });
+  await expectDenied(
+    'a demoted owner cannot read owner-side booking details',
+    () =>
+      invoke(
+        getBookingInteractionDetails,
+        { requestId: 'JRQ-LIVE-ROLE' },
+        'owner-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'a demoted owner cannot read owner-side conversation details',
+    () =>
+      invoke(
+        getConversationInteractionDetails,
+        { conversationId: conversation.conversationId, requestId: 'JRQ-LIVE-ROLE' },
+        'owner-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'a demoted owner cannot open the owner-side conversation',
+    () =>
+      invoke(
+        openConversation,
+        {
+          otherUserId: 'student-1',
+          roomId: 'RM-LIVE-ROLE',
+          requestId: 'JRQ-LIVE-ROLE',
+        },
+        'owner-1',
+      ),
+    'permission-denied',
+  );
+
+  await expectDenied(
+    'a live student cannot read booking details after the owner is demoted',
+    () =>
+      invoke(
+        getBookingInteractionDetails,
+        { requestId: 'JRQ-LIVE-ROLE' },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'a live student cannot read request-backed chat details after the owner is demoted',
+    () =>
+      invoke(
+        getConversationInteractionDetails,
+        { conversationId: conversation.conversationId, requestId: 'JRQ-LIVE-ROLE' },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'a live student cannot read room-backed chat details after the owner is demoted',
+    () =>
+      invoke(
+        getConversationInteractionDetails,
+        {
+          conversationId: conversation.conversationId,
+          roomId: 'RM-LIVE-ROLE',
+        },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+
+  await db.collection('users').doc('owner-1').update({ role: 'owner' });
+  await db.collection('users').doc('student-1').update({ isActive: false });
+  await expectDenied(
+    'an inactive student cannot read student-side booking details',
+    () =>
+      invoke(
+        getBookingInteractionDetails,
+        { requestId: 'JRQ-LIVE-ROLE' },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'an inactive student cannot read student-side conversation details',
+    () =>
+      invoke(
+        getConversationInteractionDetails,
+        { conversationId: conversation.conversationId, requestId: 'JRQ-LIVE-ROLE' },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'an inactive student cannot read room-contact details',
+    () =>
+      invoke(
+        getRoomContactDetails,
+        { roomId: 'RM-LIVE-ROLE' },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  await expectDenied(
+    'an inactive student cannot open the room conversation',
+    () =>
+      invoke(
+        openConversation,
+        {
+          otherUserId: 'owner-1',
+          roomId: 'RM-LIVE-ROLE',
+        },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+
+  const adminDetails = await invoke(
+    getBookingInteractionDetails,
+    { requestId: 'JRQ-LIVE-ROLE' },
+    'admin-1',
+  );
+  check(
+    'a live administrator can still review the booking details',
+    adminDetails.studentName,
+    'Arjun Shah',
+  );
+}
+
+async function testMalformedRequestApprovalReturnsAPreconditionError() {
+  section('a malformed booking request fails approval with a precondition error');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-MALFORMED-APPROVAL', 'owner-1');
+  await seedRequest('JRQ-MALFORMED-APPROVAL', {
+    roomId: 'RM-MALFORMED-APPROVAL',
+    studentId: '',
+  });
+
+  await expectDenied(
+    'a malformed request cannot be approved',
+    () =>
+      invoke(
+        respondToJoinRequest,
+        { requestId: 'JRQ-MALFORMED-APPROVAL', approve: true },
+        'owner-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the malformed request was not approved',
+    (
+      await db
+        .collection('joinRequests')
+        .doc('JRQ-MALFORMED-APPROVAL')
+        .get()
+    ).get('status'),
+    'pending',
+  );
+}
+
+async function testTerminalRequestCannotCreateConversation() {
+  section('a terminal booking request cannot start a new conversation');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-TERMINAL-CHAT', 'owner-1', { title: 'Terminal Chat Room' });
+
+  const conversationId = ['owner-1', 'student-1'].sort().join('_');
+  const conversationRef = db.collection('conversations').doc(conversationId);
+  const terminalStates = [
+    ['rejected', 'a rejected request cannot start a conversation'],
+    ['cancelled', 'a cancelled request cannot start a conversation'],
+    ['unknownState', 'an unknown request state cannot start a conversation'],
+  ];
+
+  for (const [status, label] of terminalStates) {
+    const requestId = `JRQ-TERMINAL-${status.toUpperCase()}`;
+    await seedRequest(requestId, {
+      roomId: 'RM-TERMINAL-CHAT',
+      status,
+    });
+    await expectDenied(
+      label,
+      () =>
+        invoke(
+          openConversation,
+          {
+            otherUserId: 'student-1',
+            roomId: 'RM-TERMINAL-CHAT',
+            requestId,
+          },
+          'owner-1',
+        ),
+      'failed-precondition',
+    );
+  }
+
+  check(
+    'terminal requests did not create a conversation',
+    (await conversationRef.get()).exists,
+    false,
+  );
+
+  // An open request can establish the conversation normally.
+  await seedRequest('JRQ-TERMINAL-OPEN', {
+    roomId: 'RM-TERMINAL-CHAT',
+    status: 'pending',
+  });
+  const opened = await invoke(
+    openConversation,
+    {
+      otherUserId: 'student-1',
+      roomId: 'RM-TERMINAL-CHAT',
+      requestId: 'JRQ-TERMINAL-OPEN',
+    },
+    'owner-1',
+  );
+  check('an open request created the conversation', opened.conversationId, conversationId);
+
+  // Once a conversation exists, a later terminal state does not erase the
+  // history. The parties can still reopen it while the block state permits.
+  await db
+    .collection('joinRequests')
+    .doc('JRQ-TERMINAL-OPEN')
+    .update({ status: 'cancelled' });
+  const reopened = await invoke(
+    openConversation,
+    {
+      otherUserId: 'student-1',
+      roomId: 'RM-TERMINAL-CHAT',
+      requestId: 'JRQ-TERMINAL-OPEN',
+    },
+    'owner-1',
+  );
+  check(
+    'an existing conversation remains available after the request closes',
+    reopened.conversationId,
+    conversationId,
+  );
+  check(
+    'the existing conversation was not removed when the request closed',
+    (await conversationRef.get()).exists,
+    true,
+  );
+}
+
+async function testDirectionalBlocksProtectBothRoles() {
+  section('directional blocks protect both the student and the owner');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedUser('outsider-1', 'student');
+  await db.collection('users').doc('owner-1').update({ name: 'Meera Nair' });
+  await db.collection('users').doc('student-1').update({ name: 'Arjun Shah' });
+  await seedRoom('RM-BLOCK', 'owner-1', { title: 'Garden Flat' });
+  await seedRequest('JRQ-BLOCK', {
+    roomId: 'RM-BLOCK',
+    studentName: 'Arjun Shah',
+    ownerName: 'Meera Nair',
+    roomTitle: 'Garden Flat',
+  });
+
+  const conversationId = ['owner-1', 'student-1'].sort().join('_');
+  await invoke(
+    openConversation,
+    {
+      otherUserId: 'owner-1',
+      roomId: 'RM-BLOCK',
+      requestId: 'JRQ-BLOCK',
+    },
+    'student-1',
+  );
+
+  const blocked = await invoke(
+    blockUser,
+    {
+      otherUserId: 'owner-1',
+      requestId: 'JRQ-BLOCK',
+    },
+    'student-1',
+  );
+  check('the student block succeeded', blocked.blocked, true);
+  check('the student reports its own block', blocked.blockedByMe, true);
+  check('the student does not report a peer block', blocked.blockedMe, false);
+  check('the block stops the student from sending', blocked.canSend, false);
+  check(
+    'the directional student-to-owner block was stored',
+    (
+      await db
+        .collection('userBlocks')
+        .doc('student-1')
+        .collection('blockedUsers')
+        .doc('owner-1')
+        .get()
+    ).exists,
+    true,
+  );
+
+  const studentView = await invoke(
+    getBookingInteractionDetails,
+    { requestId: 'JRQ-BLOCK' },
+    'student-1',
+  );
+  check('the student sees the own block flag', studentView.blockedByMe, true);
+  check('the student sees no peer block flag', studentView.blockedMe, false);
+  check('the student booking is effectively blocked', studentView.canSend, false);
+
+  const ownerView = await invoke(
+    getBookingInteractionDetails,
+    { requestId: 'JRQ-BLOCK' },
+    'owner-1',
+  );
+  check('the owner sees no own block flag', ownerView.blockedByMe, false);
+  check('the owner sees the incoming block flag', ownerView.blockedMe, true);
+  check('the owner booking is effectively blocked', ownerView.canSend, false);
+
+  const ownerChat = await invoke(
+    getConversationInteractionDetails,
+    { conversationId, requestId: 'JRQ-BLOCK' },
+    'owner-1',
+  );
+  check('the owner keeps access to the existing chat history', ownerChat.peerName, 'Arjun Shah');
+  check('the owner chat is read-only while blocked', ownerChat.canSend, false);
+
+  const reopened = await invoke(
+    openConversation,
+    {
+      otherUserId: 'owner-1',
+      roomId: 'RM-BLOCK',
+      requestId: 'JRQ-BLOCK',
+    },
+    'student-1',
+  );
+  check('a blocked student can still open the existing conversation', reopened.conversationId, conversationId);
+  check('the reopened blocked conversation is read-only', reopened.canSend, false);
+
+  await expectDenied(
+    'an outsider cannot block a participant without a relationship',
+    () =>
+      invoke(
+        blockUser,
+        {
+          otherUserId: 'owner-1',
+          requestId: 'JRQ-BLOCK',
+        },
+        'outsider-1',
+      ),
+    'failed-precondition',
+  );
+  await expectDenied(
+    'a caller cannot block an arbitrary account without context',
+    () =>
+      invoke(
+        blockUser,
+        { otherUserId: 'owner-1' },
+        'student-1',
+      ),
+    'invalid-argument',
+  );
+
+  const unblocked = await invoke(
+    unblockUser,
+    { otherUserId: 'owner-1' },
+    'student-1',
+  );
+  check('the student unblock succeeded', unblocked.blocked, false);
+  check('the student no longer reports an own block', unblocked.blockedByMe, false);
+  check('the student can send after unblocking', unblocked.canSend, true);
+  check(
+    'the directional block document was removed',
+    (
+      await db
+        .collection('userBlocks')
+        .doc('student-1')
+        .collection('blockedUsers')
+        .doc('owner-1')
+        .get()
+    ).exists,
+    false,
+  );
+
+  const ownerAfterUnblock = await invoke(
+    getBookingInteractionDetails,
+    { requestId: 'JRQ-BLOCK' },
+    'owner-1',
+  );
+  check('the owner can continue after the student unblocks', ownerAfterUnblock.canSend, true);
+
+  const conversationOnlyBlock = await invoke(
+    blockUser,
+    { otherUserId: 'owner-1', conversationId },
+    'student-1',
+  );
+  check(
+    'a verified conversation alone authorizes the block',
+    conversationOnlyBlock.blockedByMe,
+    true,
+  );
+  await invoke(unblockUser, { otherUserId: 'owner-1' }, 'student-1');
+
+  const ownerBlocked = await invoke(
+    blockUser,
+    {
+      otherUserId: 'student-1',
+      requestId: 'JRQ-BLOCK',
+    },
+    'owner-1',
+  );
+  check('the owner can block the student', ownerBlocked.blockedByMe, true);
+  check('the owner block is immediately effective', ownerBlocked.canSend, false);
+  check(
+    'the reverse directional block was stored',
+    (
+      await db
+        .collection('userBlocks')
+        .doc('owner-1')
+        .collection('blockedUsers')
+        .doc('student-1')
+        .get()
+    ).exists,
+    true,
+  );
+  await expectDenied(
+    'a caller cannot use unblock as an oracle for a peer-only block',
+    () => invoke(unblockUser, { otherUserId: 'owner-1' }, 'student-1'),
+    'failed-precondition',
+  );
+  check(
+    'the peer-only block was not removed by the unrelated caller',
+    (
+      await db
+        .collection('userBlocks')
+        .doc('owner-1')
+        .collection('blockedUsers')
+        .doc('student-1')
+        .get()
+    ).exists,
+    true,
+  );
+
+  const ownerUnblocked = await invoke(
+    unblockUser,
+    { otherUserId: 'student-1' },
+    'owner-1',
+  );
+  check('the owner can unblock the student', ownerUnblocked.blockedByMe, false);
+  check('the owner can send after unblocking', ownerUnblocked.canSend, true);
+}
+
+async function testBlockBeforeConversationAndDeletionFence() {
+  section('a request authorizes a block before a conversation exists and a deleting target cannot be blocked');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-EARLY-BLOCK', 'owner-1');
+  await seedRequest('JRQ-EARLY-BLOCK', { roomId: 'RM-EARLY-BLOCK' });
+
+  const blocked = await invoke(
+    blockUser,
+    { otherUserId: 'owner-1', requestId: 'JRQ-EARLY-BLOCK' },
+    'student-1',
+  );
+  check('the request authorizes a block before any chat exists', blocked.blockedByMe, true);
+  const earlyConversationId = ['owner-1', 'student-1'].sort().join('_');
+  await expectDenied(
+    'a blocked pair cannot create the first conversation afterwards',
+    () =>
+      invoke(
+        openConversation,
+        {
+          otherUserId: 'owner-1',
+          roomId: 'RM-EARLY-BLOCK',
+          requestId: 'JRQ-EARLY-BLOCK',
+        },
+        'student-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the blocked first conversation was not created',
+    (await db.collection('conversations').doc(earlyConversationId).get()).exists,
+    false,
+  );
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-DELETING-TARGET', 'owner-1');
+  await seedRequest('JRQ-DELETING-TARGET', {
+    roomId: 'RM-DELETING-TARGET',
+  });
+  await db.collection('users').doc('student-1').update({
+    isActive: false,
+    deletionState: 'deleting',
+  });
+  await expectDenied(
+    'a peer cannot create a new incoming block for a deleting account',
+    () =>
+      invoke(
+        blockUser,
+        { otherUserId: 'student-1', requestId: 'JRQ-DELETING-TARGET' },
+        'owner-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the deleting account did not receive a new incoming block',
+    (
+      await db
+        .collection('userBlocks')
+        .doc('owner-1')
+        .collection('blockedUsers')
+        .doc('student-1')
+        .get()
+    ).exists,
+    false,
+  );
+}
+
+async function testBlocksStopBookingProgressionButAllowClosure() {
+  section('blocks stop booking progression while protective closure stays available');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-PROGRESS', 'owner-1');
+  await seedRoom('RM-SECOND', 'owner-1');
+  await seedRequest('JRQ-APPROVE', {
+    roomId: 'RM-PROGRESS',
+    status: 'pending',
+  });
+  await seedRequest('JRQ-CONFIRM', {
+    roomId: 'RM-PROGRESS',
+    status: 'ownerConfirmed',
+  });
+  await seedRequest('JRQ-CANCEL', {
+    roomId: 'RM-PROGRESS',
+    status: 'ownerConfirmed',
+  });
+  await seedRequest('JRQ-PAYMENT', {
+    roomId: 'RM-PROGRESS',
+    status: 'studentConfirmed',
+  });
+
+  await invoke(
+    blockUser,
+    { otherUserId: 'owner-1', requestId: 'JRQ-APPROVE' },
+    'student-1',
+  );
+
+  await expectDenied(
+    'a blocked pair cannot create a new booking request',
+    () => invoke(createJoinRequest, { roomId: 'RM-SECOND' }, 'student-1'),
+    'failed-precondition',
+  );
+  check(
+    'the refused request was not created',
+    (
+      await db
+        .collection('joinRequests')
+        .where('roomId', '==', 'RM-SECOND')
+        .where('studentId', '==', 'student-1')
+        .get()
+    ).empty,
+    true,
+  );
+
+  await expectDenied(
+    'a blocked owner cannot approve a booking',
+    () =>
+      invoke(
+        respondToJoinRequest,
+        { requestId: 'JRQ-APPROVE', approve: true },
+        'owner-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the blocked approval did not advance the request',
+    (await db.collection('joinRequests').doc('JRQ-APPROVE').get()).get('status'),
+    'pending',
+  );
+
+  await invoke(
+    respondToJoinRequest,
+    { requestId: 'JRQ-APPROVE', approve: false, reason: 'Not suitable' },
+    'owner-1',
+  );
+  check(
+    'a blocked owner can still decline the request',
+    (await db.collection('joinRequests').doc('JRQ-APPROVE').get()).get('status'),
+    'rejected',
+  );
+
+  await expectDenied(
+    'a blocked student cannot confirm the booking',
+    () =>
+      invoke(
+        confirmJoinAsStudent,
+        { requestId: 'JRQ-CONFIRM' },
+        'student-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the blocked confirmation did not advance the request',
+    (await db.collection('joinRequests').doc('JRQ-CONFIRM').get()).get('status'),
+    'ownerConfirmed',
+  );
+
+  await invoke(
+    cancelJoinRequest,
+    { requestId: 'JRQ-CANCEL', reason: 'Changed my mind' },
+    'student-1',
+  );
+  check(
+    'a blocked student can still cancel the request',
+    (await db.collection('joinRequests').doc('JRQ-CANCEL').get()).get('status'),
+    'cancelled',
+  );
+
+  await expectDenied(
+    'a blocked party cannot create a payment intent',
+    () =>
+      invoke(
+        createUpiPayment,
+        { joinRequestId: 'JRQ-PAYMENT' },
+        'owner-1',
+      ),
+    'failed-precondition',
+  );
+  await expectDenied(
+    'a blocked party cannot submit a payment',
+    () =>
+      invoke(
+        submitPayment,
+        {
+          requestId: 'JRQ-PAYMENT',
+          reference: 'UPI-BLOCKED',
+          method: 'upi',
+        },
+        'owner-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the blocked payment was not stored',
+    (await db.collection('payments').doc('JRQ-PAYMENT').get()).exists,
+    false,
+  );
+}
+
+async function testBlockedPaymentCanStillBeRejectedByTheAdmin() {
+  section('an admin can still reject a submitted payment while the pair is blocked');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('owner-1', 'owner');
+  await seedUser('student-1', 'student');
+  await seedRoom('RM-PAYMENT-BLOCK', 'owner-1');
+  await seedRequest('JRQ-REJECT-BLOCKED', {
+    roomId: 'RM-PAYMENT-BLOCK',
+    status: 'studentConfirmed',
+    monthlyRentAtJoin: 5000,
+    commissionPercentageAtJoin: 30,
+    platformFeePayer: 'owner',
+  });
+  await db.collection('payments').doc('JRQ-REJECT-BLOCKED').set({
+    requestId: 'JRQ-REJECT-BLOCKED',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    roomId: 'RM-PAYMENT-BLOCK',
+    amount: 1500,
+    feePercentage: 30,
+    reference: 'UPI-REJECT-BLOCKED',
+    method: 'upi',
+    payer: 'owner',
+    feeWaived: false,
+    status: 'submitted',
+  });
+  await invoke(
+    blockUser,
+    { otherUserId: 'owner-1', requestId: 'JRQ-REJECT-BLOCKED' },
+    'student-1',
+  );
+
+  await invoke(
+    verifyPayment,
+    {
+      requestId: 'JRQ-REJECT-BLOCKED',
+      approve: false,
+      note: 'The money did not arrive',
+    },
+    'admin-1',
+  );
+  check(
+    'the admin rejected the blocked payment',
+    (await db.collection('payments').doc('JRQ-REJECT-BLOCKED').get()).get('status'),
+    'rejected',
+  );
+  check(
+    'the rejected blocked booking was not activated',
+    (await db.collection('joinRequests').doc('JRQ-REJECT-BLOCKED').get()).get('status'),
+    'studentConfirmed',
+  );
+
+  await seedRequest('JRQ-APPROVE-BLOCKED', {
+    roomId: 'RM-PAYMENT-BLOCK',
+    status: 'studentConfirmed',
+    monthlyRentAtJoin: 5000,
+    commissionPercentageAtJoin: 30,
+    platformFeePayer: 'owner',
+  });
+  await db.collection('payments').doc('JRQ-APPROVE-BLOCKED').set({
+    requestId: 'JRQ-APPROVE-BLOCKED',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    roomId: 'RM-PAYMENT-BLOCK',
+    amount: 1500,
+    feePercentage: 30,
+    reference: 'UPI-APPROVE-BLOCKED',
+    method: 'upi',
+    payer: 'owner',
+    feeWaived: false,
+    status: 'submitted',
+  });
+  await expectDenied(
+    'an admin cannot activate a submitted payment while the pair is blocked',
+    () =>
+      invoke(
+        verifyPayment,
+        { requestId: 'JRQ-APPROVE-BLOCKED', approve: true },
+        'admin-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the blocked submitted payment was not activated',
+    (await db.collection('joinRequests').doc('JRQ-APPROVE-BLOCKED').get()).get('status'),
+    'studentConfirmed',
+  );
+  check(
+    'the blocked submitted payment is still awaiting a decision',
+    (await db.collection('payments').doc('JRQ-APPROVE-BLOCKED').get()).get('status'),
+    'submitted',
+  );
+}
+
 async function main() {
+  await testInteractionMetadataUsesRealParticipantNames();
+  await testInteractionMetadataChecksLiveRolesInTheTransaction();
+  await testMalformedRequestApprovalReturnsAPreconditionError();
+  await testTerminalRequestCannotCreateConversation();
+  await testDirectionalBlocksProtectBothRoles();
+  await testBlockBeforeConversationAndDeletionFence();
+  await testBlocksStopBookingProgressionButAllowClosure();
+  await testBlockedPaymentCanStillBeRejectedByTheAdmin();
   await testOwnerApprovalAndCancellationUseLiveRole();
   await testRoleChangeCancelsOwnerSideRequests();
   await testWaivedPaymentStillRequiresAParty();

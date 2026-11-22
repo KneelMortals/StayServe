@@ -731,6 +731,32 @@ service cloud.firestore {
         participantIds[0] != participantIds[1];
     }
 
+    // Personal student-owner blocks are stored in a server-owned, directional
+    // collection. The client cannot read or write these documents, but the
+    // rules can use them to refuse a new message as soon as either side has
+    // blocked the other.
+    function pairIsBlocked(firstUserId, secondUserId) {
+      return firstUserId is string &&
+        secondUserId is string &&
+        firstUserId != secondUserId &&
+        (
+          exists(/databases/$(database)/documents/userBlocks/$(firstUserId)/blockedUsers/$(secondUserId)) ||
+          exists(/databases/$(database)/documents/userBlocks/$(secondUserId)/blockedUsers/$(firstUserId))
+        );
+    }
+
+    function conversationPairIsBlocked(participantIds) {
+      return isTwoPartyParticipantList(participantIds) &&
+        pairIsBlocked(participantIds[0], participantIds[1]);
+    }
+
+    match /userBlocks/{blockerId}/blockedUsers/{blockedUserId} {
+      // The block state is changed only by the server callables. It is
+      // intentionally invisible to ordinary clients; they receive the two
+      // booleans they need through the interaction callables instead.
+      allow read, write: if false;
+    }
+
     match /conversations/{conversationId} {
       allow get: if isLiveRegisteredAccount() &&
         (
@@ -740,21 +766,31 @@ service cloud.firestore {
       allow list: if isLiveRegisteredAccount() &&
         request.auth.uid in resource.data.get('participantIds', []);
       // Conversation creation is server-owned. The `openConversation`
-      // callable verifies that the caller is a live student and that the
-      // other participant really is the owner of the supplied room. A client
-      // may therefore not create a conversation with an arbitrary uid.
+      // callable verifies a live student-owner pair: a student may contact
+      // the owner of the supplied room, and either booking participant may
+      // open the conversation through a verified request. A client may
+      // therefore not create a conversation with an arbitrary uid.
       allow create: if false;
 
-      // The participant list, the conversation id and the creation time are
-      // immutable: a participant may not add a third party to the
-      // conversation or re-point it somewhere else. Only the bookkeeping
-      // fields the Flutter client maintains (last message, unread counts,
-      // timestamps and the optional room link) may change.
+      // The participant list, conversation id, creation time and listing
+      // context are immutable: a participant may not add a third party,
+      // re-point the conversation or overwrite the server-owned names and
+      // room title. Only the bookkeeping fields the Flutter client maintains
+      // (last message, unread counts and timestamps) may change.
       allow update: if isLiveRegisteredAccount() &&
         resource.data.get('deletionInProgress', false) != true &&
         request.auth.uid in resource.data.get('participantIds', []) &&
         resource.data.get('participantIds', []) ==
           request.resource.data.get('participantIds', []) &&
+        request.resource.data.get('roomId', '') ==
+          resource.data.get('roomId', '') &&
+        (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'lastMessage',
+            'lastMessageAt',
+          ]) ||
+          !conversationPairIsBlocked(resource.data.get('participantIds', []))
+        ) &&
         request.resource.data.get('conversationId', '') ==
           resource.data.get('conversationId', '') &&
         request.resource.data.get('createdAt', null) ==
@@ -764,8 +800,14 @@ service cloud.firestore {
           'lastMessageAt',
           'updatedAt',
           'unreadCount',
-          'roomId',
         ]);
+    }
+
+    // The listing/request context of a conversation is server-owned. It
+    // keeps the correct room title when the same student and owner discuss
+    // more than one listing.
+    match /conversations/{conversationId}/contexts/{contextId} {
+      allow read, write: if false;
     }
 
     // ======================================================================
@@ -807,7 +849,11 @@ service cloud.firestore {
           .data.get('participantIds', []) &&
         request.resource.data.get('receiverId', '') in
           get(/databases/$(database)/documents/conversations/$(conversationId))
-            .data.get('participantIds', []);
+            .data.get('participantIds', []) &&
+        !pairIsBlocked(
+          request.auth.uid,
+          request.resource.data.get('receiverId', '')
+        );
     }
 
     // ======================================================================

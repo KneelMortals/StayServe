@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 import '../../../../core/index.dart';
 import '../../../../../firebase/index.dart';
 import '../../../../../models/join_request_model.dart';
+import '../../../messaging/presentation/providers/messaging_providers.dart';
+import '../../../messaging/presentation/widgets/interaction_status_notice.dart';
 import '../../../payments/presentation/widgets/platform_fee_sheet.dart';
 import '../providers/student_providers.dart';
 import '../widgets/room_visit_sheet.dart';
@@ -110,6 +112,9 @@ class _StudentRequestsViewState extends ConsumerState<StudentRequestsView> {
                   onVisit: () => showRoomVisitSheet(context, request.roomId),
                   onReview: () =>
                       context.push('/room/${request.roomId}/reviews'),
+                  onMessage: () => _openChat(request),
+                  onToggleBlock: (name, blockedByMe) =>
+                      _toggleBlock(request, name, blockedByMe),
                 ),
               );
             },
@@ -193,6 +198,101 @@ class _StudentRequestsViewState extends ConsumerState<StudentRequestsView> {
     }
   }
 
+  /// Opens the verified conversation for this owner and listing.
+  Future<void> _openChat(JoinRequestModel request) async {
+    setState(() => _busyRequestId = request.requestId);
+    try {
+      final opened = await ref
+          .read(conversationRepositoryProvider)
+          .openConversation(
+            request.ownerId,
+            roomId: request.roomId,
+            requestId: request.requestId,
+          );
+      if (!mounted) return;
+      context.push(
+        Uri(
+          path: '/chat/${opened.conversationId}',
+          queryParameters: {
+            'peer': request.ownerId,
+            'room': request.roomId,
+            'request': request.requestId,
+          },
+        ).toString(),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _showSnack(e.toString().replaceFirst('Exception: ', ''), isError: true);
+    } finally {
+      if (mounted) setState(() => _busyRequestId = null);
+    }
+  }
+
+  /// Blocks or unblocks the owner on the other side of this request.
+  Future<void> _toggleBlock(
+    JoinRequestModel request,
+    String ownerName,
+    bool blockedByMe,
+  ) async {
+    final shouldChange = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(blockedByMe ? 'Unblock $ownerName?' : 'Block $ownerName?'),
+        content: Text(
+          blockedByMe
+              ? 'You will be able to exchange messages and continue this '
+                    'booking.'
+              : 'You will not be able to exchange new messages or advance '
+                    'this booking until you unblock $ownerName.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(blockedByMe ? 'Unblock' : 'Block'),
+          ),
+        ],
+      ),
+    );
+    if (shouldChange != true || !mounted) return;
+
+    setState(() => _busyRequestId = request.requestId);
+    try {
+      final repository = ref.read(conversationRepositoryProvider);
+      if (blockedByMe) {
+        await repository.unblockUser(request.ownerId);
+      } else {
+        await repository.blockUser(
+          request.ownerId,
+          requestId: request.requestId,
+        );
+      }
+      if (!mounted) return;
+      invalidateParticipantInteractionProviders(
+        ref,
+        conversationId: conversationIdForParticipants(
+          request.studentId,
+          request.ownerId,
+        ),
+        roomId: request.roomId,
+        requestId: request.requestId,
+      );
+      ref.invalidate(myJoinRequestsProvider);
+      _showSnack(
+        blockedByMe ? '$ownerName was unblocked.' : '$ownerName was blocked.',
+        isError: false,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _showSnack(e.toString().replaceFirst('Exception: ', ''), isError: true);
+    } finally {
+      if (mounted) setState(() => _busyRequestId = null);
+    }
+  }
+
   void _showSnack(String message, {required bool isError}) {
     final theme = Theme.of(context);
     ScaffoldMessenger.of(context).showSnackBar(
@@ -214,6 +314,8 @@ class _StudentRequestCard extends ConsumerWidget {
   final VoidCallback onOpenRoom;
   final VoidCallback onVisit;
   final VoidCallback onReview;
+  final VoidCallback onMessage;
+  final void Function(String name, bool blockedByMe) onToggleBlock;
 
   const _StudentRequestCard({
     required this.request,
@@ -224,6 +326,8 @@ class _StudentRequestCard extends ConsumerWidget {
     required this.onOpenRoom,
     required this.onVisit,
     required this.onReview,
+    required this.onMessage,
+    required this.onToggleBlock,
   });
 
   @override
@@ -231,6 +335,35 @@ class _StudentRequestCard extends ConsumerWidget {
     final theme = Theme.of(context);
     final roomAsync = ref.watch(roomProvider(request.roomId));
     final room = roomAsync.valueOrNull;
+    final detailsAsync = ref.watch(
+      bookingInteractionDetailsProvider(request.requestId),
+    );
+    final details = detailsAsync.valueOrNull;
+    // The server-resolved metadata is authoritative. The request fields are
+    // only a fallback for the short time before the callable has answered;
+    // they may contain an older name or title.
+    final ownerName = details?.ownerName.trim().isNotEmpty == true
+        ? details!.ownerName.trim()
+        : request.ownerName.trim().isNotEmpty
+        ? request.ownerName.trim()
+        : request.ownerId;
+    final roomTitle = details?.roomTitle.trim().isNotEmpty == true
+        ? details!.roomTitle.trim()
+        : room?.title.trim().isNotEmpty == true
+        ? room!.title.trim()
+        : request.roomTitle.trim().isNotEmpty
+        ? request.roomTitle.trim()
+        : request.roomId;
+    final isBlocked = details?.isBlocked ?? false;
+    final blockedByMe = details?.blockedByMe ?? false;
+    final blockedMe = details?.blockedMe ?? false;
+    // The server owns the current block state. Until it has answered, every
+    // action which advances the interaction stays disabled. A refresh is
+    // also a loading state: a previously cached value must not keep an
+    // action enabled while the server is revalidating it.
+    final interactionReady =
+        details != null && !detailsAsync.isLoading && !detailsAsync.hasError;
+    final progressionBlocked = !interactionReady || isBlocked;
 
     final fee = request.commissionAmount;
     final paymentStatus = request.advancePaymentStatus;
@@ -253,12 +386,18 @@ class _StudentRequestCard extends ConsumerWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      room?.title ?? 'Room ${request.roomId}',
+                      roomTitle,
                       style: theme.textTheme.titleMedium,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
                     const SizedBox(height: 2),
+                    Text(
+                      'Owner: $ownerName',
+                      style: theme.textTheme.bodySmall,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                     Text(
                       AppFormatters.formatRelativeTime(request.createdAt),
                       style: theme.textTheme.bodySmall,
@@ -286,6 +425,28 @@ class _StudentRequestCard extends ConsumerWidget {
             ],
           ),
           const SizedBox(height: AppSpacing.md),
+          if (isBlocked) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(AppSpacing.sm),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.errorContainer,
+                borderRadius: BorderRadius.circular(AppBorderRadius.md),
+              ),
+              child: Text(
+                blockedByMe && blockedMe
+                    ? 'You and $ownerName have blocked each other.'
+                    : blockedByMe
+                    ? 'You blocked $ownerName. Unblock them to continue.'
+                    : '$ownerName blocked you. You can still cancel this '
+                          'request.',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onErrorContainer,
+                ),
+              ),
+            ),
+            const SizedBox(height: AppSpacing.md),
+          ],
           Text(
             'Rent: ${AppFormatters.formatCurrency(request.monthlyRentAtJoin)}/month',
             style: theme.textTheme.bodyMedium,
@@ -304,6 +465,15 @@ class _StudentRequestCard extends ConsumerWidget {
           ),
           const SizedBox(height: AppSpacing.md),
           _PaymentStatusBanner(request: request, paymentStatus: paymentStatus),
+          if (!interactionReady) ...[
+            const SizedBox(height: AppSpacing.md),
+            InteractionStatusNotice(
+              isLoading: detailsAsync.isLoading,
+              onRetry: () => ref.invalidate(
+                bookingInteractionDetailsProvider(request.requestId),
+              ),
+            ),
+          ],
           if (request.rejectionReason != null &&
               request.rejectionReason!.trim().isNotEmpty) ...[
             const SizedBox(height: AppSpacing.sm),
@@ -323,6 +493,27 @@ class _StudentRequestCard extends ConsumerWidget {
             runSpacing: AppSpacing.sm,
             children: [
               _actionButton('View Room', onOpenRoom, ButtonType.secondary),
+              _actionButton(
+                'Message owner',
+                isBusy || progressionBlocked ? null : onMessage,
+                ButtonType.secondary,
+              ),
+              if (blockedByMe)
+                _actionButton(
+                  'Unblock owner',
+                  isBusy || !interactionReady
+                      ? null
+                      : () => onToggleBlock(ownerName, true),
+                  ButtonType.primary,
+                )
+              else if (!blockedMe)
+                _actionButton(
+                  'Block owner',
+                  isBusy || !interactionReady
+                      ? null
+                      : () => onToggleBlock(ownerName, false),
+                  ButtonType.danger,
+                ),
               // Once the owner accepted the request the student knows where
               // the room is and may review it.
               if (request.isOwnerAccepted) ...[
@@ -332,7 +523,7 @@ class _StudentRequestCard extends ConsumerWidget {
               if (request.status == JoinRequestStatus.ownerConfirmed)
                 _actionButton(
                   'Confirm Request',
-                  isBusy ? null : onConfirm,
+                  isBusy || progressionBlocked ? null : onConfirm,
                   ButtonType.primary,
                 ),
               if (canPay)
@@ -340,7 +531,7 @@ class _StudentRequestCard extends ConsumerWidget {
                   paymentStatus == PaymentStatus.rejected
                       ? 'Pay Again'
                       : 'Pay Platform Fee',
-                  isBusy ? null : onPay,
+                  isBusy || progressionBlocked ? null : onPay,
                   ButtonType.primary,
                 ),
               // A student may withdraw only before the booking is activated.

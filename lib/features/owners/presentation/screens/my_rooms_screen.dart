@@ -196,6 +196,9 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
             imageUrl: room.primaryImage.isEmpty ? null : room.primaryImage,
             width: double.infinity,
             height: 120,
+            onTap: room.hasImages
+                ? () => RoomImageViewer.show(context, imageUrls: room.images)
+                : null,
             borderRadius: const BorderRadius.vertical(
               top: Radius.circular(AppBorderRadius.lg),
             ),

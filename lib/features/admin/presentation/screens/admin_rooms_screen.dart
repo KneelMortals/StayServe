@@ -282,13 +282,21 @@ class _AdminRoomCard extends ConsumerWidget {
                   borderRadius: BorderRadius.circular(AppBorderRadius.md),
                 ),
                 child: room.hasImages
-                    ? ClipRRect(
-                        borderRadius: BorderRadius.circular(AppBorderRadius.md),
-                        child: Image.network(
-                          room.primaryImage,
-                          fit: BoxFit.cover,
-                          width: 72,
-                          height: 72,
+                    ? GestureDetector(
+                        onTap: () => RoomImageViewer.show(
+                          context,
+                          imageUrls: room.images,
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(
+                            AppBorderRadius.md,
+                          ),
+                          child: Image.network(
+                            room.primaryImage,
+                            fit: BoxFit.cover,
+                            width: 72,
+                            height: 72,
+                          ),
                         ),
                       )
                     : const Icon(Icons.image, size: 28),

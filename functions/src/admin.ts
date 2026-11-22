@@ -312,6 +312,9 @@ export async function deleteUserConversations(uid: string): Promise<void> {
       await deleteWhere(() =>
         conversation.ref.collection('messages').orderBy('__name__'),
       );
+      await deleteWhere(() =>
+        conversation.ref.collection('contexts').orderBy('__name__'),
+      );
 
       await db.runTransaction(async (transaction) => {
         const current = await transaction.get(conversation.ref);
@@ -464,6 +467,36 @@ async function cancelOpenAccountDeletionRequests(uid: string): Promise<number> {
   }
 
   return cancelledCount;
+}
+
+/** Removes both directions of every personal block involving [uid]. */
+async function deletePersonalBlocks(uid: string): Promise<void> {
+  // Personal blocks are directional. Remove both the blocks this account
+  // created and the blocks other accounts created against it, so a deleted
+  // uid can never keep restricting somebody else's interaction.
+  //
+  // The canonical document path is `userBlocks/{blocker}/blockedUsers/{uid}`.
+  // Sweep that path as well as the duplicated `blockedUserId` field: a
+  // malformed legacy record whose field disagrees with its path still blocks
+  // the surviving participant in the Firestore rules, so it must not survive
+  // account deletion.
+  await deleteWhere(
+    () => db.collectionGroup('blockedUsers').orderBy('__name__'),
+    (document) => document.id === uid,
+  );
+  await deleteWhere(() =>
+    db
+      .collectionGroup('blockedUsers')
+      .where('blockedUserId', '==', uid)
+      .orderBy('__name__'),
+  );
+  await deleteWhere(() =>
+    db
+      .collection('userBlocks')
+      .doc(uid)
+      .collection('blockedUsers')
+      .orderBy('__name__'),
+  );
 }
 
 /**
@@ -719,6 +752,11 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // no longer have a valid destination profile.
   await db.collection('roleClaimJobs').doc(uid).delete();
 
+  // Personal blocks are directional. Remove both the blocks this account
+  // created and the blocks other accounts created against it, so a deleted
+  // uid can never keep restricting somebody else's interaction.
+  await deletePersonalBlocks(uid);
+
   // The conversations of the user, with all their messages. Each parent is
   // marked before its messages are scanned, so a late message cannot become
   // an orphan after the parent is deleted.
@@ -753,6 +791,12 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // the room photos and the Auth account are gone. Keeping it until the end
   // preserves the account-state marker for a failed or interrupted cleanup.
   await db.collection('users').doc(uid).delete();
+
+  // Run one final block sweep after the profile is gone. A block transaction
+  // which was already in flight when the profile was deleted either loses
+  // the Firestore transaction race or is observed by this sweep. The profile
+  // fence prevents every later block from being created in the first place.
+  await deletePersonalBlocks(uid);
 }
 
 /**

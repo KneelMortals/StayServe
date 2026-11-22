@@ -498,6 +498,11 @@ class _RoomFormState extends ConsumerState<RoomForm> {
                   return _buildImageTile(
                     context,
                     imageUrl: _existingImages[index],
+                    onOpen: () => RoomImageViewer.show(
+                      context,
+                      imageUrls: _existingImages,
+                      initialIndex: index,
+                    ),
                     onRemove: () => setState(() {
                       _existingImages.removeAt(index);
                     }),
@@ -534,6 +539,7 @@ class _RoomFormState extends ConsumerState<RoomForm> {
     BuildContext context, {
     String? imageUrl,
     _PickedImage? picked,
+    VoidCallback? onOpen,
     required VoidCallback onRemove,
   }) {
     final theme = Theme.of(context);
@@ -557,6 +563,7 @@ class _RoomFormState extends ConsumerState<RoomForm> {
                 : AppImage(
                     imageUrl: imageUrl,
                     fit: BoxFit.cover,
+                    onTap: onOpen,
                     placeholder: Container(
                       color: theme.colorScheme.surfaceContainerHighest,
                       child: const Icon(Icons.broken_image_outlined),

@@ -428,6 +428,8 @@ final routerProvider = Provider<GoRouter>((ref) {
               // The recipient of the messages is handed over with the route,
               // so the chat does not have to wait for the conversation list.
               peerId: state.uri.queryParameters['peer'],
+              roomId: state.uri.queryParameters['room'],
+              requestId: state.uri.queryParameters['request'],
             ),
           );
         },

@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../../../core/index.dart';
 import '../../../../models/join_request_model.dart';
+import '../../../messaging/presentation/providers/messaging_providers.dart';
 import '../providers/admin_providers.dart';
 import '../widgets/admin_scaffold.dart';
 
@@ -76,7 +77,7 @@ class _AdminRequestsScreenState extends ConsumerState<AdminRequestsScreen> {
   }
 }
 
-class _AdminRequestCard extends StatelessWidget {
+class _AdminRequestCard extends ConsumerWidget {
   final JoinRequestModel request;
   final VoidCallback onOpenPayments;
 
@@ -86,8 +87,26 @@ class _AdminRequestCard extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
+    final details = ref
+        .watch(bookingInteractionDetailsProvider(request.requestId))
+        .valueOrNull;
+    final studentName = details?.studentName.trim().isNotEmpty == true
+        ? details!.studentName.trim()
+        : request.studentName.trim().isNotEmpty
+        ? request.studentName.trim()
+        : request.studentId;
+    final ownerName = details?.ownerName.trim().isNotEmpty == true
+        ? details!.ownerName.trim()
+        : request.ownerName.trim().isNotEmpty
+        ? request.ownerName.trim()
+        : request.ownerId;
+    final roomTitle = details?.roomTitle.trim().isNotEmpty == true
+        ? details!.roomTitle.trim()
+        : request.roomTitle.trim().isNotEmpty
+        ? request.roomTitle.trim()
+        : request.roomId;
     Color statusColor;
     switch (request.status) {
       case JoinRequestStatus.pending:
@@ -133,7 +152,7 @@ class _AdminRequestCard extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                       ),
                       Text(
-                        'Room: ${request.roomId} • Student: ${request.studentId} • Owner: ${request.ownerId}',
+                        'Room: $roomTitle • Student: $studentName • Owner: $ownerName',
                         style: theme.textTheme.bodySmall,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,

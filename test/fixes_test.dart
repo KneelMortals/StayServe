@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
@@ -12,12 +14,14 @@ import 'package:stayserve/core/routing/app_router.dart';
 import 'package:stayserve/core/routing/back_to_dashboard.dart';
 import 'package:stayserve/core/widgets/common_widgets.dart';
 import 'package:stayserve/features/auth/presentation/providers/auth_provider.dart';
+import 'package:stayserve/features/messaging/presentation/providers/messaging_providers.dart';
 import 'package:stayserve/features/students/presentation/providers/student_providers.dart';
 import 'package:stayserve/features/students/presentation/screens/room_detail_screen.dart';
 import 'package:stayserve/firebase/functions/functions_service.dart';
 import 'package:stayserve/firebase/payments/payment_repository.dart';
 import 'package:stayserve/firebase/student/student_join_request_repository.dart';
 import 'package:stayserve/firebase/student/student_repository.dart';
+import 'package:stayserve/models/interaction_model.dart';
 import 'package:stayserve/models/room_model.dart';
 import 'package:stayserve/models/user_model.dart';
 import 'package:stayserve/services/payment_service.dart';
@@ -255,7 +259,7 @@ void main() {
       }
       expect(find.text('1 / ${images.length}'), findsOneWidget);
 
-      // Selecting another thumbnail opens that exact photo.
+      // Selecting another thumbnail opens that exact photo full-screen.
       await tester.tap(
         find.byKey(
           const ValueKey(
@@ -266,14 +270,193 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 300));
 
-      expect(find.text('2 / ${images.length}'), findsOneWidget);
+      expect(find.byKey(const ValueKey('room-image-viewer')), findsOneWidget);
       expect(
-        find.byKey(
-          const ValueKey(
-            'room-gallery-image-https://example.com/room-photo-2.jpg',
-          ),
+        find.byKey(const ValueKey('room-image-viewer-page-count')),
+        findsOneWidget,
+      );
+      expect(find.text('2 / ${images.length}'), findsNWidgets(2));
+
+      await tester.tap(find.byKey(const ValueKey('room-image-viewer-close')));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+
+      // Closing the viewer leaves the detail gallery on the selected photo.
+      expect(find.byKey(const ValueKey('room-image-viewer')), findsNothing);
+      expect(find.text('2 / ${images.length}'), findsOneWidget);
+      expect(find.text('2 of ${images.length}'), findsOneWidget);
+    });
+  });
+
+  group('room interaction metadata', () {
+    testWidgets('an unavailable owner status fails closed', (tester) async {
+      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.student),
+            authStateProvider.overrideWith((ref) => Stream.value(user)),
+            roomProvider.overrideWith(
+              (ref, roomId) => Stream.value(_room(ownerId: 'owner-1')),
+            ),
+            myJoinRequestsProvider.overrideWith(
+              (ref) => Stream.value(const []),
+            ),
+            roomContactDetailsProvider.overrideWith(
+              (ref, roomId) async =>
+                  throw Exception('interaction details unavailable'),
+            ),
+            userLocationProvider.overrideWith(_FakeLocationNotifier.new),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
+          ],
+          child: const MaterialApp(home: RoomDetailScreen(roomId: 'room-1')),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text(
+          'Could not verify the participant status. New messages and booking '
+          'progression are paused.',
         ),
         findsOneWidget,
+      );
+      expect(
+        tester
+            .widget<AppButton>(find.widgetWithText(AppButton, 'Contact Owner'))
+            .onPressed,
+        isNull,
+      );
+      expect(
+        tester
+            .widget<AppButton>(
+              find.widgetWithText(AppButton, 'Request to Book'),
+            )
+            .onPressed,
+        isNull,
+      );
+    });
+
+    testWidgets('a loading owner status fails closed', (tester) async {
+      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+      final pendingDetails = Completer<RoomContactDetails>();
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.student),
+            authStateProvider.overrideWith((ref) => Stream.value(user)),
+            roomProvider.overrideWith(
+              (ref, roomId) => Stream.value(_room(ownerId: 'owner-1')),
+            ),
+            myJoinRequestsProvider.overrideWith(
+              (ref) => Stream.value(const []),
+            ),
+            roomContactDetailsProvider.overrideWith(
+              (ref, roomId) => pendingDetails.future,
+            ),
+            userLocationProvider.overrideWith(_FakeLocationNotifier.new),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
+          ],
+          child: const MaterialApp(home: RoomDetailScreen(roomId: 'room-1')),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('Checking contact status…'), findsOneWidget);
+      expect(
+        tester
+            .widget<AppButton>(find.widgetWithText(AppButton, 'Contact Owner'))
+            .onPressed,
+        isNull,
+      );
+      expect(
+        tester
+            .widget<AppButton>(
+              find.widgetWithText(AppButton, 'Request to Book'),
+            )
+            .onPressed,
+        isNull,
+      );
+
+      pendingDetails.complete(
+        const RoomContactDetails(
+          roomId: 'room-1',
+          roomTitle: 'Test room',
+          ownerId: 'owner-1',
+          ownerName: 'Meera Nair',
+        ),
+      );
+      await tester.pumpAndSettle();
+    });
+  });
+
+  group('a blocked room contact', () {
+    testWidgets('disables contact and booking but keeps unblock available', (
+      tester,
+    ) async {
+      final user = MockUser(uid: 'student-1', email: 'student@example.com');
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            currentUserProvider.overrideWithValue(user),
+            currentUserRoleProvider.overrideWithValue(UserRole.student),
+            authStateProvider.overrideWith((ref) => Stream.value(user)),
+            roomProvider.overrideWith(
+              (ref, roomId) => Stream.value(_room(ownerId: 'owner-1')),
+            ),
+            myJoinRequestsProvider.overrideWith(
+              (ref) => Stream.value(const []),
+            ),
+            roomContactDetailsProvider.overrideWith(
+              (ref, roomId) async => const RoomContactDetails(
+                roomId: 'room-1',
+                roomTitle: 'Test room',
+                ownerId: 'owner-1',
+                ownerName: 'Meera Nair',
+                blockedByMe: true,
+                blockedMe: false,
+                canContact: false,
+              ),
+            ),
+            userLocationProvider.overrideWith(_FakeLocationNotifier.new),
+            studentRepositoryProvider.overrideWithValue(
+              _FakeStudentRepository(),
+            ),
+          ],
+          child: const MaterialApp(home: RoomDetailScreen(roomId: 'room-1')),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        tester
+            .widget<AppButton>(find.widgetWithText(AppButton, 'Contact Owner'))
+            .onPressed,
+        isNull,
+      );
+      expect(
+        tester
+            .widget<AppButton>(
+              find.widgetWithText(AppButton, 'Request to Book'),
+            )
+            .onPressed,
+        isNull,
+      );
+      expect(
+        tester
+            .widget<AppButton>(find.widgetWithText(AppButton, 'Unblock Owner'))
+            .onPressed,
+        isNotNull,
       );
     });
   });

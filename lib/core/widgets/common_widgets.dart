@@ -235,6 +235,7 @@ class AppImage extends StatelessWidget {
   final BorderRadius? borderRadius;
   final Widget? placeholder;
   final Widget? errorWidget;
+  final VoidCallback? onTap;
 
   const AppImage({
     this.imageUrl,
@@ -244,6 +245,7 @@ class AppImage extends StatelessWidget {
     this.borderRadius,
     this.placeholder,
     this.errorWidget,
+    this.onTap,
     super.key,
   });
 
@@ -262,10 +264,19 @@ class AppImage extends StatelessWidget {
       errorWidget: (context, url, error) => errorWidget ?? _buildError(context),
     );
 
-    if (borderRadius != null) {
-      return ClipRRect(borderRadius: borderRadius!, child: image);
-    }
-    return image;
+    final clippedImage = borderRadius != null
+        ? ClipRRect(borderRadius: borderRadius!, child: image)
+        : image;
+    if (onTap == null) return clippedImage;
+
+    return Semantics(
+      button: true,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: clippedImage,
+      ),
+    );
   }
 
   Widget _buildPlaceholder(BuildContext context) {

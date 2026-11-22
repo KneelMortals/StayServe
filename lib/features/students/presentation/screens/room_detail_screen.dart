@@ -5,9 +5,12 @@ import 'package:firebase_auth/firebase_auth.dart';
 
 import '../../../../core/index.dart';
 import '../../../../../firebase/index.dart';
+import '../../../../../models/interaction_model.dart';
 import '../../../../../models/join_request_model.dart';
 import '../../../../../models/room_model.dart';
 import '../../../../../services/user_location_provider.dart';
+import '../../../messaging/presentation/providers/messaging_providers.dart';
+import '../../../messaging/presentation/widgets/interaction_status_notice.dart';
 import '../../../reviews/presentation/providers/review_providers.dart';
 import '../providers/student_providers.dart';
 import '../widgets/room_visit_sheet.dart';
@@ -159,6 +162,12 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     final isAvailable = room.isAvailable;
     final currentUser = ref.watch(currentUserProvider);
     final currentUserRole = ref.watch(currentUserRoleProvider);
+    final contactAsync =
+        currentUser != null &&
+            currentUserRole == UserRole.student &&
+            room.ownerId != currentUser.uid
+        ? ref.watch(roomContactDetailsProvider(room.roomId))
+        : null;
     final location = ref.watch(userLocationProvider);
     final distanceKm = roomDistanceFromUser(room, location);
 
@@ -208,13 +217,23 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
                   const SizedBox(height: AppSpacing.lg),
                   _buildAmenities(context, room),
                   const SizedBox(height: AppSpacing.lg),
-                  _buildOwnerInfo(context, room),
+                  _buildOwnerInfo(context, room, contactAsync),
                   const SizedBox(height: AppSpacing.lg),
+                  if (contactAsync?.hasError == true) ...[
+                    InteractionStatusNotice(
+                      isLoading: false,
+                      onRetry: () => ref.invalidate(
+                        roomContactDetailsProvider(room.roomId),
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.md),
+                  ],
                   _buildActionButtons(
                     context,
                     room,
                     currentUser,
                     currentUserRole,
+                    contactAsync,
                     isAvailable,
                     isAccepted,
                     activeRequest,
@@ -246,6 +265,33 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     );
   }
 
+  /// Opens one room photo and keeps the detail gallery on the same image.
+  Future<void> _openRoomImage(
+    BuildContext context,
+    RoomModel room,
+    int index,
+  ) async {
+    if (room.images.isEmpty) return;
+    final safeIndex = index.clamp(0, room.images.length - 1).toInt();
+    if (_currentImageIndex != safeIndex) {
+      setState(() => _currentImageIndex = safeIndex);
+    }
+    if (_imagePageController.hasClients) {
+      _imagePageController.jumpToPage(safeIndex);
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _imagePageController.hasClients) {
+          _imagePageController.jumpToPage(safeIndex);
+        }
+      });
+    }
+    await RoomImageViewer.show(
+      context,
+      imageUrls: room.images,
+      initialIndex: safeIndex,
+    );
+  }
+
   /// The large, swipeable gallery of every photo uploaded for the room.
   Widget _buildImageGallery(BuildContext context, RoomModel room) {
     if (!room.hasImages) {
@@ -272,6 +318,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
               key: ValueKey('room-gallery-image-${room.images[index]}'),
               imageUrl: room.images[index],
               fit: BoxFit.cover,
+              onTap: () => _openRoomImage(context, room, index),
               placeholder: Container(
                 color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 child: const Center(child: CircularProgressIndicator()),
@@ -358,7 +405,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
                     key: ValueKey(
                       'room-gallery-thumbnail-${room.images[index]}',
                     ),
-                    onTap: () => _selectImage(index),
+                    onTap: () => _openRoomImage(context, room, index),
                     borderRadius: BorderRadius.circular(AppBorderRadius.sm),
                     child: Container(
                       width: 84,
@@ -396,19 +443,6 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
         ],
       ),
     );
-  }
-
-  Future<void> _selectImage(int index) async {
-    if (index < 0 || index >= widget.room.images.length) return;
-
-    setState(() => _currentImageIndex = index);
-    if (_imagePageController.hasClients) {
-      await _imagePageController.animateToPage(
-        index,
-        duration: const Duration(milliseconds: 250),
-        curve: Curves.easeOut,
-      );
-    }
   }
 
   Widget _buildRoomInfo(
@@ -647,10 +681,22 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     );
   }
 
-  Widget _buildOwnerInfo(BuildContext context, RoomModel room) {
+  Widget _buildOwnerInfo(
+    BuildContext context,
+    RoomModel room,
+    AsyncValue<RoomContactDetails>? contactAsync,
+  ) {
     final theme = Theme.of(context);
     final currentUser = ref.watch(currentUserProvider);
     final isOwnRoom = currentUser != null && room.ownerId == currentUser.uid;
+    final contact = contactAsync?.valueOrNull;
+    final ownerName = contact?.ownerName.trim().isNotEmpty == true
+        ? contact!.ownerName.trim()
+        : room.ownerId;
+    final contactBlocked = contact?.isBlocked ?? false;
+    final interactionReady =
+        contactAsync == null ||
+        (contact != null && !contactAsync.isLoading && !contactAsync.hasError);
 
     return Container(
       padding: const EdgeInsets.all(AppSpacing.md),
@@ -660,15 +706,28 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       ),
       child: Row(
         children: [
-          const AppAvatar(name: 'Owner', radius: 30),
+          AppAvatar(name: ownerName, radius: 30),
           const SizedBox(width: AppSpacing.md),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Room Owner', style: theme.textTheme.titleMedium),
                 Text(
-                  isOwnRoom ? 'This is your listing' : 'Contact to know more',
+                  ownerName,
+                  style: theme.textTheme.titleMedium,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  isOwnRoom
+                      ? 'This is your listing'
+                      : contactAsync?.isLoading == true
+                      ? 'Checking contact status…'
+                      : contactAsync?.hasError == true
+                      ? 'Contact status is temporarily unavailable'
+                      : contactBlocked
+                      ? 'Messaging is currently unavailable'
+                      : 'Contact to know more',
                   style: theme.textTheme.bodySmall,
                 ),
               ],
@@ -677,14 +736,51 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
           // There is no point in opening a chat with yourself.
           if (!isOwnRoom)
             AppButton(
-              label: 'Message',
-              onPressed: () => _openChat(context, room),
+              label: contact?.blockedByMe == true ? 'Unblock Owner' : 'Message',
+              onPressed: !interactionReady
+                  ? null
+                  : contact?.blockedByMe == true
+                  ? () => _unblockOwner(context, contact!.ownerId)
+                  : contactBlocked
+                  ? null
+                  : () => _openChat(context, room),
               isFullWidth: false,
-              type: ButtonType.secondary,
+              type: contact?.blockedByMe == true
+                  ? ButtonType.primary
+                  : ButtonType.secondary,
             ),
         ],
       ),
     );
+  }
+
+  /// Removes the student's own block of this listing's owner.
+  Future<void> _unblockOwner(BuildContext context, String ownerId) async {
+    try {
+      await ref.read(conversationRepositoryProvider).unblockUser(ownerId);
+      if (!context.mounted) return;
+      final currentUserId = ref.read(currentUserProvider)?.uid ?? '';
+      invalidateParticipantInteractionProviders(
+        ref,
+        conversationId: conversationIdForParticipants(currentUserId, ownerId),
+        roomId: widget.room.roomId,
+      );
+      // The room screen does not know which request-backed chat variants are
+      // mounted, so clear the family caches as well.
+      ref.invalidate(conversationInteractionDetailsProvider);
+      ref.invalidate(bookingInteractionDetailsProvider);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('The owner was unblocked.')));
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+    }
   }
 
   /// Opens the chat with the owner of the room.
@@ -702,13 +798,19 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     }
 
     try {
-      final conversationId = await ref
+      final opened = await ref
           .read(conversationRepositoryProvider)
           .openConversation(room.ownerId, roomId: room.roomId);
       if (!context.mounted) return;
       // The recipient is handed over with the route, so that the message
-      // input is there right away.
-      context.push('/chat/$conversationId?peer=${room.ownerId}');
+      // input is there right away. The listing context lets the server
+      // resolve the correct room title.
+      context.push(
+        Uri(
+          path: '/chat/${opened.conversationId}',
+          queryParameters: {'peer': room.ownerId, 'room': room.roomId},
+        ).toString(),
+      );
     } catch (e) {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -727,12 +829,18 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     RoomModel room,
     User? currentUser,
     UserRole? currentUserRole,
+    AsyncValue<RoomContactDetails>? contactAsync,
     bool isAvailable,
     bool isAccepted,
     JoinRequestModel? activeRequest,
     bool sentRequestWasClosed,
   ) {
     final theme = Theme.of(context);
+    final contact = contactAsync?.valueOrNull;
+    final contactBlocked = contact?.isBlocked ?? false;
+    final interactionReady =
+        contactAsync == null ||
+        (contact != null && !contactAsync.isLoading && !contactAsync.hasError);
 
     if (currentUser == null) {
       return Row(
@@ -942,7 +1050,9 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
           ],
           AppButton(
             label: 'Contact Owner',
-            onPressed: () => _openChat(context, room),
+            onPressed: !interactionReady || contactBlocked
+                ? null
+                : () => _openChat(context, room),
             isFullWidth: true,
             type: ButtonType.secondary,
           ),
@@ -980,7 +1090,9 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
         Expanded(
           child: AppButton(
             label: 'Contact Owner',
-            onPressed: () => _openChat(context, room),
+            onPressed: !interactionReady || contactBlocked
+                ? null
+                : () => _openChat(context, room),
             type: ButtonType.secondary,
           ),
         ),
@@ -988,7 +1100,9 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
         Expanded(
           child: AppButton(
             label: 'Request to Book',
-            onPressed: _busy ? null : () => _showBookingDialog(context, room),
+            onPressed: _busy || !interactionReady || contactBlocked
+                ? null
+                : () => _showBookingDialog(context, room),
             isLoading: _busy,
             type: ButtonType.primary,
           ),

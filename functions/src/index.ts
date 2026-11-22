@@ -329,6 +329,19 @@ export {
   notifyUser,
 } from './requests';
 
+// Participant names and personal student-owner blocks.
+//
+// The peer profile is private, so the server resolves the display names and
+// owns the directional block documents. The client only receives the small
+// amount of metadata it needs to render the interaction safely.
+export {
+  getConversationInteractionDetails,
+  getBookingInteractionDetails,
+  getRoomContactDetails,
+  blockUser,
+  unblockUser,
+} from './interactions';
+
 // Notification content and deletion are server-owned. Clients may only
 // update the read bookkeeping of their own notification.
 export { deleteNotification } from './notifications';

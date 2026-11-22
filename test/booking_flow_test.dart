@@ -9,11 +9,13 @@ import 'package:go_router/go_router.dart';
 import 'package:stayserve/core/constants/enums.dart';
 import 'package:stayserve/core/widgets/common_widgets.dart';
 import 'package:stayserve/features/auth/presentation/providers/auth_provider.dart';
+import 'package:stayserve/features/messaging/presentation/providers/messaging_providers.dart';
 import 'package:stayserve/features/students/presentation/providers/student_providers.dart';
 import 'package:stayserve/features/students/presentation/screens/room_detail_screen.dart';
 import 'package:stayserve/firebase/functions/functions_service.dart';
 import 'package:stayserve/firebase/student/student_join_request_repository.dart';
 import 'package:stayserve/firebase/student/student_repository.dart';
+import 'package:stayserve/models/interaction_model.dart';
 import 'package:stayserve/models/join_request_model.dart';
 import 'package:stayserve/models/room_model.dart';
 import 'package:stayserve/services/user_location_provider.dart';
@@ -204,6 +206,14 @@ Future<void> _pumpRoom(
         myJoinRequestsProvider.overrideWith(
           (ref) => Stream<List<JoinRequestModel>>.value(
             List<JoinRequestModel>.of(studentRepository.requests),
+          ),
+        ),
+        roomContactDetailsProvider.overrideWith(
+          (ref, roomId) async => RoomContactDetails(
+            roomId: roomId,
+            roomTitle: 'Test room',
+            ownerId: 'owner-1',
+            ownerName: 'Meera Nair',
           ),
         ),
       ],

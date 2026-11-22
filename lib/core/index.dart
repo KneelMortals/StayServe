@@ -10,6 +10,7 @@ export 'utils/app_exit.dart';
 export 'utils/app_snackbar.dart';
 export 'utils/distance.dart';
 export 'widgets/common_widgets.dart';
+export 'widgets/room_image_viewer.dart';
 export 'widgets/room_card.dart';
 export 'widgets/radio_filter_sheet.dart';
 export 'widgets/theme_mode_switch.dart';

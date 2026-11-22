@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/index.dart';
 import '../../../../firebase/index.dart';
 import '../../../../models/payment_model.dart';
+import '../../../messaging/presentation/providers/messaging_providers.dart';
 import '../providers/admin_providers.dart';
 import '../widgets/admin_scaffold.dart';
 
@@ -221,7 +222,7 @@ class _RejectPaymentDialogState extends State<_RejectPaymentDialog> {
   }
 }
 
-class _AdminPaymentCard extends StatelessWidget {
+class _AdminPaymentCard extends ConsumerWidget {
   final PaymentModel payment;
   final VoidCallback onVerify;
   final VoidCallback onReject;
@@ -233,8 +234,20 @@ class _AdminPaymentCard extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
+    final details = ref
+        .watch(bookingInteractionDetailsProvider(payment.requestId))
+        .valueOrNull;
+    final roomLabel = details?.roomTitle.trim().isNotEmpty == true
+        ? details!.roomTitle.trim()
+        : payment.roomId;
+    final studentLabel = details?.studentName.trim().isNotEmpty == true
+        ? details!.studentName.trim()
+        : payment.studentId;
+    final ownerLabel = details?.ownerName.trim().isNotEmpty == true
+        ? details!.ownerName.trim()
+        : payment.ownerId;
     final statusColor = switch (payment.status) {
       PaymentStatus.submitted => Colors.orange,
       PaymentStatus.verified => Colors.green,
@@ -261,13 +274,19 @@ class _AdminPaymentCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      'Room: ${payment.roomId}',
+                      'Room: $roomLabel',
                       style: theme.textTheme.bodySmall,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
                     Text(
-                      'Student: ${payment.studentId}',
+                      'Student: $studentLabel',
+                      style: theme.textTheme.bodySmall,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text(
+                      'Owner: $ownerLabel',
                       style: theme.textTheme.bodySmall,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,

@@ -16,8 +16,10 @@ import 'package:stayserve/features/admin/presentation/screens/admin_rooms_screen
 import 'package:stayserve/features/admin/presentation/screens/admin_settings_screen.dart';
 import 'package:stayserve/features/admin/presentation/screens/admin_users_screen.dart';
 import 'package:stayserve/features/admin/presentation/widgets/admin_scaffold.dart';
+import 'package:stayserve/features/messaging/presentation/providers/messaging_providers.dart';
 import 'package:stayserve/features/notifications/presentation/providers/notification_providers.dart';
 import 'package:stayserve/firebase/admin/admin_repository.dart';
+import 'package:stayserve/models/interaction_model.dart';
 import 'package:stayserve/models/join_request_model.dart';
 import 'package:stayserve/models/launch_pincode_config.dart';
 import 'package:stayserve/models/payment_model.dart';
@@ -261,7 +263,23 @@ List<Override> _overrides() {
       (ref, filter) => Stream.value(_invoices),
     ),
     adminPaymentsProvider.overrideWith(
-      (ref, filter) => Stream.value(_payments),
+      (ref, filter) => Stream.value(
+        _payments
+            .where((payment) => filter == null || payment.status == filter)
+            .toList(),
+      ),
+    ),
+    bookingInteractionDetailsProvider.overrideWith(
+      (ref, requestId) async => const BookingInteractionDetails(
+        requestId: 'JRQ-1794513452376',
+        studentId: 'student-1',
+        ownerId: 'owner-1',
+        studentName: 'Arjun Shah',
+        ownerName: 'Meera Nair',
+        roomId: 'room-1',
+        roomTitle: 'Sunset Studio',
+        canSend: true,
+      ),
     ),
     adminCommissionPercentageProvider.overrideWith((ref) async => 30.0),
     adminMaintenanceModeProvider.overrideWith((ref) async => false),
@@ -357,6 +375,25 @@ void main() {
         );
       });
     }
+  });
+
+  testWidgets('payments show the resolved listing and participant names', (
+    tester,
+  ) async {
+    final error = await _render(
+      tester,
+      path: '/admin/payments',
+      screen: const AdminPaymentsScreen(),
+      size: const Size(800, 600),
+    );
+
+    expect(error, isNull);
+    expect(find.text('Room: Sunset Studio'), findsWidgets);
+    expect(find.text('Student: Arjun Shah'), findsWidgets);
+    expect(find.text('Owner: Meera Nair'), findsWidgets);
+    expect(find.text('Room: room-1'), findsNothing);
+    expect(find.text('Student: student-1'), findsNothing);
+    expect(find.text('Owner: owner-1'), findsNothing);
   });
 
   group('the admin navigation', () {

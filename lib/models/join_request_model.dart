@@ -32,6 +32,17 @@ String? _optionalString(dynamic value) {
   return value is String ? value : null;
 }
 
+/// Returns the first non-empty string from the current and snapshot values.
+///
+/// An empty current display value must not hide a valid immutable request
+/// snapshot. The server uses the same fallback order when it resolves names.
+String _firstNonEmptyString(dynamic first, dynamic second) {
+  for (final value in [first, second]) {
+    if (value is String && value.trim().isNotEmpty) return value.trim();
+  }
+  return '';
+}
+
 double _doubleOr(dynamic value, double fallback) {
   return value is num ? value.toDouble() : fallback;
 }
@@ -49,6 +60,18 @@ class JoinRequestModel {
   final String roomId;
   final String studentId;
   final String ownerId;
+
+  /// Server-resolved display names for the two booking participants.
+  ///
+  /// Older requests did not contain these fields, so they remain optional.
+  /// The UI uses the request snapshot and then the participant uid as safe
+  /// fallbacks while the server enriches the request.
+  final String studentName;
+  final String ownerName;
+
+  /// The title of the room/listing which the request belongs to.
+  final String roomTitle;
+
   final JoinRequestStatus status;
   final DateTime createdAt;
   final DateTime updatedAt;
@@ -92,6 +115,9 @@ class JoinRequestModel {
     required this.roomId,
     required this.studentId,
     required this.ownerId,
+    this.studentName = '',
+    this.ownerName = '',
+    this.roomTitle = '',
     required this.status,
     required this.createdAt,
     required this.updatedAt,
@@ -120,6 +146,18 @@ class JoinRequestModel {
       roomId: _stringOr(json['roomId'], ''),
       studentId: _stringOr(json['studentId'], ''),
       ownerId: _stringOr(json['ownerId'], ''),
+      studentName: _firstNonEmptyString(
+        json['studentName'],
+        json['studentNameAtRequest'],
+      ),
+      ownerName: _firstNonEmptyString(
+        json['ownerName'],
+        json['ownerNameAtRequest'],
+      ),
+      roomTitle: _firstNonEmptyString(
+        json['roomTitle'],
+        json['roomTitleAtRequest'],
+      ),
       status: _parseJoinRequestStatus(
         json['status'] is String ? json['status'] as String : '',
       ),
@@ -156,6 +194,9 @@ class JoinRequestModel {
       'roomId': roomId,
       'studentId': studentId,
       'ownerId': ownerId,
+      'studentName': studentName,
+      'ownerName': ownerName,
+      'roomTitle': roomTitle,
       'status': status.value,
       'createdAt': Timestamp.fromDate(createdAt),
       'updatedAt': Timestamp.fromDate(updatedAt),
@@ -192,6 +233,9 @@ class JoinRequestModel {
     String? roomId,
     String? studentId,
     String? ownerId,
+    String? studentName,
+    String? ownerName,
+    String? roomTitle,
     JoinRequestStatus? status,
     DateTime? createdAt,
     DateTime? updatedAt,
@@ -218,6 +262,9 @@ class JoinRequestModel {
       roomId: roomId ?? this.roomId,
       studentId: studentId ?? this.studentId,
       ownerId: ownerId ?? this.ownerId,
+      studentName: studentName ?? this.studentName,
+      ownerName: ownerName ?? this.ownerName,
+      roomTitle: roomTitle ?? this.roomTitle,
       status: status ?? this.status,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,

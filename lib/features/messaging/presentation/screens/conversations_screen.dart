@@ -59,17 +59,22 @@ class ConversationsScreen extends ConsumerWidget {
               itemCount: conversations.length,
               itemBuilder: (context, index) {
                 final conversation = conversations[index];
-                final otherParticipant =
-                    conversation.getOtherParticipant(currentUid);
+                final otherParticipant = conversation.getOtherParticipant(
+                  currentUid,
+                );
                 return _ConversationTile(
                   conversation: conversation,
-                  name: otherParticipant.isEmpty
-                      ? 'Conversation'
-                      : otherParticipant,
+                  peerId: otherParticipant,
                   unread: conversation.getUnreadCount(currentUid) > 0,
                   onTap: () => context.push(
-                    '/chat/${conversation.conversationId}'
-                    '?peer=$otherParticipant',
+                    Uri(
+                      path: '/chat/${conversation.conversationId}',
+                      queryParameters: {
+                        'peer': otherParticipant,
+                        if (conversation.roomId?.isNotEmpty ?? false)
+                          'room': conversation.roomId!,
+                      },
+                    ).toString(),
                   ),
                 );
               },
@@ -81,22 +86,40 @@ class ConversationsScreen extends ConsumerWidget {
   }
 }
 
-class _ConversationTile extends StatelessWidget {
+class _ConversationTile extends ConsumerWidget {
   final ConversationModel conversation;
-  final String name;
+  final String peerId;
   final bool unread;
   final VoidCallback onTap;
 
   const _ConversationTile({
     required this.conversation,
-    required this.name,
+    required this.peerId,
     required this.unread,
     required this.onTap,
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
+    final detailsAsync = ref.watch(
+      conversationInteractionDetailsProvider((
+        conversationId: conversation.conversationId,
+        roomId: conversation.roomId,
+        requestId: null,
+      )),
+    );
+    final details = detailsAsync.valueOrNull;
+    final name = details?.peerName.isNotEmpty == true
+        ? details!.peerName
+        : conversation.getParticipantName(peerId).isNotEmpty
+        ? conversation.getParticipantName(peerId)
+        : peerId.isNotEmpty
+        ? peerId
+        : 'Loading participant…';
+    final roomTitle = details?.roomTitle.isNotEmpty == true
+        ? details!.roomTitle
+        : conversation.roomTitle;
 
     return Card(
       margin: const EdgeInsets.only(bottom: AppSpacing.sm),
@@ -137,12 +160,23 @@ class _ConversationTile extends StatelessWidget {
                     Text(
                       name,
                       style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight:
-                            unread ? FontWeight.w700 : FontWeight.w500,
+                        fontWeight: unread ? FontWeight.w700 : FontWeight.w500,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
+                    if (roomTitle.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        roomTitle,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: theme.colorScheme.primary,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
                     const SizedBox(height: AppSpacing.xs),
                     Text(
                       conversation.lastMessage.isEmpty

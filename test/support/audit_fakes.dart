@@ -29,6 +29,7 @@ import 'package:stayserve/firebase/student/student_join_request_repository.dart'
 import 'package:stayserve/firebase/student/student_repository.dart';
 import 'package:stayserve/firebase/storage/storage_service.dart';
 import 'package:stayserve/firebase/visits/visit_repository.dart';
+import 'package:stayserve/models/interaction_model.dart';
 import 'package:stayserve/models/join_request_model.dart';
 import 'package:stayserve/models/messaging_model.dart';
 import 'package:stayserve/models/owned_room_model.dart';
@@ -255,8 +256,84 @@ class FakeConversationRepository extends ConversationRepository {
   Future<void> markConversationRead(String conversationId) async {}
 
   @override
-  Future<String> openConversation(String otherUserId, {String? roomId}) async {
-    return 'conversation-1';
+  Future<ConversationOpenResult> openConversation(
+    String otherUserId, {
+    String? roomId,
+    String? requestId,
+  }) async {
+    return const ConversationOpenResult(
+      conversationId: 'conversation-1',
+      peerId: 'owner-1',
+      peerName: 'Test Owner',
+      roomId: 'room-1',
+      roomTitle: 'Test Room',
+      canSend: true,
+    );
+  }
+
+  @override
+  Future<ConversationInteractionDetails> getConversationInteractionDetails(
+    String conversationId, {
+    String? roomId,
+    String? requestId,
+  }) async {
+    return const ConversationInteractionDetails(
+      conversationId: 'conversation-1',
+      peerId: 'owner-1',
+      peerName: 'Test Owner',
+      roomId: 'room-1',
+      roomTitle: 'Test Room',
+      canSend: true,
+    );
+  }
+
+  @override
+  Future<BookingInteractionDetails> getBookingInteractionDetails(
+    String requestId,
+  ) async {
+    return const BookingInteractionDetails(
+      requestId: 'request-1',
+      studentId: 'student-1',
+      ownerId: 'owner-1',
+      studentName: 'Test Student',
+      ownerName: 'Test Owner',
+      roomId: 'room-1',
+      roomTitle: 'Test Room',
+      canSend: true,
+    );
+  }
+
+  @override
+  Future<RoomContactDetails> getRoomContactDetails(String roomId) async {
+    return const RoomContactDetails(
+      roomId: 'room-1',
+      roomTitle: 'Test Room',
+      ownerId: 'owner-1',
+      ownerName: 'Test Owner',
+    );
+  }
+
+  @override
+  Future<UserBlockResult> blockUser(
+    String otherUserId, {
+    String? requestId,
+    String? conversationId,
+  }) async {
+    return UserBlockResult(
+      otherUserId: otherUserId,
+      otherName: 'Test Owner',
+      blockedByMe: true,
+      canSend: false,
+    );
+  }
+
+  @override
+  Future<UserBlockResult> unblockUser(String otherUserId) async {
+    return UserBlockResult(
+      otherUserId: otherUserId,
+      otherName: 'Test Owner',
+      canSend: true,
+    );
   }
 
   @override
@@ -595,6 +672,7 @@ RoomModel auditRoom({
   String title = 'Test Room',
   double rent = 5000,
   RoomStatus status = RoomStatus.available,
+  List<String> images = const [],
 }) {
   return RoomModel(
     roomId: roomId,
@@ -611,7 +689,7 @@ RoomModel auditRoom({
     occupancy: 2,
     currentOccupancy: 0,
     genderPreference: GenderPreference.any,
-    images: const [],
+    images: images,
     status: status,
     createdAt: auditNow(),
     updatedAt: auditNow(),

@@ -30,6 +30,13 @@ import {
 } from './roomValidation';
 import { assertActiveAccount } from './accounts';
 import {
+  assertPairIsNotBlocked,
+  profileDisplayName,
+  readPairBlockStateInTransaction,
+  safeDisplayText,
+  safeRoomTitle,
+} from './interactions';
+import {
   notificationRecipientAllows,
   notify as pushNotification,
   pushToDevice,
@@ -58,6 +65,25 @@ const db = firestore.getFirestore();
 
 /** A request in one of these states is still "open". */
 const OPEN_STATUSES = ['pending', 'studentConfirmed', 'ownerConfirmed'];
+
+/**
+ * The request states which may establish a booking conversation.
+ *
+ * A rejected or cancelled request is terminal: it proves that the two
+ * accounts once interacted, but it must not authorize the owner to start a
+ * new conversation with the student. Unknown states fail closed as well.
+ * Legacy spellings remain accepted because old request documents are still
+ * read by the client.
+ */
+const CONVERSATION_REQUEST_STATUSES = new Set([
+  'pending',
+  'ownerConfirmed',
+  'owner_confirmed',
+  'studentConfirmed',
+  'student_confirmed',
+  'adminReviewed',
+  'admin_reviewed',
+]);
 
 /**
  * The states in which the student **already occupies** a slot of the room.
@@ -252,6 +278,16 @@ export const createJoinRequest = callableHttps.onCall(async (data, context) => {
       );
     }
 
+    // A personal block is effective in either direction. It is read in the
+    // same transaction as the request so a block and a new booking request
+    // cannot both commit from contradictory states.
+    const blockState = await readPairBlockStateInTransaction(
+      transaction,
+      uid,
+      ownerId,
+    );
+    assertPairIsNotBlocked(blockState);
+
     const eligibility = decideRoomBookingEligibility(room, ownerId);
     if (!eligibility.allowed) {
       throw new functions.https.HttpsError(
@@ -308,6 +344,10 @@ export const createJoinRequest = callableHttps.onCall(async (data, context) => {
       }
     }
 
+    const studentName = profileDisplayName(studentSnapshot) || uid;
+    const ownerName = profileDisplayName(ownerSnapshot) || ownerId;
+    const roomTitle = safeRoomTitle(room.title || '');
+
     transaction.set(lockRef, {
       studentId: uid,
       roomId,
@@ -320,6 +360,14 @@ export const createJoinRequest = callableHttps.onCall(async (data, context) => {
       roomId,
       studentId: uid,
       ownerId,
+      // Server-resolved display metadata. The participants' private profile
+      // documents remain unreadable to the other side.
+      studentName,
+      ownerName,
+      roomTitle,
+      studentNameAtRequest: studentName,
+      ownerNameAtRequest: ownerName,
+      roomTitleAtRequest: roomTitle,
       status: 'pending',
       createdAt: firestore.FieldValue.serverTimestamp(),
       updatedAt: firestore.FieldValue.serverTimestamp(),
@@ -474,6 +522,27 @@ export const respondToJoinRequest = callableHttps.onCall(async (data, context) =
       );
     }
 
+    // Rejecting a request is a protective action and remains available while
+    // the pair is blocked. Approving it would advance a new interaction, so
+    // an effective block refuses that transition. The parties are validated
+    // first: a malformed legacy request must produce the intended
+    // precondition error, not an invalid Firestore document path while the
+    // block documents are read.
+    if (approve) {
+      if (!hasValidBookingParties(request)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This request does not have a valid student tenant.',
+        );
+      }
+      const blockState = await readPairBlockStateInTransaction(
+        transaction,
+        String(request.studentId || '').trim(),
+        uid,
+      );
+      assertPairIsNotBlocked(blockState);
+    }
+
     const status = String(request.status || '');
     if (approve) {
       if (status !== 'pending') {
@@ -500,12 +569,6 @@ export const respondToJoinRequest = callableHttps.onCall(async (data, context) =
     }
 
     if (approve) {
-      if (!hasValidBookingParties(request)) {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'This request does not have a valid student tenant.',
-        );
-      }
       const studentId = String(request.studentId || '');
       const roomId = String(request.roomId || '').trim();
       if (!isValidMonthlyRent(request.monthlyRentAtJoin)) {
@@ -724,6 +787,13 @@ export const confirmJoinAsStudent = callableHttps.onCall(async (data, context) =
         'The room owner can no longer accept this booking.',
       );
     }
+
+    const blockState = await readPairBlockStateInTransaction(
+      transaction,
+      uid,
+      ownerId,
+    );
+    assertPairIsNotBlocked(blockState);
 
     const roomSnapshot = await transaction.get(
       db.collection('rooms').doc(roomId),
@@ -998,11 +1068,12 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
 
   const uid = context.auth.uid;
   const otherUserId = String(data?.otherUserId || '').trim();
-  const roomId = String(data?.roomId || '').trim();
-  if (!otherUserId || !roomId) {
+  const requestedRoomId = String(data?.roomId || '').trim();
+  const requestId = String(data?.requestId || '').trim();
+  if (!otherUserId || (!requestedRoomId && !requestId)) {
     throw new functions.https.HttpsError(
       'invalid-argument',
-      'Missing conversation participant or room',
+      'Missing conversation participant, room or booking request',
     );
   }
   if (otherUserId === uid) {
@@ -1017,12 +1088,70 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
   const participants = [uid, otherUserId].sort();
   const conversationId = participants.join('_');
   const conversationRef = db.collection('conversations').doc(conversationId);
-  const roomRef = db.collection('rooms').doc(roomId);
-  const userRef = db.collection('users').doc(uid);
+  const requestRef = requestId
+    ? db.collection('joinRequests').doc(requestId)
+    : null;
+  let result: Record<string, any> = {};
 
   await db.runTransaction(async (transaction) => {
+    let effectiveRoomId = requestedRoomId;
+    let requestSnapshot: firestore.DocumentSnapshot | null = null;
+    let requestStatus = '';
+
+    // A booking request is the owner-side route into a conversation. The
+    // request itself proves that the two accounts may talk, and its room is
+    // the listing shown in the chat.
+    if (requestRef) {
+      requestSnapshot = await transaction.get(requestRef);
+      if (!requestSnapshot.exists) {
+        throw new functions.https.HttpsError(
+          'not-found',
+          'That booking request no longer exists',
+        );
+      }
+      const request = requestSnapshot.data() as Record<string, any>;
+      const studentId = String(request.studentId || '').trim();
+      const ownerId = String(request.ownerId || '').trim();
+      const requestRoomId = String(request.roomId || '').trim();
+      requestStatus = String(request.status || '').trim();
+      const callerIsStudent = studentId === uid;
+      const callerIsOwner = ownerId === uid;
+      if (!callerIsStudent && !callerIsOwner) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'This booking request belongs to somebody else',
+        );
+      }
+      const expectedPeerId = callerIsStudent ? ownerId : studentId;
+      if (!expectedPeerId || expectedPeerId !== otherUserId) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'The conversation participant does not match this booking request',
+        );
+      }
+      if (!requestRoomId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This booking request does not identify a room',
+        );
+      }
+      if (requestedRoomId && requestedRoomId !== requestRoomId) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'The room does not match this booking request',
+        );
+      }
+      effectiveRoomId = requestRoomId;
+    }
+
+    const roomRef = db.collection('rooms').doc(effectiveRoomId);
     const roomSnapshot = await transaction.get(roomRef);
-    const userSnapshot = await transaction.get(userRef);
+    const callerSnapshot = await transaction.get(
+      db.collection('users').doc(uid),
+    );
+    const peerSnapshot = await transaction.get(
+      db.collection('users').doc(otherUserId),
+    );
 
     if (!roomSnapshot.exists) {
       throw new functions.https.HttpsError(
@@ -1030,49 +1159,79 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
         'That room no longer exists',
       );
     }
-    if (
-      !canBookAsStudent({
-        exists: userSnapshot.exists,
-        registrationCompleted: userSnapshot.get('registrationCompleted'),
-        isActive: userSnapshot.get('isActive'),
-        role: userSnapshot.get('role'),
-      })
-    ) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'Only a live student account can start a room conversation.',
-      );
-    }
 
     const roomOwnerId = String(roomSnapshot.get('ownerId') || '').trim();
-    if (!roomOwnerId || roomOwnerId !== otherUserId) {
-      throw new functions.https.HttpsError(
-        'permission-denied',
-        'A room conversation may only be opened with the owner of that room.',
-      );
-    }
-
-    // The owner must still be a live owner. This also closes the account
-    // deletion race: the deletion fence marks the profile inactive before the
-    // conversation cleanup starts, so no new conversation with that account
-    // can appear after the cleanup scan.
-    const ownerSnapshot = await transaction.get(
-      db.collection('users').doc(roomOwnerId),
-    );
-    if (
-      !canActAsRoomOwner({
-        exists: ownerSnapshot.exists,
-        registrationCompleted: ownerSnapshot.get('registrationCompleted'),
-        isActive: ownerSnapshot.get('isActive'),
-        role: ownerSnapshot.get('role'),
-      })
-    ) {
+    if (!roomOwnerId) {
       throw new functions.https.HttpsError(
         'failed-precondition',
-        'The owner account is not available for a conversation.',
+        'This listing has no owner',
       );
     }
 
+    const callerIsStudent = canBookAsStudent({
+      exists: callerSnapshot.exists,
+      registrationCompleted: callerSnapshot.get('registrationCompleted'),
+      isActive: callerSnapshot.get('isActive'),
+      role: callerSnapshot.get('role'),
+    });
+    const callerIsOwner = canActAsRoomOwner({
+      exists: callerSnapshot.exists,
+      registrationCompleted: callerSnapshot.get('registrationCompleted'),
+      isActive: callerSnapshot.get('isActive'),
+      role: callerSnapshot.get('role'),
+    });
+    const peerIsStudent = canBookAsStudent({
+      exists: peerSnapshot.exists,
+      registrationCompleted: peerSnapshot.get('registrationCompleted'),
+      isActive: peerSnapshot.get('isActive'),
+      role: peerSnapshot.get('role'),
+    });
+    const peerIsOwner = canActAsRoomOwner({
+      exists: peerSnapshot.exists,
+      registrationCompleted: peerSnapshot.get('registrationCompleted'),
+      isActive: peerSnapshot.get('isActive'),
+      role: peerSnapshot.get('role'),
+    });
+
+    if (requestSnapshot) {
+      // The request route is symmetric: either the student or the owner may
+      // open the conversation, provided both live roles are still intact.
+      if (
+        !((callerIsStudent && peerIsOwner) ||
+          (callerIsOwner && peerIsStudent))
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'One of the booking accounts is no longer available.',
+        );
+      }
+      if (roomOwnerId !== (callerIsOwner ? uid : otherUserId)) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'The room owner does not match this booking request.',
+        );
+      }
+    } else {
+      // The room route remains the verified student-to-owner flow.
+      if (!callerIsStudent) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'Only a live student account can start a room conversation.',
+        );
+      }
+      if (!peerIsOwner || roomOwnerId !== otherUserId) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'A room conversation may only be opened with the owner of that room.',
+        );
+      }
+    }
+
+    const blockState = await readPairBlockStateInTransaction(
+      transaction,
+      uid,
+      otherUserId,
+    );
     const conversationSnapshot = await transaction.get(conversationRef);
     if (conversationSnapshot.get('deletionInProgress') === true) {
       throw new functions.https.HttpsError(
@@ -1080,6 +1239,66 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
         'This conversation is being closed.',
       );
     }
+
+    // A terminal request must not authorize a **new** conversation. An
+    // already-existing conversation remains available so its history is not
+    // lost when a booking is declined or cancelled. The room-only inquiry
+    // route remains available to a live student and is verified separately.
+    if (
+      !conversationSnapshot.exists &&
+      requestSnapshot &&
+      !CONVERSATION_REQUEST_STATUSES.has(requestStatus)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This booking request is closed and cannot start a conversation.',
+      );
+    }
+
+    const requestStudentId = String(
+      requestSnapshot?.get('studentId') || '',
+    ).trim();
+    const requestOwnerId = String(
+      requestSnapshot?.get('ownerId') || '',
+    ).trim();
+    const requestCurrentNameFor = (participantId: string): string =>
+      participantId === requestStudentId
+        ? safeDisplayText(requestSnapshot?.get('studentName'), 80)
+        : participantId === requestOwnerId
+        ? safeDisplayText(requestSnapshot?.get('ownerName'), 80)
+        : '';
+    const requestSnapshotNameFor = (participantId: string): string =>
+      participantId === requestStudentId
+        ? safeDisplayText(requestSnapshot?.get('studentNameAtRequest'), 80)
+        : participantId === requestOwnerId
+        ? safeDisplayText(requestSnapshot?.get('ownerNameAtRequest'), 80)
+        : '';
+    const participantNames = {
+      [uid]:
+        profileDisplayName(callerSnapshot) ||
+        requestCurrentNameFor(uid) ||
+        requestSnapshotNameFor(uid) ||
+        uid,
+      [otherUserId]:
+        profileDisplayName(peerSnapshot) ||
+        requestCurrentNameFor(otherUserId) ||
+        requestSnapshotNameFor(otherUserId) ||
+        otherUserId,
+    };
+    const roomTitle =
+      safeRoomTitle(roomSnapshot.get('title') || '') ||
+      safeRoomTitle(requestSnapshot?.get('roomTitle')) ||
+      safeRoomTitle(requestSnapshot?.get('roomTitleAtRequest'));
+    const contextId = requestId || effectiveRoomId;
+    const contextRef = conversationRef
+      .collection('contexts')
+      .doc(contextId);
+    // Context documents are create-once. The captured listing title and the
+    // original capture time describe the context which opened this chat and
+    // must not be reset merely because the conversation is opened again.
+    // The context is read before either parent or child is written because a
+    // Firestore transaction cannot read a document after writing it.
+    const contextSnapshot = await transaction.get(contextRef);
 
     if (conversationSnapshot.exists) {
       const existing = Array.from(
@@ -1097,13 +1316,57 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
           'This conversation belongs to different participants.',
         );
       }
+
+      // Keep the listing context stable even when the same student and
+      // owner discuss more than one room. The parent keeps the most recent
+      // convenience fields; the context document keeps the exact room title
+      // for the request or room which opened this chat. It is never
+      // overwritten, so `capturedAt` remains the original capture time.
+      if (!contextSnapshot.exists) {
+        transaction.set(contextRef, {
+          contextId,
+          roomId: effectiveRoomId,
+          roomTitle,
+          requestId: requestId || null,
+          capturedAt: firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      // An existing conversation stays readable after a block, but the
+      // Firestore rules refuse every new message in either direction.
+      transaction.update(conversationRef, {
+        participantNames,
+        roomId: effectiveRoomId,
+        roomTitle,
+      });
+      result = {
+        success: true,
+        conversationId,
+        peerId: otherUserId,
+        peerName: participantNames[otherUserId],
+        peerRole: peerIsOwner ? 'owner' : 'student',
+        roomId: effectiveRoomId,
+        roomTitle,
+        requestId: requestId || null,
+        blockedByMe: blockState.firstBlockedSecond,
+        blockedMe: blockState.secondBlockedFirst,
+        blockedByCaller: blockState.firstBlockedSecond,
+        callerBlockedByPeer: blockState.secondBlockedFirst,
+        canSend: !blockState.firstBlockedSecond && !blockState.secondBlockedFirst,
+      };
       return;
     }
+
+    // A block prevents a new conversation. It does not hide an existing
+    // conversation, so the user can still see the history and unblock later.
+    assertPairIsNotBlocked(blockState);
 
     transaction.set(conversationRef, {
       conversationId,
       participantIds: participants,
-      roomId,
+      participantNames,
+      roomId: effectiveRoomId,
+      roomTitle,
       createdByServer: true,
       lastMessage: '',
       lastMessageAt: firestore.FieldValue.serverTimestamp(),
@@ -1111,9 +1374,34 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
       updatedAt: firestore.FieldValue.serverTimestamp(),
       unreadCount: {},
     });
+    if (!contextSnapshot.exists) {
+      transaction.set(contextRef, {
+        contextId,
+        roomId: effectiveRoomId,
+        roomTitle,
+        requestId: requestId || null,
+        capturedAt: firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    result = {
+      success: true,
+      conversationId,
+      peerId: otherUserId,
+      peerName: participantNames[otherUserId],
+      peerRole: peerIsOwner ? 'owner' : 'student',
+      roomId: effectiveRoomId,
+      roomTitle,
+      requestId: requestId || null,
+      blockedByMe: false,
+      blockedMe: false,
+      blockedByCaller: false,
+      callerBlockedByPeer: false,
+      canSend: true,
+    };
   });
 
-  return { success: true, conversationId };
+  return result;
 });
 
 /**
@@ -1254,6 +1542,13 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
         'You can only message the other participant of an authorized conversation.',
       );
     }
+
+    const blockState = await readPairBlockStateInTransaction(
+      transaction,
+      uid,
+      recipientId,
+    );
+    assertPairIsNotBlocked(blockState);
 
     const messageSnapshot = await transaction.get(
       db

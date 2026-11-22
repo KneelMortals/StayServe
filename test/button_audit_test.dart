@@ -184,13 +184,17 @@ String _describe(Element element) {
 
   // The label of the button — the text below it.
   String label = '';
-  element.visitChildren((child) {
-    if (label.isNotEmpty) return;
-    final childWidget = child.widget;
-    if (childWidget is Text && (childWidget.data ?? '').isNotEmpty) {
-      label = childWidget.data!;
+  final textFinder = find.descendant(
+    of: find.byElementPredicate((candidate) => identical(candidate, element)),
+    matching: find.byType(Text),
+  );
+  for (final textElement in textFinder.evaluate()) {
+    final textWidget = textElement.widget;
+    if (textWidget is Text && (textWidget.data ?? '').isNotEmpty) {
+      label = textWidget.data!;
+      break;
     }
-  });
+  }
   if (label.isEmpty) {
     element.visitAncestorElements((ancestor) {
       if (label.isNotEmpty) return false;
@@ -331,6 +335,20 @@ Future<void> auditScreen(
       await tester.pump(const Duration(milliseconds: 50));
 
       await tester.tap(finder, warnIfMissed: false);
+      await _settle(tester);
+
+      // A dialog or a bottom sheet is pushed above the audited screen. It
+      // belongs to the same navigator, so rebuilding the widget tree alone
+      // does **not** dismiss it. Close every route above the first one;
+      // otherwise the next button belongs to the temporary dialog instead
+      // of the screen under test.
+      final navigator = tester.state<NavigatorState>(
+        find.byType(Navigator).first,
+      );
+      while (navigator.canPop()) {
+        navigator.pop();
+        await tester.pump();
+      }
       await _settle(tester);
 
       final error = tester.takeException();

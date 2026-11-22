@@ -7,6 +7,7 @@ import '../theme/app_theme.dart';
 import '../utils/distance.dart';
 import '../utils/validators.dart';
 import 'common_widgets.dart';
+import 'room_image_viewer.dart';
 
 /// Card showing a room listing. Tapping it opens the room detail screen.
 class RoomCard extends StatelessWidget {
@@ -45,6 +46,10 @@ class RoomCard extends StatelessWidget {
                 imageUrl: room.primaryImage.isEmpty ? null : room.primaryImage,
                 width: double.infinity,
                 height: 160,
+                onTap: room.hasImages
+                    ? () =>
+                          RoomImageViewer.show(context, imageUrls: room.images)
+                    : null,
                 borderRadius: const BorderRadius.vertical(
                   top: Radius.circular(AppBorderRadius.lg),
                 ),

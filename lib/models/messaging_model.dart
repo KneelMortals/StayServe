@@ -9,6 +9,13 @@ class ConversationModel {
   final DateTime lastMessageAt;
   final Map<String, int> unreadCount;
   final String? roomId;
+
+  /// Server-resolved display names keyed by participant uid.
+  final Map<String, String> participantNames;
+
+  /// The title of the room/listing which the conversation belongs to.
+  final String roomTitle;
+
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -19,6 +26,8 @@ class ConversationModel {
     required this.lastMessageAt,
     required this.unreadCount,
     this.roomId,
+    this.participantNames = const {},
+    this.roomTitle = '',
     required this.createdAt,
     required this.updatedAt,
   });
@@ -26,7 +35,8 @@ class ConversationModel {
   factory ConversationModel.fromJson(Map<String, dynamic> json) {
     return ConversationModel(
       conversationId: json['conversationId'] as String,
-      participants: (json['participants'] as List<dynamic>?)
+      participants:
+          (json['participants'] as List<dynamic>?)
               ?.map((e) => e as String)
               .toList() ??
           const [],
@@ -35,6 +45,11 @@ class ConversationModel {
       unreadCount: (json['unreadCount'] as Map<String, dynamic>? ?? const {})
           .map((key, value) => MapEntry(key, (value as num).toInt())),
       roomId: json['roomId'] as String?,
+      participantNames:
+          (json['participantNames'] as Map<String, dynamic>? ?? const {}).map(
+            (key, value) => MapEntry(key, value?.toString() ?? ''),
+          ),
+      roomTitle: json['roomTitle'] as String? ?? '',
       createdAt: _toDate(json['createdAt']),
       updatedAt: _toDate(json['updatedAt']),
     );
@@ -48,6 +63,8 @@ class ConversationModel {
       'lastMessageAt': Timestamp.fromDate(lastMessageAt),
       'unreadCount': unreadCount,
       'roomId': roomId,
+      'participantNames': participantNames,
+      'roomTitle': roomTitle,
       'createdAt': Timestamp.fromDate(createdAt),
       'updatedAt': Timestamp.fromDate(updatedAt),
     };
@@ -60,6 +77,8 @@ class ConversationModel {
     DateTime? lastMessageAt,
     Map<String, int>? unreadCount,
     String? roomId,
+    Map<String, String>? participantNames,
+    String? roomTitle,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) {
@@ -70,16 +89,27 @@ class ConversationModel {
       lastMessageAt: lastMessageAt ?? this.lastMessageAt,
       unreadCount: unreadCount ?? this.unreadCount,
       roomId: roomId ?? this.roomId,
+      participantNames: participantNames ?? this.participantNames,
+      roomTitle: roomTitle ?? this.roomTitle,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
     );
   }
 
   String getOtherParticipant(String currentUserId) {
-    return participants.firstWhere((id) => id != currentUserId, orElse: () => '');
+    return participants.firstWhere(
+      (id) => id != currentUserId,
+      orElse: () => '',
+    );
   }
 
   int getUnreadCount(String userId) => unreadCount[userId] ?? 0;
+
+  /// The server-resolved display name of one participant.
+  String getParticipantName(String userId) {
+    final name = participantNames[userId]?.trim() ?? '';
+    return name;
+  }
 
   @override
   bool operator ==(Object other) {
@@ -92,34 +122,39 @@ class ConversationModel {
             lastMessageAt == other.lastMessageAt &&
             mapEquals(unreadCount, other.unreadCount) &&
             roomId == other.roomId &&
+            mapEquals(participantNames, other.participantNames) &&
+            roomTitle == other.roomTitle &&
             createdAt == other.createdAt &&
             updatedAt == other.updatedAt;
   }
 
   @override
   int get hashCode => Object.hash(
-        conversationId,
-        Object.hashAll(participants),
-        lastMessage,
-        lastMessageAt,
-        // The entries are **sorted** before they are hashed.
-        //
-        // `==` compares the map without an order (`mapEquals`), so two
-        // equal conversations have to have the same hash code. The entries
-        // of a map keep their insertion order, and the order of the keys is
-        // not guaranteed to be the same for two equal maps — so the hash
-        // code was different and the models behaved differently in a set
-        // or as a key of a map.
-        Object.hashAll(
-          unreadCount.entries
-              .map((e) => Object.hash(e.key, e.value))
-              .toList()
-            ..sort(),
-        ),
-        roomId,
-        createdAt,
-        updatedAt,
-      );
+    conversationId,
+    Object.hashAll(participants),
+    lastMessage,
+    lastMessageAt,
+    // The entries are **sorted** before they are hashed.
+    //
+    // `==` compares the map without an order (`mapEquals`), so two
+    // equal conversations have to have the same hash code. The entries
+    // of a map keep their insertion order, and the order of the keys is
+    // not guaranteed to be the same for two equal maps — so the hash
+    // code was different and the models behaved differently in a set
+    // or as a key of a map.
+    Object.hashAll(
+      unreadCount.entries.map((e) => Object.hash(e.key, e.value)).toList()
+        ..sort(),
+    ),
+    roomId,
+    Object.hashAll(
+      participantNames.entries.map((e) => Object.hash(e.key, e.value)).toList()
+        ..sort(),
+    ),
+    roomTitle,
+    createdAt,
+    updatedAt,
+  );
 
   @override
   String toString() {
@@ -237,17 +272,17 @@ class MessageModel {
 
   @override
   int get hashCode => Object.hash(
-        messageId,
-        conversationId,
-        senderId,
-        receiverId,
-        content,
-        type,
-        createdAt,
-        readAt,
-        roomId,
-        imageUrl,
-      );
+    messageId,
+    conversationId,
+    senderId,
+    receiverId,
+    content,
+    type,
+    createdAt,
+    readAt,
+    roomId,
+    imageUrl,
+  );
 
   @override
   String toString() {

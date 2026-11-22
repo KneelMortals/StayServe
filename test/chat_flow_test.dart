@@ -12,6 +12,7 @@ import 'package:stayserve/features/messaging/presentation/providers/messaging_pr
 import 'package:stayserve/features/messaging/presentation/screens/chat_screen.dart';
 import 'package:stayserve/firebase/functions/functions_service.dart';
 import 'package:stayserve/firebase/messaging/conversation_repository.dart';
+import 'package:stayserve/models/interaction_model.dart';
 import 'package:stayserve/models/messaging_model.dart';
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,22 @@ class _FakeConversationRepository extends ConversationRepository {
   @override
   Future<String?> getOtherParticipant(String conversationId) async =>
       otherParticipant;
+
+  @override
+  Future<ConversationInteractionDetails> getConversationInteractionDetails(
+    String conversationId, {
+    String? roomId,
+    String? requestId,
+  }) async {
+    return ConversationInteractionDetails(
+      conversationId: conversationId,
+      peerId: otherParticipant ?? 'owner-1',
+      peerName: 'Actual Owner Name',
+      roomId: roomId ?? 'room-1',
+      roomTitle: 'Actual Room Name',
+      canSend: true,
+    );
+  }
 
   @override
   Future<void> sendMessage({
@@ -118,7 +135,7 @@ void main() {
       await tester.enterText(find.byType(TextField), 'Is the room available?');
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byType(Icon).last);
+      await tester.tap(find.byIcon(Icons.send));
       await tester.pumpAndSettle();
 
       // The message went to the owner that came with the route.
@@ -169,7 +186,7 @@ void main() {
 
       await tester.enterText(find.byType(TextField), 'Hello there');
       await tester.pumpAndSettle();
-      await tester.tap(find.byType(Icon).last);
+      await tester.tap(find.byIcon(Icons.send));
       await tester.pumpAndSettle();
 
       expect(repository.sent, hasLength(1));

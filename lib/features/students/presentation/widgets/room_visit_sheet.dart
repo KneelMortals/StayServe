@@ -18,8 +18,9 @@ Future<void> showRoomVisitSheet(BuildContext context, String roomId) async {
 
   // The repository is read from the container of the context — the sheet is
   // opened from a plain function, so there is no `WidgetRef` at hand.
-  final repository = ProviderScope.containerOf(context)
-      .read<VisitRepository>(visitRepositoryProvider);
+  final repository = ProviderScope.containerOf(
+    context,
+  ).read<VisitRepository>(visitRepositoryProvider);
 
   // The details are fetched **before** the sheet is opened: the sheet shows
   // the address right away, and a failure is reported in a snack bar.
@@ -94,7 +95,7 @@ class _RoomVisitSheet extends StatelessWidget {
               const SizedBox(height: AppSpacing.md),
               Row(
                 children: [
-                  const AppAvatar(name: 'Owner', radius: 16),
+                  AppAvatar(name: details.ownerName, radius: 16),
                   const SizedBox(width: AppSpacing.sm),
                   Expanded(
                     child: Text(

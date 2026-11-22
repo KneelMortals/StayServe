@@ -46,6 +46,10 @@ import {
   roomBookingRejectionMessage,
 } from './roomValidation';
 import { notify } from './notifications';
+import {
+  assertPairIsNotBlocked,
+  readPairBlockStateInTransaction,
+} from './interactions';
 
 const db = firestore.getFirestore();
 
@@ -349,6 +353,13 @@ export const createUpiPayment = callableHttps.onCall(async (data, context) => {
       );
     }
 
+    const blockState = await readPairBlockStateInTransaction(
+      transaction,
+      studentId,
+      ownerId,
+    );
+    assertPairIsNotBlocked(blockState);
+
     const roomRef = db.collection('rooms').doc(roomId);
     const roomSnapshot = await transaction.get(roomRef);
     if (!roomSnapshot.exists) {
@@ -568,6 +579,13 @@ export const submitPayment = callableHttps.onCall(async (data, context) => {
         'The room owner can no longer take payment for this booking.',
       );
     }
+
+    const blockState = await readPairBlockStateInTransaction(
+      transaction,
+      studentId,
+      ownerId,
+    );
+    assertPairIsNotBlocked(blockState);
 
     const paymentSnapshot = await transaction.get(paymentRef);
     if (paymentSnapshot.exists) {
@@ -998,6 +1016,19 @@ export const verifyPayment = callableHttps.onCall(async (data, context) => {
           'This request does not have a valid student tenant.',
         );
       }
+
+      // A block prevents a new tenancy from being activated. The rejection
+      // path below stays available so an administrator can still resolve a
+      // submitted payment and release the booking safely.
+      if (!wasAlreadyActive) {
+        const blockState = await readPairBlockStateInTransaction(
+          transaction,
+          studentId,
+          ownerId,
+        );
+        assertPairIsNotBlocked(blockState);
+      }
+
       if (!roomId || !roomSnapshot) {
         throw new functions.https.HttpsError(
           'failed-precondition',

@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/index.dart';
 import '../../../../../features/auth/presentation/providers/auth_provider.dart';
 import '../../../../../firebase/messaging/conversation_repository.dart';
+import '../../../../../models/interaction_model.dart';
 import '../../../../../models/messaging_model.dart';
 import '../providers/messaging_providers.dart';
 
@@ -26,9 +27,15 @@ class ChatScreen extends ConsumerStatefulWidget {
   /// the chat would have no input field at all.
   final String? peerId;
 
+  /// The listing context which opened this conversation.
+  final String? roomId;
+  final String? requestId;
+
   const ChatScreen({
     required this.conversationId,
     this.peerId,
+    this.roomId,
+    this.requestId,
     super.key,
   });
 
@@ -41,9 +48,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final _scrollController = ScrollController();
   final _focusNode = FocusNode();
   bool _isSending = false;
+  bool _isChangingBlock = false;
 
   /// The recipient of the messages.
   String? _receiverId;
+
+  ConversationInteractionKey get _interactionKey => (
+    conversationId: widget.conversationId,
+    roomId: widget.roomId,
+    requestId: widget.requestId,
+  );
 
   @override
   void initState() {
@@ -61,9 +75,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // kept growing even though the user had read every message.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      ref.read(conversationRepositoryProvider).markConversationRead(
-            widget.conversationId,
-          );
+      ref
+          .read(conversationRepositoryProvider)
+          .markConversationRead(widget.conversationId);
       ref.invalidate(conversationsProvider);
     });
   }
@@ -95,9 +109,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
   }
 
-  Future<void> _send(String receiverId) async {
+  Future<void> _send(String receiverId, bool canSend) async {
     final text = _controller.text.trim();
     if (text.isEmpty || _isSending) return;
+
+    if (!canSend) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text(
+            'Messaging is unavailable while this participant is blocked.',
+          ),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+      return;
+    }
 
     // The server refuses a notification whose body is longer than 1000
     // characters. The message itself would be stored, but the recipient
@@ -117,7 +143,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     setState(() => _isSending = true);
     try {
-      await ref.read(conversationRepositoryProvider).sendMessage(
+      await ref
+          .read(conversationRepositoryProvider)
+          .sendMessage(
             conversationId: widget.conversationId,
             receiverId: receiverId,
             content: text,
@@ -135,6 +163,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ref.invalidate(conversationsProvider);
     } catch (e) {
       if (!mounted) return;
+      // A concurrent block is rejected by the Firestore rules. Reload the
+      // server-owned state so the composer changes to its read-only form.
+      ref.invalidate(conversationInteractionDetailsProvider(_interactionKey));
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(e.toString().replaceFirst('Exception: ', '')),
@@ -146,10 +177,96 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
+  Future<void> _toggleBlock({
+    required String peerId,
+    required String peerName,
+    required bool blockedByMe,
+    required bool blockedMe,
+  }) async {
+    if (_isChangingBlock) return;
+
+    if (blockedMe && !blockedByMe) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$peerName blocked you. You cannot send messages.'),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+      return;
+    }
+
+    final shouldChange = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(blockedByMe ? 'Unblock $peerName?' : 'Block $peerName?'),
+        content: Text(
+          blockedByMe
+              ? 'You will be able to exchange messages again.'
+              : 'You will not be able to exchange new messages or advance '
+                    'this booking until you unblock $peerName.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(blockedByMe ? 'Unblock' : 'Block'),
+          ),
+        ],
+      ),
+    );
+    if (shouldChange != true || !mounted) return;
+
+    setState(() => _isChangingBlock = true);
+    try {
+      final repository = ref.read(conversationRepositoryProvider);
+      if (blockedByMe) {
+        await repository.unblockUser(peerId);
+      } else {
+        await repository.blockUser(
+          peerId,
+          conversationId: widget.conversationId,
+          requestId: widget.requestId,
+        );
+      }
+      if (!mounted) return;
+      invalidateParticipantInteractionProviders(
+        ref,
+        conversationId: widget.conversationId,
+        roomId: widget.roomId,
+        requestId: widget.requestId,
+      );
+      ref.invalidate(conversationsProvider);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            blockedByMe ? '$peerName was unblocked.' : '$peerName was blocked.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isChangingBlock = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final messagesAsync = ref.watch(messagesProvider(widget.conversationId));
     final conversationsAsync = ref.watch(conversationsProvider);
+    final detailsAsync = ref.watch(
+      conversationInteractionDetailsProvider(_interactionKey),
+    );
+    final details = detailsAsync.valueOrNull;
 
     // ---------------------------------------------------------------------
     // Messages that arrive while the chat is open are read right away.
@@ -171,27 +288,95 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ref.invalidate(conversationsProvider);
     });
 
-    // The other participant is needed as the recipient of new messages.
-    //
-    // The recipient that came with the route is used first. Only if it is
-    // missing the conversation list is asked — and that list may still be
-    // loading, so the input field would be missing for a moment.
-    var receiverId = _receiverId;
-    if (receiverId == null || receiverId.isEmpty) {
-      for (final conversation
-          in conversationsAsync.valueOrNull ?? const <ConversationModel>[]) {
-        if (conversation.conversationId == widget.conversationId) {
-          final currentUid = ref.watch(currentUserProvider)?.uid;
-          receiverId = conversation.getOtherParticipant(currentUid ?? '');
-          break;
-        }
+    ConversationModel? conversation;
+    for (final candidate
+        in conversationsAsync.valueOrNull ?? const <ConversationModel>[]) {
+      if (candidate.conversationId == widget.conversationId) {
+        conversation = candidate;
+        break;
       }
     }
 
+    // The server-resolved peer id and name are authoritative. The route and
+    // the stored conversation are only fallbacks while the details load.
+    var receiverId = details?.peerId ?? _receiverId;
+    final storedPeerName =
+        conversation?.getParticipantName(
+          details?.peerId ?? _receiverId ?? '',
+        ) ??
+        '';
+    final peerName = details?.peerName.isNotEmpty == true
+        ? details!.peerName
+        : storedPeerName.isNotEmpty
+        ? storedPeerName
+        : receiverId?.trim().isNotEmpty == true
+        ? receiverId!
+        : 'Loading participant…';
+    final roomTitle = details?.roomTitle.isNotEmpty == true
+        ? details!.roomTitle
+        : conversation?.roomTitle ?? '';
+
+    // Messaging fails closed until the server confirms that neither side
+    // has blocked the other. A refresh is a loading state too, so a stale
+    // cached value cannot keep the composer enabled while the server
+    // revalidates the block state.
+    final interactionReady =
+        details != null && !detailsAsync.isLoading && !detailsAsync.hasError;
+    final canSend = interactionReady && details.canSend;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Chat')),
+      appBar: AppBar(
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(peerName, maxLines: 1, overflow: TextOverflow.ellipsis),
+            if (roomTitle.isNotEmpty)
+              Text(
+                roomTitle,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            tooltip: details?.blockedByMe == true
+                ? 'Unblock $peerName'
+                : details?.blockedMe == true
+                ? '$peerName blocked you'
+                : 'Block $peerName',
+            icon: Icon(
+              details?.blockedByMe == true ? Icons.lock_open : Icons.block,
+            ),
+            onPressed:
+                !interactionReady ||
+                    receiverId == null ||
+                    receiverId.isEmpty ||
+                    _isChangingBlock ||
+                    (details.blockedMe && !details.blockedByMe)
+                ? null
+                : () => _toggleBlock(
+                    peerId: receiverId,
+                    peerName: peerName,
+                    blockedByMe: details.blockedByMe,
+                    blockedMe: details.blockedMe,
+                  ),
+          ),
+        ],
+      ),
       body: Column(
         children: [
+          if (details != null && details.isBlocked)
+            _BlockNotice(details: details, peerName: peerName),
+          if (detailsAsync.hasError)
+            _InteractionErrorNotice(
+              onRetry: () => ref.invalidate(
+                conversationInteractionDetailsProvider(_interactionKey),
+              ),
+            ),
           Expanded(
             child: messagesAsync.when(
               loading: () => const Center(child: CircularProgressIndicator()),
@@ -208,8 +393,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     const Text('Could not load messages'),
                     const SizedBox(height: AppSpacing.md),
                     TextButton(
-                      onPressed: () =>
-                          ref.invalidate(messagesProvider(widget.conversationId)),
+                      onPressed: () => ref.invalidate(
+                        messagesProvider(widget.conversationId),
+                      ),
                       child: const Text('Retry'),
                     ),
                   ],
@@ -224,7 +410,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   );
                 }
 
-                WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+                WidgetsBinding.instance.addPostFrameCallback(
+                  (_) => _scrollToBottom(),
+                );
 
                 final currentUid = ref.watch(currentUserProvider)?.uid ?? '';
                 return ListView.builder(
@@ -245,8 +433,83 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               controller: _controller,
               focusNode: _focusNode,
               isSending: _isSending,
-              onSend: () => _send(receiverId!),
+              enabled: canSend,
+              onSend: () => _send(receiverId, canSend),
             ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BlockNotice extends StatelessWidget {
+  final ConversationInteractionDetails details;
+  final String peerName;
+
+  const _BlockNotice({required this.details, required this.peerName});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final message = details.blockedByMe && details.blockedMe
+        ? 'You and $peerName have blocked each other.'
+        : details.blockedByMe
+        ? 'You blocked $peerName. Unblock them to send messages.'
+        : '$peerName blocked you. You cannot send new messages.';
+
+    return Container(
+      width: double.infinity,
+      color: theme.colorScheme.errorContainer,
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.md,
+        vertical: AppSpacing.sm,
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.block, color: theme.colorScheme.onErrorContainer),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Text(
+              message,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onErrorContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InteractionErrorNotice extends StatelessWidget {
+  final VoidCallback onRetry;
+
+  const _InteractionErrorNotice({required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      color: theme.colorScheme.errorContainer,
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.md,
+        vertical: AppSpacing.sm,
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.warning_amber, color: theme.colorScheme.onErrorContainer),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Text(
+              'Could not verify the conversation status. Messaging is paused.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onErrorContainer,
+              ),
+            ),
+          ),
+          TextButton(onPressed: onRetry, child: const Text('Retry')),
         ],
       ),
     );
@@ -309,12 +572,14 @@ class _MessageInput extends StatelessWidget {
   final TextEditingController controller;
   final FocusNode focusNode;
   final bool isSending;
+  final bool enabled;
   final VoidCallback onSend;
 
   const _MessageInput({
     required this.controller,
     required this.focusNode,
     required this.isSending,
+    required this.enabled,
     required this.onSend,
   });
 
@@ -336,14 +601,19 @@ class _MessageInput extends StatelessWidget {
             child: TextField(
               controller: controller,
               focusNode: focusNode,
+              enabled: enabled,
               textInputAction: TextInputAction.send,
               maxLength: maxMessageLength,
               decoration: InputDecoration(
-                hintText: 'Type a message...',
+                hintText: enabled
+                    ? 'Type a message...'
+                    : 'Messaging is unavailable',
                 counterText: '',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(24),
-                  borderSide: BorderSide(color: theme.colorScheme.outlineVariant),
+                  borderSide: BorderSide(
+                    color: theme.colorScheme.outlineVariant,
+                  ),
                 ),
                 contentPadding: const EdgeInsets.symmetric(
                   horizontal: 16,
@@ -352,13 +622,13 @@ class _MessageInput extends StatelessWidget {
                 filled: true,
                 fillColor: theme.colorScheme.surfaceContainerHighest,
               ),
-              onSubmitted: (_) => onSend(),
+              onSubmitted: enabled ? (_) => onSend() : null,
             ),
           ),
           const SizedBox(width: AppSpacing.sm),
           IconButton.filled(
             icon: const Icon(Icons.send),
-            onPressed: isSending ? null : onSend,
+            onPressed: enabled && !isSending ? onSend : null,
           ),
         ],
       ),

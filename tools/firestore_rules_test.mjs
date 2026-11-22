@@ -1717,6 +1717,136 @@ async function main() {
     false,
   );
 
+  console.log('\n--- personal blocks and server-owned conversation metadata ---');
+  await call('owner', 'PATCH', '/userBlocks/student1/blockedUsers/owner1', {
+    fields: {
+      blockerId: string('student1'),
+      blockedUserId: string('owner1'),
+      scope: string('person'),
+    },
+  });
+  await call('owner', 'PATCH', '/conversations/conv1/contexts/request-1', {
+    fields: {
+      contextId: string('request-1'),
+      roomId: string('room1'),
+      roomTitle: string('Test Room'),
+      requestId: string('request-1'),
+    },
+  });
+
+  check(
+    'a client cannot read a personal block document',
+    await call(TOKENS.student, 'GET', '/userBlocks/student1/blockedUsers/owner1'),
+    false,
+  );
+  check(
+    'a client cannot create a personal block document',
+    await create(TOKENS.student, 'userBlocks/student1/blockedUsers', 'owner2', {
+      blockerId: string('student1'),
+      blockedUserId: string('owner2'),
+    }),
+    false,
+  );
+  check(
+    'a client cannot remove a personal block document',
+    await call(TOKENS.student, 'DELETE', '/userBlocks/student1/blockedUsers/owner1'),
+    false,
+  );
+  check(
+    'a client cannot read a server-owned conversation context',
+    await call(TOKENS.student, 'GET', '/conversations/conv1/contexts/request-1'),
+    false,
+  );
+  check(
+    'a client cannot write a server-owned conversation context',
+    await update(TOKENS.owner, 'conversations/conv1/contexts', 'request-1', {
+      roomTitle: string('Forged title'),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot overwrite the server-owned participant names',
+    await update(TOKENS.student, 'conversations', 'conv1', {
+      participantNames: map({ owner1: string('Forged owner') }),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot overwrite the server-owned room title',
+    await update(TOKENS.student, 'conversations', 'conv1', {
+      roomTitle: string('Forged room title'),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot re-point a conversation to another room',
+    await update(TOKENS.student, 'conversations', 'conv1', {
+      roomId: string('room2'),
+    }),
+    false,
+  );
+  check(
+    'the existing chat history stays readable after a block',
+    await call(TOKENS.student, 'GET', '/conversations/conv1/messages/msg1'),
+    true,
+  );
+  check(
+    'the blocking student cannot send a new message',
+    await create(TOKENS.student, 'conversations/conv1/messages', 'msg-blocked-student', {
+      messageId: string('msg-blocked-student'),
+      conversationId: string('conv1'),
+      senderId: string('student1'),
+      receiverId: string('owner1'),
+      content: string('Blocked message'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'the blocked owner cannot send a new message either',
+    await create(TOKENS.owner, 'conversations/conv1/messages', 'msg-blocked-owner', {
+      messageId: string('msg-blocked-owner'),
+      conversationId: string('conv1'),
+      senderId: string('owner1'),
+      receiverId: string('student1'),
+      content: string('Blocked reply'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot update the last message while the pair is blocked',
+    await update(TOKENS.student, 'conversations', 'conv1', {
+      lastMessage: string('Bypassing the block'),
+      lastMessageAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a participant can still update unread bookkeeping while blocked',
+    await update(TOKENS.student, 'conversations', 'conv1', {
+      unreadCount: map({ student1: integer(0), owner1: integer(0) }),
+    }),
+    true,
+  );
+
+  await call('owner', 'DELETE', '/userBlocks/student1/blockedUsers/owner1');
+  check(
+    'the same participant can send again after the block is removed',
+    await create(TOKENS.student, 'conversations/conv1/messages', 'msg-after-unblock', {
+      messageId: string('msg-after-unblock'),
+      conversationId: string('conv1'),
+      senderId: string('student1'),
+      receiverId: string('owner1'),
+      content: string('Message after unblock'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+
   console.log('\n--- server-owned booking and payment collections ---');
   check(
     'student cannot create a join request',

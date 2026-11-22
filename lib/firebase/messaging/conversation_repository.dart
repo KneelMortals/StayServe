@@ -6,6 +6,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../../core/constants/enums.dart';
 import '../../../core/utils/app_logger.dart';
+import '../../../models/interaction_model.dart';
 import '../../../models/messaging_model.dart';
 import '../auth/auth_service.dart';
 import '../functions/functions_service.dart';
@@ -143,13 +144,8 @@ class ConversationRepository {
       conversation['updatedAt'] = FieldValue.serverTimestamp();
       conversation['unreadCount'] = unread;
 
-      // `roomId` is only written when it is actually known. Writing `null`
-      // used to wipe the room link of every conversation on the first
-      // message that was sent without one.
-      if (roomId != null) {
-        conversation['roomId'] = roomId;
-      }
-
+      // The listing context is server-owned. A client message must not
+      // re-point an existing conversation to another room.
       transaction.set(conversationRef, conversation, SetOptions(merge: true));
       transaction.set(
         conversationRef.collection('messages').doc(messageId),
@@ -203,31 +199,133 @@ class ConversationRepository {
     }
   }
 
-  /// Starts (or reuses) a verified conversation with a room owner.
-  Future<String> openConversation(String otherUserId, {String? roomId}) async {
+  /// Starts (or reuses) a verified conversation.
+  ///
+  /// A student may open a room inquiry with the owner of that room. Either
+  /// booking participant may also open the conversation through a verified
+  /// booking request, which is how an owner replies to a student.
+  Future<ConversationOpenResult> openConversation(
+    String otherUserId, {
+    String? roomId,
+    String? requestId,
+  }) async {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
-    if (roomId == null || roomId.trim().isEmpty) {
-      throw Exception('The room is required to open a conversation.');
+    final cleanRoomId = roomId?.trim() ?? '';
+    final cleanRequestId = requestId?.trim() ?? '';
+    if (cleanRoomId.isEmpty && cleanRequestId.isEmpty) {
+      throw Exception('A room or booking request is required.');
     }
 
+    final data = await _callInteraction(
+      'openConversation',
+      parameters: {
+        'otherUserId': otherUserId,
+        if (cleanRoomId.isNotEmpty) 'roomId': cleanRoomId,
+        if (cleanRequestId.isNotEmpty) 'requestId': cleanRequestId,
+      },
+      fallbackMessage: 'Could not open the conversation',
+    );
+    final conversationId = data['conversationId'];
+    if (conversationId is! String || conversationId.isEmpty) {
+      throw Exception('The server did not return a conversation id.');
+    }
+    return ConversationOpenResult.fromJson(data);
+  }
+
+  /// Loads the peer name, listing title and current block state of a chat.
+  Future<ConversationInteractionDetails> getConversationInteractionDetails(
+    String conversationId, {
+    String? roomId,
+    String? requestId,
+  }) async {
+    final data = await _callInteraction(
+      'getConversationInteractionDetails',
+      parameters: {
+        'conversationId': conversationId,
+        if (roomId != null && roomId.trim().isNotEmpty) 'roomId': roomId.trim(),
+        if (requestId != null && requestId.trim().isNotEmpty)
+          'requestId': requestId.trim(),
+      },
+      fallbackMessage: 'Could not load the conversation details',
+    );
+    return ConversationInteractionDetails.fromJson(data);
+  }
+
+  /// Loads the real participant names, room title and block state of a
+  /// booking request.
+  Future<BookingInteractionDetails> getBookingInteractionDetails(
+    String requestId,
+  ) async {
+    final data = await _callInteraction(
+      'getBookingInteractionDetails',
+      parameters: {'requestId': requestId},
+      fallbackMessage: 'Could not load the booking details',
+    );
+    return BookingInteractionDetails.fromJson(data);
+  }
+
+  /// Loads the safe owner contact details for a room listing.
+  Future<RoomContactDetails> getRoomContactDetails(String roomId) async {
+    final data = await _callInteraction(
+      'getRoomContactDetails',
+      parameters: {'roomId': roomId},
+      fallbackMessage: 'Could not load the owner details',
+    );
+    return RoomContactDetails.fromJson(data);
+  }
+
+  /// Blocks the other participant from new messages and booking progress.
+  Future<UserBlockResult> blockUser(
+    String otherUserId, {
+    String? requestId,
+    String? conversationId,
+  }) async {
+    final data = await _callInteraction(
+      'blockUser',
+      parameters: {
+        'otherUserId': otherUserId,
+        if (requestId != null && requestId.trim().isNotEmpty)
+          'requestId': requestId.trim(),
+        if (conversationId != null && conversationId.trim().isNotEmpty)
+          'conversationId': conversationId.trim(),
+      },
+      fallbackMessage: 'Could not block this participant',
+    );
+    return UserBlockResult.fromJson(data);
+  }
+
+  /// Removes only the current user's block of the other participant.
+  Future<UserBlockResult> unblockUser(String otherUserId) async {
+    final data = await _callInteraction(
+      'unblockUser',
+      parameters: {'otherUserId': otherUserId},
+      fallbackMessage: 'Could not unblock this participant',
+    );
+    return UserBlockResult.fromJson(data);
+  }
+
+  /// Calls an interaction callable and converts Firebase failures into the
+  /// readable [Exception] used by the screens.
+  Future<Map<String, dynamic>> _callInteraction(
+    String name, {
+    required Map<String, dynamic> parameters,
+    required String fallbackMessage,
+  }) async {
     try {
       final result = await _functions.callFunction(
-        'openConversation',
-        parameters: {'otherUserId': otherUserId, 'roomId': roomId},
+        name,
+        parameters: parameters,
       );
-      final data = Map<String, dynamic>.from(result.data as Map);
-      final conversationId = data['conversationId'];
-      if (conversationId is! String || conversationId.isEmpty) {
-        throw Exception('The server did not return a conversation id.');
+      final raw = result.data;
+      if (raw is! Map) {
+        throw Exception(fallbackMessage);
       }
-      return conversationId;
+      return Map<String, dynamic>.from(raw);
     } on FirebaseFunctionsException catch (error) {
       final message = error.message?.trim();
       throw Exception(
-        message == null || message.isEmpty
-            ? 'Could not open the conversation'
-            : message,
+        message == null || message.isEmpty ? fallbackMessage : message,
       );
     }
   }
