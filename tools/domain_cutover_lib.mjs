@@ -12,6 +12,19 @@ export const PUBLIC_ORIGIN_FILES = Object.freeze([
 
 export const CORS_FILE = 'storage.cors.json';
 
+export const PUBLIC_SITEMAP_PATHS = Object.freeze([
+  '/home/',
+  '/terms/',
+  '/privacy-policy/',
+]);
+
+const EXPECTED_CANONICAL_PATHS = Object.freeze({
+  'web/index.html': '/',
+  'web/home/index.html': '/home/',
+  'web/terms/index.html': '/terms/',
+  'web/privacy-policy/index.html': '/privacy-policy/',
+});
+
 export class HostingApiError extends Error {
   constructor(message, {status = null, body = null} = {}) {
     super(message);
@@ -83,6 +96,36 @@ function normalizeHttpsOrigin(value, description) {
   return url.origin;
 }
 
+function validatePublicUrl(value, description, targetOrigin, expectedPath) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${description} must be an absolute URL.`);
+  }
+
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(
+      `${description} must be an HTTPS URL without credentials, a query, or a fragment.`,
+    );
+  }
+  if (url.origin !== targetOrigin) {
+    throw new Error(`${description} is outside the target origin.`);
+  }
+  if (url.pathname !== expectedPath) {
+    throw new Error(
+      `${description} must use the expected path ${expectedPath}.`,
+    );
+  }
+  return url;
+}
+
 export function planOriginAlignment(fileContents, options) {
   const {
     targetOrigin,
@@ -132,17 +175,19 @@ export function planOriginAlignment(fileContents, options) {
     }
 
     if (relativePath.endsWith('.html')) {
+      const expectedPath = EXPECTED_CANONICAL_PATHS[relativePath];
       const canonicalMatch = updated.match(
         /<link\s+rel=["']canonical["']\s+href=["']([^"']+)["']/i,
       );
       if (!canonicalMatch) {
         throw new Error(`${relativePath} is missing its canonical link.`);
       }
-      if (new URL(canonicalMatch[1]).origin !== normalizedTarget) {
-        throw new Error(
-          `${relativePath} has a canonical URL outside the target origin.`,
-        );
-      }
+      validatePublicUrl(
+        canonicalMatch[1],
+        `${relativePath} canonical URL`,
+        normalizedTarget,
+        expectedPath,
+      );
 
       const openGraphMatch = updated.match(
         /<meta\s+property=["']og:url["']\s+content=["']([^"']+)["']/i,
@@ -150,10 +195,60 @@ export function planOriginAlignment(fileContents, options) {
       if (!openGraphMatch) {
         throw new Error(`${relativePath} is missing its Open Graph URL.`);
       }
-      if (new URL(openGraphMatch[1]).origin !== normalizedTarget) {
-        throw new Error(
-          `${relativePath} has an Open Graph URL outside the target origin.`,
+      validatePublicUrl(
+        openGraphMatch[1],
+        `${relativePath} Open Graph URL`,
+        normalizedTarget,
+        expectedPath,
+      );
+    }
+
+    if (relativePath === 'web/sitemap.xml') {
+      const locations = [
+        ...updated.matchAll(/<loc>([^<]+)<\/loc>/g),
+      ].map((match) => match[1]);
+      if (locations.length === 0) {
+        throw new Error(`${relativePath} does not contain any public URLs.`);
+      }
+
+      const foundPaths = new Set();
+      for (const location of locations) {
+        let parsedLocation;
+        try {
+          parsedLocation = new URL(location);
+        } catch {
+          throw new Error(
+            `${relativePath} contains a non-absolute public URL: ${location}`,
+          );
+        }
+        const expectedPath = PUBLIC_SITEMAP_PATHS.find(
+          (path) => parsedLocation.pathname === path,
         );
+        if (!expectedPath) {
+          throw new Error(
+            `${relativePath} contains an unexpected public URL: ${location}`,
+          );
+        }
+        validatePublicUrl(
+          location,
+          `${relativePath} URL`,
+          normalizedTarget,
+          expectedPath,
+        );
+        if (foundPaths.has(expectedPath)) {
+          throw new Error(
+            `${relativePath} contains a duplicate public URL: ${location}`,
+          );
+        }
+        foundPaths.add(expectedPath);
+      }
+
+      for (const expectedPath of PUBLIC_SITEMAP_PATHS) {
+        if (!foundPaths.has(expectedPath)) {
+          throw new Error(
+            `${relativePath} is missing the public URL ${expectedPath}.`,
+          );
+        }
       }
     }
 
@@ -316,15 +411,41 @@ export function isDomainReady(domain) {
 }
 
 export function getDesiredDnsRecords(domain) {
-  const recordSets = domain?.requiredDnsUpdates?.desired || [];
-  return recordSets.flatMap((recordSet) =>
+  const recordSets = [
+    ...(domain?.requiredDnsUpdates?.desired || []).map((recordSet) => ({
+      recordSet,
+      source: 'hosting',
+    })),
+    ...(domain?.cert?.verification?.dns?.desired || []).map((recordSet) => ({
+      recordSet,
+      source: 'certificate',
+    })),
+  ];
+
+  const records = recordSets.flatMap(({recordSet, source}) =>
     (recordSet.records || []).map((record) => ({
+      source,
       type: record.type,
       host: recordSet.domainName,
       value: record.rdata,
       action: record.requiredAction,
     })),
   );
+
+  const seen = new Set();
+  return records.filter((record) => {
+    const key = [
+      record.type,
+      record.host,
+      record.value,
+      record.action,
+    ].join('\0');
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 export function formatDnsRecords(records) {
@@ -332,8 +453,9 @@ export function formatDnsRecords(records) {
     return 'No desired DNS records were returned by Firebase.';
   }
 
-  const header = ['TYPE', 'HOST', 'VALUE', 'ACTION'];
+  const header = ['SOURCE', 'TYPE', 'HOST', 'VALUE', 'ACTION'];
   const rows = records.map((record) => [
+    record.source || '-',
     record.type || '-',
     record.host || '-',
     record.value || '-',

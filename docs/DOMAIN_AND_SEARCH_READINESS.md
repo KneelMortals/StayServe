@@ -137,9 +137,11 @@ npm run domain:attach -- \
 
 The helper attaches only the domain mappings. It does **not** change DNS,
 apply Storage CORS, or deploy Hosting. It prints the exact records Firebase
-requires. Apply each row according to its `ACTION` value: `ADD` means add the
-record, `REMOVE` means remove the conflicting record, and `NONE` means no DNS
-change is required. A setup commonly includes:
+requires, including any certificate-verification records requested for a DNS
+challenge. The `SOURCE` column distinguishes Hosting routing records from
+certificate records. Apply each row according to its `ACTION` value: `ADD`
+means add the record, `REMOVE` means remove the conflicting record, and `NONE`
+means no DNS change is required. A setup commonly includes:
 
 1. a Firebase-provided TXT ownership record at the apex;
 2. the Firebase-provided A/AAAA records for each hostname;

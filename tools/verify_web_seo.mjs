@@ -105,6 +105,12 @@ if (!sitemapMatch) {
     if (location.origin !== origin) {
       failures.push(`Sitemap URL uses a different origin: ${location.href}`);
     }
+    if (location.search) {
+      failures.push(`Sitemap URL must not contain a query: ${location.href}`);
+    }
+    if (location.hash) {
+      failures.push(`Sitemap URL must not contain a fragment: ${location.href}`);
+    }
     if (!expectedPaths.has(location.pathname)) {
       failures.push(`Sitemap contains an unexpected URL: ${location.href}`);
     }

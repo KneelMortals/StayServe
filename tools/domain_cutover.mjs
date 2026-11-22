@@ -157,6 +157,35 @@ function findDomain(domains, domainName) {
   return domains.find((domain) => domain.name?.endsWith(`/customDomains/${domainName}`));
 }
 
+export function getDomainStatusAction(canonical, redirect, configuration) {
+  if (!canonical) {
+    return (
+      'Attach the domain with the attach command, then apply the exact DNS records.'
+    );
+  }
+  if (canonical.redirectTarget) {
+    return (
+      `${configuration.canonicalDomain} is configured as a redirect to ` +
+      `${canonical.redirectTarget}; canonical alignment is blocked.`
+    );
+  }
+  if (!isDomainReady(canonical)) {
+    return 'Apply the exact Firebase-requested DNS records at the registrar.';
+  }
+  if (!redirect) {
+    return (
+      'Attach the www redirect with the attach command and --include-www.'
+    );
+  }
+  if (redirect.redirectTarget !== configuration.canonicalDomain) {
+    return (
+      `${configuration.redirectDomain} has an unexpected redirect target. ` +
+      'The helper will not repoint it automatically; review it in Firebase.'
+    );
+  }
+  return 'Run the align command with --apply to update checked-in canonical URLs.';
+}
+
 function printDomainStatus(domain) {
   const certState = domain.cert?.state || domain.certState || 'unknown';
   console.log(`- ${domain.name?.split('/').pop()}`);
@@ -220,30 +249,11 @@ async function printStatus(api, configuration) {
       : `Local canonical URLs still use ${localOrigin}; alignment is gated on the remote readiness checks.`,
   );
 
-  if (canonical) {
-    const redirect = findDomain(domains, configuration.redirectDomain);
-    console.log('\nNext action:');
-    if (!isDomainReady(canonical)) {
-      console.log('Apply the exact Firebase-requested DNS records at the registrar.');
-    } else if (!redirect) {
-      console.log(
-        'Attach the www redirect with the attach command and --include-www.',
-      );
-    } else if (redirect.redirectTarget !== configuration.canonicalDomain) {
-      console.log(
-        `${configuration.redirectDomain} has an unexpected redirect target. ` +
-          'The helper will not repoint it automatically; review it in Firebase.',
-      );
-    } else {
-      console.log(
-        'Run the align command with --apply to update checked-in canonical URLs.',
-      );
-    }
-  } else {
-    console.log(
-      'Attach the domain with the attach command, then add the exact DNS records.',
-    );
-  }
+  const redirect = findDomain(domains, configuration.redirectDomain);
+  console.log('\nNext action:');
+  console.log(
+    getDomainStatusAction(canonical, redirect, configuration),
+  );
 }
 
 function requireConfirmation(configuration, options) {
@@ -254,7 +264,12 @@ function requireConfirmation(configuration, options) {
   }
 }
 
-async function attachDomains(api, configuration, options) {
+export async function attachDomains(
+  api,
+  configuration,
+  options,
+  {logger = console} = {},
+) {
   requireConfirmation(configuration, options);
 
   const canonical = await ensureCustomDomain(api, {
@@ -262,7 +277,7 @@ async function attachDomains(api, configuration, options) {
     siteId: configuration.hostingSiteId,
     domain: configuration.canonicalDomain,
   });
-  console.log(
+  logger.log(
     canonical.created
       ? `Attached ${configuration.canonicalDomain} to Firebase Hosting.`
       : `${configuration.canonicalDomain} was already attached; no change was made.`,
@@ -275,14 +290,14 @@ async function attachDomains(api, configuration, options) {
       domain: configuration.redirectDomain,
       redirectTarget: configuration.canonicalDomain,
     });
-    console.log(
+    logger.log(
       redirect.created
         ? `Attached ${configuration.redirectDomain} as a redirect to ${configuration.canonicalDomain}.`
         : `${configuration.redirectDomain} was already attached with the expected redirect; no change was made.`,
     );
   }
 
-  console.log(
+  logger.log(
     '\nNo DNS records were changed. Apply the Firebase-requested records below ' +
       'at the registrar according to their ACTION values:',
   );
@@ -295,12 +310,17 @@ async function attachDomains(api, configuration, options) {
     ...(options.includeWww ? [configuration.redirectDomain] : []),
   ]) {
     const domain = findDomain(domains, domainName);
-    console.log(`\n${domainName}:`);
-    console.log(formatDnsRecords(getDesiredDnsRecords(domain)));
+    logger.log(`\n${domainName}:`);
+    logger.log(formatDnsRecords(getDesiredDnsRecords(domain)));
   }
 }
 
-async function alignCanonicalSources(api, configuration, options) {
+export async function alignCanonicalSources(
+  api,
+  configuration,
+  options,
+  {projectRoot = PROJECT_ROOT, logger = console} = {},
+) {
   requireConfirmation(configuration, options);
 
   const domains = await api.listCustomDomains(
@@ -310,6 +330,12 @@ async function alignCanonicalSources(api, configuration, options) {
   const canonical = findDomain(domains, configuration.canonicalDomain);
   if (!canonical) {
     fail(`${configuration.canonicalDomain} is not attached to Firebase Hosting.`);
+  }
+  if (canonical.redirectTarget) {
+    fail(
+      `${configuration.canonicalDomain} is configured as a redirect to ` +
+        `${canonical.redirectTarget}; refusing to align canonical URLs.`,
+    );
   }
 
   const redirect = findDomain(domains, configuration.redirectDomain);
@@ -334,7 +360,7 @@ async function alignCanonicalSources(api, configuration, options) {
     );
   }
 
-  const files = await readProjectFiles(PROJECT_ROOT, [
+  const files = await readProjectFiles(projectRoot, [
     ...PUBLIC_ORIGIN_FILES,
     CORS_FILE,
   ]);
@@ -347,24 +373,30 @@ async function alignCanonicalSources(api, configuration, options) {
   });
 
   if (plan.changes.size === 0) {
-    console.log('The checked-in canonical URLs and CORS policy are already aligned.');
+    logger.log(
+      'The checked-in canonical URLs and CORS policy are already aligned.',
+    );
     return;
   }
 
-  console.log(`Canonical origin: ${plan.currentOrigin} -> ${plan.targetOrigin}`);
-  console.log('Files to update:');
+  logger.log(
+    `Canonical origin: ${plan.currentOrigin} -> ${plan.targetOrigin}`,
+  );
+  logger.log('Files to update:');
   for (const relativePath of plan.changes.keys()) {
-    console.log(`- ${relativePath}`);
+    logger.log(`- ${relativePath}`);
   }
 
   if (!options.apply) {
-    console.log('\nDry run only. Add --apply to update the checked-in files.');
+    logger.log('\nDry run only. Add --apply to update the checked-in files.');
     return;
   }
 
-  await applyFileChanges(PROJECT_ROOT, plan.changes);
-  console.log(`\nUpdated ${plan.changes.size} checked-in file(s).`);
-  console.log('No Storage CORS policy was applied and no Hosting release was deployed.');
+  await applyFileChanges(projectRoot, plan.changes);
+  logger.log(`\nUpdated ${plan.changes.size} checked-in file(s).`);
+  logger.log(
+    'No Storage CORS policy was applied and no Hosting release was deployed.',
+  );
 }
 
 function printHelp() {
@@ -387,7 +419,7 @@ This tool never deletes domains, changes registrar DNS, applies Storage CORS,
 or deploys Hosting.`);
 }
 
-async function main() {
+export async function main() {
   const {command, options} = parseArguments(process.argv.slice(2));
   if (command === 'help' || command === '--help' || command === '-h') {
     printHelp();
@@ -409,7 +441,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(`ERROR  ${error.message || error}`);
-  process.exitCode = 1;
-});
+const isDirectRun =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(`ERROR  ${error.message || error}`);
+    process.exitCode = 1;
+  });
+}
