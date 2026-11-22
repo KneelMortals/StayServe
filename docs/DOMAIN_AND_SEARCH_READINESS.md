@@ -11,6 +11,8 @@ StayServe. It does **not** authorize a production deployment or a DNS change.
 - Firebase Hosting site: `myfirstapp-fa30f52b`
 - Current public Hosting origin: `https://myfirstapp-fa30f52b.web.app`
 - Custom domains attached to the Hosting site: **none**
+- Selected target domain: **`stayserve.co.in`**
+- Target-domain registration status on 2026-11-22: **not yet registered by the owner**
 - Checked-in canonical origin: `https://myfirstapp-fa30f52b.web.app`
 - Production deployment performed during this work: **none**
 
@@ -58,38 +60,62 @@ screening.
 
 | Domain | Observation on 2026-11-22 | Decision needed |
 |---|---|---|
-| `stayserve.com` | Registered at GoDaddy; DNS still points away from Firebase Hosting. The apex resolves to GoDaddy infrastructure and `www` points to `ghs.googlehosted.com`; HTTPS was not healthy during the check. A public `google-site-verification` TXT record is present, which may allow an existing Search Console property to be reused. | Confirm ownership and whether the domain is serving or reserved. Use Firebase's **Advanced Setup** if traffic must be preserved. |
-| `stayserve.in` | Registered at Hostinger on 2026-08-19; DNS currently uses Hostinger parking nameservers and a parking address. | Confirm ownership and whether this is the intended brand domain. |
-| `stayserve.co.in` | Reported available by the `.co.in` registry WHOIS. | Candidate for an India-focused domain. |
-| `stayserve.co` | Reported available by registry WHOIS. | Candidate. |
-| `stayserve.io` | Reported available by registry WHOIS. | Candidate. |
-| `getstayserve.com` | Reported available by registry WHOIS. | Candidate. |
-| `stay-serve.com` | Reported available by registry WHOIS. | Candidate. |
-| `stayserve.app` | The registry response did not conclusively establish availability. | Check at the registrar. |
+| `stayserve.com` | Registered at GoDaddy; DNS still points away from Firebase Hosting. The apex resolves to GoDaddy infrastructure and `www` points to `ghs.googlehosted.com`; HTTPS was not healthy during the check. A public `google-site-verification` TXT record is present, but it is unrelated to the selected `.co.in` domain. | Not selected; registration predates this work. |
+| `stayserve.in` | Registered at Hostinger on 2026-08-19; DNS currently uses Hostinger parking nameservers and a parking address. | Not selected; registration predates this work. |
+| `stayserve.co.in` | Registry RDAP returned no registration on 2026-11-22. | **Selected target.** Register it through an accredited `.IN` registrar and complete mandatory eKYC/contact validation. |
+| `stayserve.co` | Registry RDAP returned no registration on 2026-11-22. | Available alternative. |
+| `stayserve.io` | Registry RDAP returned no registration on 2026-11-22. | Available alternative. |
+| `getstayserve.com` | Registry RDAP returned no registration on 2026-11-22. | Available global `.com` alternative. |
+| `stay-serve.com` | Reported available by registry WHOIS. | Available alternative. |
+| `stayserve.app` | Registry RDAP returned no registration on 2026-11-22. | Available alternative; renewal is normally more expensive. |
 
-Recommended preference, if the user controls it: **`stayserve.com`**. It is the
-cleanest brand match and already has a Search Console verification record.
-The alternative is to register one of the available names above. Do not buy a
-domain automatically without the owner's approval.
+Selected target: **`stayserve.co.in`**. It preserves the exact product name and
+is appropriate for the India-focused student market. The owner must complete
+the registration and payment in a registrar account; domain purchases cannot
+be completed safely by an automated tool.
 
 ## Custom-domain cutover checklist
 
-### 1. Choose the canonical hostname
+### 1. Register `stayserve.co.in`
+
+Register the selected domain through an accredited `.IN` registrar. The
+registry publishes a wholesale price of ₹400 per year for `.co.in`; retail
+registration and renewal prices are set by the registrar and can be higher.
+The checkout price is authoritative.
+
+Examples of registrar search pages:
+
+- Hostinger: <https://hostinger.com/in/tld/co-in-domain>
+- Namecheap: <https://www.namecheap.com/domains/registration/results/?domain=stayserve.co.in>
+- GoDaddy: <https://www.godaddy.com/domainsearch/find?domainToCheck=stayserve.co.in>
+
+During checkout:
+
+1. use accurate registrant, administrative, technical, and billing contact
+   details, as required by `.IN` registry policy;
+2. enable auto-renew;
+3. complete the registry's mandatory eKYC/contact-validation request;
+4. keep the registrar account accessible for DNS changes.
+
+Do not change nameservers or DNS records as part of the purchase. Firebase must
+issue the exact records for this Hosting site first.
+
+### 2. Choose the canonical hostname
 
 Choose either the apex or `www` as the canonical hostname. Prefer the apex
-(`https://stayserve.com`) unless there is a specific reason not to. The other
-hostname should redirect permanently to the canonical host.
+(`https://stayserve.co.in`) unless there is a specific reason not to. The
+other hostname should redirect permanently to the canonical host.
 
-### 2. Attach the domain to Firebase Hosting
+### 3. Attach the domain to Firebase Hosting
 
 In the Firebase console, open **Hosting → myfirstapp-fa30f52b → Add custom
 domain**.
 
-- Use **Quick Setup** for a new domain that does not currently receive
-  traffic.
-- Use **Advanced Setup** for an existing site such as the current
-  `stayserve.com` DNS configuration, so the old host can remain online until
-  Firebase has verified ownership and provisioned TLS.
+- Use **Quick Setup** for `stayserve.co.in`, because it is a new domain that
+  does not currently receive traffic.
+- Use **Advanced Setup** only if the domain becomes an existing live site
+  before the cutover, so the old host can remain online until Firebase has
+  verified ownership and provisioned TLS.
 
 Follow the exact records displayed by the Firebase wizard. A typical setup
 includes:
@@ -106,7 +132,7 @@ certificate provisioning can take up to 24 hours.
 Firebase provisions and renews the TLS certificate automatically. The domain
 must show **Connected** before the cutover is considered complete.
 
-### 3. Align all checked-in public URLs
+### 4. Align all checked-in public URLs
 
 After the hostname is attached, update the canonical origin in every file
 below before building or deploying:
@@ -123,7 +149,7 @@ The SEO tests and `npm run web:seo:check` fail if these values drift apart.
 Keep the Firebase-generated domain as a fallback only while the custom domain
 is unavailable; do not publish conflicting canonicals.
 
-### 4. Build and validate without cutting traffic over
+### 5. Build and validate without cutting traffic over
 
 ```bash
 flutter test test/web_seo_test.dart
@@ -147,19 +173,17 @@ redirected hostname must not create a second crawlable copy of the site.
 
 ## Google Search Console setup
 
-Use a **Domain property** for the apex domain (for example,
-`stayserve.com`), not a URL-prefix property. A Domain property covers the
-apex, `www`, and both HTTP and HTTPS variants.
+Use a **Domain property** for `stayserve.co.in`, not a URL-prefix property. A
+Domain property covers the apex, `www`, and both HTTP and HTTPS variants.
 
 1. Open Google Search Console with the Google account that owns or manages
    the domain.
-2. Add a **Domain** property using the apex hostname only; do not include
+2. Add a **Domain** property using `stayserve.co.in` only; do not include
    `www`, a protocol, or a path.
 3. Copy the Search Console-provided `google-site-verification` TXT value into
-   the domain's DNS settings. Keep that record permanently. The existing
-   public TXT record on `stayserve.com` may already satisfy verification, but
-   ownership of the Search Console property must still be confirmed in the
-   Search Console UI.
+   the domain's DNS settings. Keep that record permanently. This Search
+   Console TXT record is separate from Firebase's domain-ownership TXT
+   record; both may need to coexist.
 4. Wait until the property is verified.
 5. In **Sitemaps**, submit:
    `https://THE-CANONICAL-HOST/sitemap.xml`
