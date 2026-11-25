@@ -89,12 +89,150 @@ jobs:
       - name: Verify the web SEO assets
         run: npm run web:seo:check
 
-      - name: Build the Android release
+      - name: Build the Android App Bundle
         # A clean checkout does not track Flutter's generated Gradle wrapper.
         # The Flutter build restores it before the lint step runs below.
-        run: flutter build apk --release
+        # Build the bundle before split APKs because AGP cannot pre-bundle
+        # after a multi-APK build has produced multiple shrunk-resource files.
+        run: flutter build appbundle --release
+
+      - name: Enforce the Android per-device download limit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLETOOL_VERSION="1.18.3"
+          BUNDLETOOL_SHA256="a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
+          BUNDLETOOL_JAR="${RUNNER_TEMP}/bundletool.jar"
+          BUNDLE="${GITHUB_WORKSPACE}/build/app/outputs/bundle/release/app-release.aab"
+          APKS="${RUNNER_TEMP}/stayserve.apks"
+          KEYSTORE="${RUNNER_TEMP}/ci-upload.keystore"
+
+          curl --fail --location --retry 3 \
+            "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
+            --output "${BUNDLETOOL_JAR}"
+          echo "${BUNDLETOOL_SHA256}  ${BUNDLETOOL_JAR}" | sha256sum --check --strict
+
+          keytool -genkeypair \
+            -keystore "${KEYSTORE}" \
+            -storepass android \
+            -keypass android \
+            -alias androiddebugkey \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+          java -jar "${BUNDLETOOL_JAR}" build-apks \
+            --bundle="${BUNDLE}" \
+            --output="${APKS}" \
+            --ks="${KEYSTORE}" \
+            --ks-pass=pass:android \
+            --ks-key-alias=androiddebugkey \
+            --key-pass=pass:android
+
+          java -jar "${BUNDLETOOL_JAR}" get-size total --apks="${APKS}" \
+            | dart run tools/check_android_bundle_size.dart \
+                --max-bytes 40000000
+
+      - name: Build the Android release APKs
+        # Flutter's supported split flow produces distributable ABI-specific
+        # APKs without the oversized universal fallback and honors targeted
+        # Flutter ABI flags.
+        run: flutter build apk --release --split-per-abi
+
+      - name: Verify the Android APK variant version codes
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          metadata_path = Path("build/app/outputs/apk/release/output-metadata.json")
+          metadata = json.loads(metadata_path.read_text())
+          version_codes = {
+              int(element["versionCode"])
+              for element in metadata["elements"]
+          }
+          if len(version_codes) != 1:
+              raise SystemExit(
+                  "Every APK output of one release must use the same version code: "
+                  f"{sorted(version_codes)}"
+              )
+          print(f"Android APK version code: {version_codes.pop()}")
+          PY
+
+      - name: Enforce the Android release APK size limit
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          limit = 40_000_000
+          metadata_path = Path("build/app/outputs/apk/release/output-metadata.json")
+          metadata = json.loads(metadata_path.read_text())
+          elements = metadata.get("elements", [])
+          if not elements:
+              raise SystemExit("The Android release build produced no APK outputs.")
+
+          output_paths = set()
+          for element in elements:
+              if element.get("type") != "ONE_OF_MANY":
+                  raise SystemExit(
+                      "Every Android release APK output must be ABI-specific; "
+                      f"found {element.get('type')}."
+                  )
+              output_name = element.get("outputFile")
+              if not output_name:
+                  raise SystemExit("An Android release APK output has no filename.")
+              output_path = metadata_path.parent / output_name
+              if not output_path.is_file():
+                  raise SystemExit(f"Android release APK is missing: {output_path}")
+              output_paths.add(output_path)
+
+          # Flutter copies the distributable APKs to a second directory. Check
+          # both locations so a stale universal APK cannot escape the limit.
+          for output_directory in (
+              metadata_path.parent,
+              Path("build/app/outputs/flutter-apk"),
+          ):
+              output_paths.update(output_directory.glob("*.apk"))
+
+          for output_path in sorted(output_paths):
+              size = output_path.stat().st_size
+              print(f"{output_path.name}: {size} bytes")
+              if size >= limit:
+                  raise SystemExit(
+                      f"{output_path} is {size} bytes; every distributable "
+                      "Android release APK must be strictly below "
+                      f"{limit} bytes."
+                  )
+          PY
 
       - name: Lint the Android app
         # Lint only the application module. Flutter plugins are separate
         # Gradle projects and may carry their own upstream lint findings.
         run: ./android/gradlew -p android :app:lintDebug
+
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Verify the iOS push and OAuth configuration
+        run: flutter test test/ios_auth_configuration_test.dart
+
+      - name: Build the unsigned iOS release
+        run: flutter build ios --release --no-codesign

@@ -19,6 +19,36 @@ final conversationRepositoryProvider = Provider<ConversationRepository>((ref) {
   );
 });
 
+/// Keeps the idempotency key of an unresolved administrator message.
+///
+/// The server trims the message before storing it. The client therefore uses
+/// the same trimmed text as the operation identity: a retry which only adds
+/// whitespace is the same send. Once a send succeeds, its key is released so
+/// that deliberately sending the same text again creates a new message.
+class AdminMessageRequestTracker {
+  AdminMessageRequestTracker(this._newRequestId);
+
+  final String Function() _newRequestId;
+  final Map<String, String> _pendingRequestIdsByContent = {};
+
+  /// The stable request id for an unresolved send of [content].
+  String requestIdFor(String content) {
+    final canonicalContent = content.trim();
+    if (canonicalContent.isEmpty) {
+      throw ArgumentError.value(content, 'content', 'Message cannot be empty');
+    }
+    return _pendingRequestIdsByContent.putIfAbsent(
+      canonicalContent,
+      _newRequestId,
+    );
+  }
+
+  /// Releases the key after the server has confirmed the send.
+  void markSucceeded(String content) {
+    _pendingRequestIdsByContent.remove(content.trim());
+  }
+}
+
 /// Data access for conversations and their messages.
 class ConversationRepository {
   static const Uuid _uuid = Uuid();
@@ -169,6 +199,41 @@ class ConversationRepository {
       // A missing notification must never lose the message itself.
       AppLogger.warning('Could not create the chat notification', error: e);
     }
+  }
+
+  /// Creates an idempotency key for one administrator message.
+  ///
+  /// The key must be reused when the **same** send is retried after a lost
+  /// response. Otherwise the server cannot tell a retry from a second
+  /// message and may notify the recipient twice.
+  String newAdminMessageRequestId() => _uuid.v4();
+
+  /// Sends a verified administrator message to a student or room owner.
+  ///
+  /// The server owns the conversation id, the sender fields and the verified
+  /// administrator marker. The client cannot make an ordinary message look
+  /// as if the administrator had sent it.
+  Future<AdminMessageResult> sendAdminMessage({
+    required String userId,
+    required String content,
+    required String requestId,
+  }) async {
+    final targetUid = userId.trim();
+    final body = content.trim();
+    final key = requestId.trim();
+    if (targetUid.isEmpty || body.isEmpty || key.isEmpty) {
+      throw Exception('The recipient and message are required.');
+    }
+    if (body.length > 1000) {
+      throw Exception('A message can be at most 1000 characters long');
+    }
+
+    final data = await _callInteraction(
+      'sendAdminMessage',
+      parameters: {'userId': targetUid, 'content': body, 'requestId': key},
+      fallbackMessage: 'Could not send the administrator message',
+    );
+    return AdminMessageResult.fromJson(data);
   }
 
   /// Resets the unread counter of the current user for [conversationId].

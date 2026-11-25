@@ -58,6 +58,17 @@ class OtpVerifyResult {
   });
 }
 
+/// Result of completing the server-owned registration.
+class RegistrationResult {
+  /// The role which the server actually stored.
+  final String role;
+
+  /// Whether the server copied a verified Firebase phone into the profile.
+  final bool phoneVerified;
+
+  const RegistrationResult({required this.role, required this.phoneVerified});
+}
+
 final otpServiceProvider = Provider<OtpService>((ref) {
   return OtpService(ref.watch(functionsServiceProvider));
 });
@@ -148,7 +159,7 @@ class OtpService {
   /// disabled on the server it is not verified at all; when phone
   /// verification is switched on the server requires a verified number and
   /// rejects this call without one.
-  Future<String> completeRegistration({
+  Future<RegistrationResult> completeRegistration({
     required String name,
     required String role,
     required String challenge,
@@ -170,6 +181,9 @@ class OtpService {
     );
 
     final data = Map<String, dynamic>.from(result.data as Map);
-    return data['role']?.toString() ?? role;
+    return RegistrationResult(
+      role: data['role']?.toString() ?? role,
+      phoneVerified: data['phoneVerified'] == true,
+    );
   }
 }

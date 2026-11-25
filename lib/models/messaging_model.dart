@@ -16,6 +16,16 @@ class ConversationModel {
   /// The title of the room/listing which the conversation belongs to.
   final String roomTitle;
 
+  /// The server-owned kind of conversation.
+  ///
+  /// Ordinary student-owner chats use `booking`. A conversation created by
+  /// `sendAdminMessage` uses `adminSupport` and contains one live
+  /// administrator and one student or owner.
+  final String conversationType;
+
+  /// The administrator who owns an [isAdminSupport] conversation.
+  final String? adminId;
+
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -28,6 +38,8 @@ class ConversationModel {
     this.roomId,
     this.participantNames = const {},
     this.roomTitle = '',
+    this.conversationType = 'booking',
+    this.adminId,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -50,6 +62,10 @@ class ConversationModel {
             (key, value) => MapEntry(key, value?.toString() ?? ''),
           ),
       roomTitle: json['roomTitle'] as String? ?? '',
+      conversationType:
+          (json['conversationType'] as String?)?.trim().toLowerCase() ??
+          'booking',
+      adminId: json['adminId'] as String?,
       createdAt: _toDate(json['createdAt']),
       updatedAt: _toDate(json['updatedAt']),
     );
@@ -65,6 +81,8 @@ class ConversationModel {
       'roomId': roomId,
       'participantNames': participantNames,
       'roomTitle': roomTitle,
+      'conversationType': conversationType,
+      'adminId': adminId,
       'createdAt': Timestamp.fromDate(createdAt),
       'updatedAt': Timestamp.fromDate(updatedAt),
     };
@@ -79,6 +97,8 @@ class ConversationModel {
     String? roomId,
     Map<String, String>? participantNames,
     String? roomTitle,
+    String? conversationType,
+    String? adminId,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) {
@@ -91,6 +111,8 @@ class ConversationModel {
       roomId: roomId ?? this.roomId,
       participantNames: participantNames ?? this.participantNames,
       roomTitle: roomTitle ?? this.roomTitle,
+      conversationType: conversationType ?? this.conversationType,
+      adminId: adminId ?? this.adminId,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
     );
@@ -104,6 +126,18 @@ class ConversationModel {
   }
 
   int getUnreadCount(String userId) => unreadCount[userId] ?? 0;
+
+  /// Whether this is a server-created administrator support conversation.
+  ///
+  /// The administrator id must also be one of the participants. A malformed
+  /// or legacy document with only a type label is not allowed to render the
+  /// verified administrator identity.
+  bool get isAdminSupport {
+    final verifiedAdminId = adminId?.trim();
+    return conversationType.trim().toLowerCase() == 'adminsupport' &&
+        (verifiedAdminId?.isNotEmpty ?? false) &&
+        participants.contains(verifiedAdminId);
+  }
 
   /// The server-resolved display name of one participant.
   String getParticipantName(String userId) {
@@ -124,6 +158,8 @@ class ConversationModel {
             roomId == other.roomId &&
             mapEquals(participantNames, other.participantNames) &&
             roomTitle == other.roomTitle &&
+            conversationType == other.conversationType &&
+            adminId == other.adminId &&
             createdAt == other.createdAt &&
             updatedAt == other.updatedAt;
   }
@@ -152,6 +188,8 @@ class ConversationModel {
         ..sort(),
     ),
     roomTitle,
+    conversationType,
+    adminId,
     createdAt,
     updatedAt,
   );
@@ -177,6 +215,18 @@ class MessageModel {
   final String? roomId;
   final String? imageUrl;
 
+  /// The server-owned kind of sender.
+  ///
+  /// It is `admin` only for a message created by `sendAdminMessage`; an
+  /// ordinary participant message keeps the default `user` value.
+  final String senderType;
+
+  /// Whether the server verified that [adminId] is a live administrator.
+  final bool adminVerified;
+
+  /// The uid of the verified administrator who sent this message.
+  final String? adminId;
+
   const MessageModel({
     required this.messageId,
     required this.conversationId,
@@ -188,6 +238,9 @@ class MessageModel {
     this.readAt,
     this.roomId,
     this.imageUrl,
+    this.senderType = 'user',
+    this.adminVerified = false,
+    this.adminId,
   });
 
   factory MessageModel.fromJson(Map<String, dynamic> json) {
@@ -205,6 +258,10 @@ class MessageModel {
       readAt: json['readAt'] == null ? null : _toDate(json['readAt']),
       roomId: json['roomId'] as String?,
       imageUrl: json['imageUrl'] as String?,
+      senderType:
+          (json['senderType'] as String?)?.trim().toLowerCase() ?? 'user',
+      adminVerified: json['adminVerified'] == true,
+      adminId: json['adminId'] as String?,
     );
   }
 
@@ -220,6 +277,9 @@ class MessageModel {
       'readAt': readAt != null ? Timestamp.fromDate(readAt!) : null,
       'roomId': roomId,
       'imageUrl': imageUrl,
+      // The administrator markers are deliberately **not** serialized.
+      // This map is the client-created message schema accepted by the
+      // Firestore rules; only trusted server code may add those markers.
     };
   }
 
@@ -234,6 +294,9 @@ class MessageModel {
     DateTime? readAt,
     String? roomId,
     String? imageUrl,
+    String? senderType,
+    bool? adminVerified,
+    String? adminId,
   }) {
     return MessageModel(
       messageId: messageId ?? this.messageId,
@@ -246,12 +309,29 @@ class MessageModel {
       readAt: readAt ?? this.readAt,
       roomId: roomId ?? this.roomId,
       imageUrl: imageUrl ?? this.imageUrl,
+      senderType: senderType ?? this.senderType,
+      adminVerified: adminVerified ?? this.adminVerified,
+      adminId: adminId ?? this.adminId,
     );
   }
 
   bool get isRead => readAt != null;
   bool get isImage => type == MessageType.image;
   bool get isContactShare => type == MessageType.contactShare;
+
+  /// Whether this message carries the server-owned administrator badge.
+  ///
+  /// The sender type, verification marker and administrator id must all be
+  /// present, and the administrator id must be the actual sender. A message
+  /// which merely calls its sender `admin` is not shown as an administrator
+  /// message.
+  bool get isVerifiedAdminMessage {
+    final verifiedAdminId = adminId?.trim();
+    return senderType == 'admin' &&
+        adminVerified &&
+        (verifiedAdminId?.isNotEmpty ?? false) &&
+        senderId == verifiedAdminId;
+  }
 
   @override
   bool operator ==(Object other) {
@@ -267,7 +347,10 @@ class MessageModel {
             createdAt == other.createdAt &&
             readAt == other.readAt &&
             roomId == other.roomId &&
-            imageUrl == other.imageUrl;
+            imageUrl == other.imageUrl &&
+            senderType == other.senderType &&
+            adminVerified == other.adminVerified &&
+            adminId == other.adminId;
   }
 
   @override
@@ -282,6 +365,9 @@ class MessageModel {
     readAt,
     roomId,
     imageUrl,
+    senderType,
+    adminVerified,
+    adminId,
   );
 
   @override
@@ -290,6 +376,46 @@ class MessageModel {
         'senderId: $senderId, receiverId: $receiverId, content: $content, '
         'type: $type, createdAt: $createdAt, readAt: $readAt, '
         'roomId: $roomId, imageUrl: $imageUrl)';
+  }
+}
+
+/// The server's result for an administrator support message.
+class AdminMessageResult {
+  final String conversationId;
+  final String messageId;
+  final String peerId;
+  final String peerName;
+  final String peerRole;
+  final bool alreadySent;
+
+  const AdminMessageResult({
+    required this.conversationId,
+    required this.messageId,
+    required this.peerId,
+    required this.peerName,
+    this.peerRole = '',
+    this.alreadySent = false,
+  });
+
+  factory AdminMessageResult.fromJson(Map<String, dynamic> json) {
+    String requiredString(String key) {
+      final value = json[key];
+      if (value is! String || value.trim().isEmpty) {
+        throw FormatException('Missing $key in the administrator message.');
+      }
+      return value.trim();
+    }
+
+    return AdminMessageResult(
+      conversationId: requiredString('conversationId'),
+      messageId: requiredString('messageId'),
+      peerId: requiredString('peerId'),
+      peerName: requiredString('peerName'),
+      peerRole: json['peerRole'] is String
+          ? (json['peerRole'] as String).trim().toLowerCase()
+          : '',
+      alreadySent: json['alreadySent'] == true,
+    );
   }
 }
 

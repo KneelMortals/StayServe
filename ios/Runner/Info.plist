@@ -24,6 +24,19 @@
 		<string>????</string>
 		<key>CFBundleVersion</key>
 		<string>$(FLUTTER_BUILD_NUMBER)</string>
+		<key>CFBundleURLTypes</key>
+		<array>
+			<dict>
+				<key>CFBundleTypeRole</key>
+				<string>Editor</string>
+				<key>CFBundleURLName</key>
+				<string>com.stayserve.stayserve</string>
+				<key>CFBundleURLSchemes</key>
+				<array>
+					<string>com.googleusercontent.apps.96035616668-vlen8u59amj2i9m44h9cqq05snrta7pq</string>
+				</array>
+			</dict>
+		</array>
 		<key>LSRequiresIPhoneOS</key>
 		<true/>
 		<key>UIApplicationSceneManifest</key>
@@ -49,6 +62,10 @@
 		</dict>
 		<key>UIApplicationSupportsIndirectInputEvents</key>
 		<true/>
+		<key>UIBackgroundModes</key>
+		<array>
+			<string>remote-notification</string>
+		</array>
 		<key>NSLocationWhenInUseUsageDescription</key>
 		<string>StayServe needs your location to check if service is available in your area and show nearby rooms.</string>
 		<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>

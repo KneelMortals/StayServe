@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../../../../core/index.dart';
 import '../../../../firebase/reviews/review_repository.dart';
 import '../../../../models/room_review_model.dart';
+import '../../../auth/presentation/providers/auth_provider.dart';
 import '../../../students/presentation/providers/student_providers.dart';
 import '../providers/review_providers.dart';
 
@@ -33,19 +34,57 @@ class RoomReviewsScreen extends ConsumerStatefulWidget {
 }
 
 class _RoomReviewsScreenState extends ConsumerState<RoomReviewsScreen> {
+  String? _deletingReviewId;
+
+  /// Removes a review as the live administrator.
+  Future<void> _deleteAsAdmin(RoomReviewModel review) async {
+    if (_deletingReviewId != null) return;
+    final confirmed = await ConfirmationDialog.show(
+      context,
+      title: 'Delete this review?',
+      message:
+          'This review by ${review.displayName} will be removed. The action is '
+          'recorded in the moderation audit.',
+      confirmLabel: 'Delete review',
+      isDestructive: true,
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _deletingReviewId = review.reviewId);
+    try {
+      await ref
+          .read(reviewRepositoryProvider)
+          .deleteReviewAsAdmin(
+            reviewId: review.reviewId,
+            reviewInstanceId: review.reviewInstanceId,
+          );
+      if (!mounted) return;
+      ref.invalidate(roomReviewsProvider(widget.roomId));
+      ref.invalidate(myRoomReviewProvider(widget.roomId));
+      context.showSuccessSnackBar('The review was deleted.');
+    } catch (error) {
+      if (!mounted) return;
+      context.showErrorSnackBar(
+        error.toString().replaceFirst('Exception: ', '').trim(),
+      );
+    } finally {
+      if (mounted) setState(() => _deletingReviewId = null);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final reviewsAsync = ref.watch(roomReviewsProvider(widget.roomId));
     final summary = ref.watch(roomReviewSummaryProvider(widget.roomId));
-    final requests = ref.watch(myJoinRequestsProvider).valueOrNull ??
-        const [];
+    final requests = ref.watch(myJoinRequestsProvider).valueOrNull ?? const [];
 
-    final mayReview = mayReviewRoom(requests, widget.roomId);
+    final role = ref.watch(currentUserRoleProvider);
+    final isStudent = role == UserRole.student;
+    final mayReview = isStudent && mayReviewRoom(requests, widget.roomId);
+    final isAdmin = role == UserRole.admin;
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text('Reviews of ${widget.roomTitle}'),
-      ),
+      appBar: AppBar(title: Text('Reviews of ${widget.roomTitle}')),
       body: reviewsAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (error, _) => Center(
@@ -61,7 +100,8 @@ class _RoomReviewsScreenState extends ConsumerState<RoomReviewsScreen> {
               const Text('Could not load the reviews'),
               const SizedBox(height: AppSpacing.md),
               TextButton(
-                onPressed: () => ref.invalidate(roomReviewsProvider(widget.roomId)),
+                onPressed: () =>
+                    ref.invalidate(roomReviewsProvider(widget.roomId)),
                 child: const Text('Retry'),
               ),
             ],
@@ -75,7 +115,7 @@ class _RoomReviewsScreenState extends ConsumerState<RoomReviewsScreen> {
             if (mayReview) ...[
               _WriteReviewCard(roomId: widget.roomId),
               const SizedBox(height: AppSpacing.md),
-            ] else ...[
+            ] else if (isStudent) ...[
               const _ReviewHintCard(),
               const SizedBox(height: AppSpacing.md),
             ],
@@ -93,7 +133,11 @@ class _RoomReviewsScreenState extends ConsumerState<RoomReviewsScreen> {
               ...reviews.map(
                 (review) => Padding(
                   padding: const EdgeInsets.only(bottom: AppSpacing.md),
-                  child: _ReviewCard(review: review),
+                  child: _ReviewCard(
+                    review: review,
+                    onDelete: isAdmin ? () => _deleteAsAdmin(review) : null,
+                    isDeleting: isAdmin && _deletingReviewId == review.reviewId,
+                  ),
                 ),
               ),
           ],
@@ -156,18 +200,20 @@ class _SummaryCard extends StatelessWidget {
                         const SizedBox(width: AppSpacing.xs),
                         Expanded(
                           child: ClipRRect(
-                            borderRadius:
-                                BorderRadius.circular(AppBorderRadius.full),
+                            borderRadius: BorderRadius.circular(
+                              AppBorderRadius.full,
+                            ),
                             child: LinearProgressIndicator(
                               value: summary.count == 0
                                   ? 0
                                   : (summary.distribution[stars] ?? 0) /
-                                      summary.count,
+                                        summary.count,
                               minHeight: 6,
                               backgroundColor:
                                   theme.colorScheme.surfaceContainerHighest,
-                              valueColor:
-                                  const AlwaysStoppedAnimation<Color>(Colors.amber),
+                              valueColor: const AlwaysStoppedAnimation<Color>(
+                                Colors.amber,
+                              ),
                             ),
                           ),
                         ),
@@ -235,31 +281,23 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
   bool _isSending = false;
 
   @override
-  void initState() {
-    super.initState();
-
-    // The review the student already wrote is shown in the form — writing a
-    // second one replaces it.
-    ref.listenManual(myRoomReviewProvider(widget.roomId), (previous, next) {
-      final review = next.valueOrNull;
-      if (review == null) return;
-      if (_rating != 0 && _rating != review.rating) return;
-      if (_commentController.text.isNotEmpty &&
-          _commentController.text != review.comment) {
-        return;
-      }
-      if (!mounted) return;
-      setState(() {
-        _rating = review.rating;
-        _commentController.text = review.comment;
-      });
-    });
-  }
-
-  @override
   void dispose() {
     _commentController.dispose();
     super.dispose();
+  }
+
+  void _applyServerReview(RoomReviewModel? review) {
+    if (review == null) return;
+    if (_rating != 0 && _rating != review.rating) return;
+    if (_commentController.text.isNotEmpty &&
+        _commentController.text != review.comment) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _rating = review.rating;
+      _commentController.text = review.comment;
+    });
   }
 
   Future<void> _submit() async {
@@ -273,12 +311,16 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
       return;
     }
 
+    final existing = ref.read(myRoomReviewProvider(widget.roomId));
     setState(() => _isSending = true);
     try {
-      await ref.read(reviewRepositoryProvider).submitReview(
+      await ref
+          .read(reviewRepositoryProvider)
+          .submitReview(
             roomId: widget.roomId,
             rating: _rating,
             comment: _commentController.text,
+            expectedReviewInstanceId: existing?.reviewInstanceId,
           );
       if (!mounted) return;
 
@@ -314,9 +356,21 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
     );
     if (confirmed != true || !mounted) return;
 
+    final existing = ref.read(myRoomReviewProvider(widget.roomId));
+    final reviewInstanceId = existing?.reviewInstanceId.trim() ?? '';
+    if (reviewInstanceId.isEmpty) {
+      context.showErrorSnackBar('Refresh the review before removing it.');
+      return;
+    }
+
     setState(() => _isSending = true);
     try {
-      await ref.read(reviewRepositoryProvider).deleteReview(roomId: widget.roomId);
+      await ref
+          .read(reviewRepositoryProvider)
+          .deleteReview(
+            roomId: widget.roomId,
+            reviewInstanceId: reviewInstanceId,
+          );
       if (!mounted) return;
 
       _commentController.clear();
@@ -339,7 +393,11 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final existing = ref.watch(myRoomReviewProvider(widget.roomId)).valueOrNull;
+    ref.listen<RoomReviewModel?>(
+      myRoomReviewProvider(widget.roomId),
+      (previous, next) => _applyServerReview(next),
+    );
+    final existing = ref.watch(myRoomReviewProvider(widget.roomId));
 
     return AppCard(
       margin: EdgeInsets.zero,
@@ -410,8 +468,14 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
 /// One review.
 class _ReviewCard extends StatelessWidget {
   final RoomReviewModel review;
+  final VoidCallback? onDelete;
+  final bool isDeleting;
 
-  const _ReviewCard({required this.review});
+  const _ReviewCard({
+    required this.review,
+    this.onDelete,
+    this.isDeleting = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -444,6 +508,22 @@ class _ReviewCard extends StatelessWidget {
                 ),
               ),
               _Stars(rating: review.rating.toDouble(), size: 16),
+              if (onDelete != null) ...[
+                const SizedBox(width: AppSpacing.xs),
+                IconButton(
+                  tooltip: 'Delete review',
+                  onPressed: isDeleting ? null : onDelete,
+                  icon: isDeleting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.delete_outline),
+                  color: theme.colorScheme.error,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
             ],
           ),
           if (review.comment.trim().isNotEmpty) ...[

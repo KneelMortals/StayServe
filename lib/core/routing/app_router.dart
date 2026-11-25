@@ -14,6 +14,7 @@ import '../../features/auth/presentation/screens/register_screen.dart';
 import '../../features/auth/presentation/screens/forgot_password_screen.dart';
 import '../../features/auth/presentation/screens/role_selection_screen.dart';
 import '../../features/auth/presentation/screens/otp_verification_screen.dart';
+import '../../features/auth/presentation/screens/phone_verification_screen.dart';
 import '../../firebase/otp/otp_service.dart';
 import '../../features/students/presentation/screens/student_home_screen.dart';
 import '../../features/students/presentation/screens/student_search_screen.dart';
@@ -59,6 +60,17 @@ final routerProvider = Provider<GoRouter>((ref) {
     // source of the old logout race.
     if (next.hasValue) {
       ref.read(signingOutProvider.notifier).state = false;
+
+      final session = next.valueOrNull;
+      final transition = ref.read(authProfileTransitionProvider);
+      if (transition != null) {
+        final belongsToAnotherAccount =
+            session == null || session.user.uid != transition.uid;
+        if (belongsToAnotherAccount ||
+            transition.isSatisfiedBy(session.profile)) {
+          ref.read(authProfileTransitionProvider.notifier).state = null;
+        }
+      }
     }
     refreshListenable.refresh();
   });
@@ -70,106 +82,25 @@ final routerProvider = Provider<GoRouter>((ref) {
     refreshListenable.refresh();
   });
 
+  // A server-confirmed phone/role update can arrive before the matching
+  // Firestore snapshot. Re-run the redirect immediately when that transition
+  // is created so the completed screen is left without a visible bounce.
+  ref.listen(authProfileTransitionProvider, (_, __) {
+    refreshListenable.refresh();
+  });
+
   return GoRouter(
     initialLocation: '/splash',
     debugLogDiagnostics: true,
     refreshListenable: refreshListenable,
-    redirect: (context, state) {
-      final sessionAsync = ref.read(authSessionProvider);
-      // `AsyncValue.value` re-throws the error when the stream failed and
-      // there is no previous value — which crashed the router (and with it
-      // the whole app) whenever the session stream errored.
-      final session = sessionAsync.valueOrNull;
-      final directUser = ref.read(currentUserProvider);
-      final location = state.matchedLocation;
+    redirect: (context, state) => resolveAuthRedirect(
+      sessionAsync: ref.read(authSessionProvider),
+      directUser: ref.read(currentUserProvider),
+      location: state.matchedLocation,
+      signingOut: ref.read(signingOutProvider),
+      transition: ref.read(authProfileTransitionProvider),
+    ),
 
-      const authRoutes = kAuthLocations;
-
-      // The splash screen owns the initial hand-off (force-update checks,
-      // maintenance mode and pincode gating), so it is never redirected away
-      // from automatically.
-      if (location == '/splash') {
-        return null;
-      }
-
-      // The session is still being resolved. Stay put; the router will
-      // re-run this redirect as soon as the session resolves.
-      if (sessionAsync.isLoading && !sessionAsync.hasValue) {
-        return null;
-      }
-
-      // Firebase's auth state is authoritative for *authentication*. The
-      // profile-enriched session is authoritative for the role. A confirmed
-      // `null` session means that the account signed out; a session for a
-      // different uid means that the account changed and its new profile is
-      // still being resolved.
-      final sessionUser = session?.user;
-      User? user;
-      if (sessionAsync.hasValue && session == null) {
-        user = null;
-      } else if (sessionUser != null) {
-        if (directUser != null && directUser.uid != sessionUser.uid) {
-          // A different account has signed in. Wait for its profile rather
-          // than redirecting it with the previous account's role.
-          return null;
-        } else {
-          // The session provider is fed directly by Firebase Auth, so its
-          // `null` event is the authoritative logout signal. A momentarily
-          // empty `currentUserProvider` is not enough to discard a session
-          // that has not been replaced yet.
-          user = sessionUser;
-        }
-      } else {
-        user = directUser;
-      }
-
-      // Not signed in.
-      if (user == null) {
-        if (authRoutes.contains(location)) return null;
-        return '/login';
-      }
-
-      // The session for the current Firebase user is not ready yet. Keeping
-      // the current page is safer than guessing a role (or sending a
-      // returning user to role selection because the profile is still
-      // loading).
-      if (session == null || session.user.uid != user.uid) {
-        return null;
-      }
-
-      final role = session.role;
-
-      // Signed in but on an auth screen.
-      if (authRoutes.contains(location)) {
-        // The app is signing the user out: the login screen is exactly
-        // where they belong.
-        //
-        // Without this the router sent them straight back to the dashboard
-        // of the role — and when they were on the dashboard already, it
-        // ran into a redirect loop and showed its "Page Not Found" page
-        // instead of the login screen.
-        if (ref.read(signingOutProvider)) return null;
-
-        if (!session.hasProfile) {
-          // A signed-in user without a profile has to pick a role first.
-          // `/role-selection` is itself an auth route, so redirecting to it
-          // *from* it would redirect to the very same location forever —
-          // the router gave up with "redirect loop detected" and the app
-          // became unusable.
-          return location == '/role-selection' ? null : '/role-selection';
-        }
-        return homeForRole(role);
-      }
-
-      // Signed in: keep the user inside the area that matches their role.
-      // The check is skipped while the profile is still loading, otherwise a
-      // stale role would bounce the user out of the screen they just opened.
-      if (session.hasProfile && !_roleMatchesArea(role, location)) {
-        return homeForRole(role);
-      }
-
-      return null;
-    },
     routes: [
       GoRoute(
         path: '/splash',
@@ -211,6 +142,32 @@ final routerProvider = Provider<GoRouter>((ref) {
           location: '/role-selection',
           child: RoleSelectionScreen(),
         ),
+      ),
+      GoRoute(
+        path: '/phone-auth',
+        name: 'phone-auth',
+        builder: (context, state) => const BackToPreviousPage(
+          location: '/phone-auth',
+          child: PhoneVerificationScreen(mode: PhoneVerificationMode.signIn),
+        ),
+      ),
+      GoRoute(
+        path: '/verify-phone',
+        name: 'verify-phone',
+        builder: (context, state) {
+          final phone = ref
+              .read(authSessionProvider)
+              .valueOrNull
+              ?.profile
+              ?.phone;
+          return BackToPreviousPage(
+            location: state.uri.path,
+            child: PhoneVerificationScreen(
+              mode: PhoneVerificationMode.link,
+              initialPhoneNumber: phone,
+            ),
+          );
+        },
       ),
       GoRoute(
         path: '/verify-otp',
@@ -484,6 +441,153 @@ final routerProvider = Provider<GoRouter>((ref) {
     ),
   );
 });
+
+/// Resolves the authentication and role gates for one navigation attempt.
+///
+/// The policy is kept outside the [GoRouter] callback so it can be tested
+/// without mounting every screen behind the routes. The callback below is
+/// only a thin adapter which supplies the live providers to this function.
+String? resolveAuthRedirect({
+  required AsyncValue<AuthSession?> sessionAsync,
+  required User? directUser,
+  required String location,
+  required bool signingOut,
+  AuthProfileTransition? transition,
+}) {
+  final session = sessionAsync.valueOrNull;
+  const authRoutes = kAuthLocations;
+
+  // The splash screen owns the initial hand-off (force-update checks,
+  // maintenance mode and pincode gating), so it is never redirected away
+  // from automatically.
+  if (location == '/splash') return null;
+
+  // The session is still being resolved. Stay put; the router will re-run
+  // this redirect as soon as the session resolves.
+  if (sessionAsync.isLoading && !sessionAsync.hasValue) return null;
+
+  // Firebase's auth state is authoritative for authentication. The
+  // profile-enriched session is authoritative for the role. A confirmed null
+  // session means that the account signed out; a session for a different uid
+  // means that the account changed and its new profile is still resolving.
+  final sessionUser = session?.user;
+  User? user;
+  if (sessionAsync.hasValue && session == null) {
+    user = null;
+  } else if (sessionUser != null) {
+    if (directUser != null && directUser.uid != sessionUser.uid) {
+      // A different account has signed in. Wait for its profile rather than
+      // redirecting it with the previous account's role.
+      return null;
+    }
+    user = sessionUser;
+  } else {
+    user = directUser;
+  }
+
+  // Not signed in. The phone-verification screen belongs to an existing
+  // session. The phone sign-in screen may be opened while signed out.
+  if (user == null) {
+    if (location == '/verify-phone') return '/login';
+    // Role selection is only meaningful for a signed-in account. Leaving a
+    // signed-out user there was a silent dead end: the screen could not
+    // complete the registration and no route explained what to do next.
+    if (location == '/role-selection') return '/login';
+    if (authRoutes.contains(location)) return null;
+    return '/login';
+  }
+
+  // The session for the current Firebase user is not ready yet. Keeping the
+  // current page is safer than guessing a role.
+  if (session == null || session.user.uid != user.uid) return null;
+
+  final activeTransition = transition != null && transition.uid == user.uid
+      ? transition
+      : null;
+  final role = activeTransition?.role ?? session.role;
+  final profileExists =
+      session.hasProfile || activeTransition?.registrationCompleted == true;
+  final registrationCompleted =
+      session.profile?.registrationCompleted == true ||
+      activeTransition?.registrationCompleted == true;
+  // A server-confirmed transition is authoritative until the Firestore
+  // snapshot catches up. This includes a confirmed **false** phone state:
+  // an old snapshot which still says `phoneVerified: true` must not reopen
+  // the student or owner service area after a provider was unlinked.
+  final phoneVerified =
+      activeTransition?.phoneVerified ??
+      (session.profile?.phoneVerified == true);
+
+  // A disabled account must not keep using an already-issued Firebase
+  // session. The login page itself is allowed so the account can be signed
+  // out cleanly.
+  if (session.profile != null && !session.profile!.isActive) {
+    if (location == '/login') return null;
+    return '/login';
+  }
+
+  // Signed in but on an auth screen.
+  if (authRoutes.contains(location)) {
+    // The app is signing the user out: the login screen is exactly where
+    // they belong.
+    if (signingOut) return null;
+
+    // The one-time-code screen is also used inside an authenticated flow:
+    // role selection proves an email/password address with it and the
+    // profile screen uses it to add a verified email later.
+    if (location == '/verify-otp') return null;
+
+    if (!profileExists || !registrationCompleted) {
+      // A signed-in user without a completed profile has to pick a role
+      // first. `/role-selection` is itself an auth route, so redirecting to
+      // it from itself would create a redirect loop.
+      if (location == '/role-selection') return null;
+      return '/role-selection';
+    }
+
+    // The phone gate applies on every route, including the auth routes.
+    // Otherwise a newly registered email/password account could be sent
+    // from `/register` straight to the student dashboard before its missing
+    // phone had been verified.
+    if ((role == UserRole.student || role == UserRole.owner) &&
+        !phoneVerified) {
+      if (location == '/verify-phone') return null;
+      return '/verify-phone';
+    }
+
+    if (location == '/phone-auth') {
+      // This route is for signing in with a different phone account.
+      return homeForRole(role);
+    }
+
+    if (location == '/verify-phone') {
+      // Administrators do not need a phone. Students and owners may leave
+      // this route only after the server copied the verified phone into
+      // their profile.
+      return homeForRole(role);
+    }
+
+    return homeForRole(role);
+  }
+
+  // An account without a profile must finish role selection before it can
+  // use any service.
+  if (!profileExists) return '/role-selection';
+
+  // An incomplete account must finish role selection before it can use any
+  // service.
+  if (!registrationCompleted) return '/role-selection';
+
+  // A verified phone is mandatory for the student and owner service areas.
+  if ((role == UserRole.student || role == UserRole.owner) && !phoneVerified) {
+    return '/verify-phone';
+  }
+
+  // Signed in: keep the user inside the area that matches their role.
+  if (!_roleMatchesArea(role, location)) return homeForRole(role);
+
+  return null;
+}
 
 /// The landing route for a given role.
 String homeForRole(UserRole? role) {

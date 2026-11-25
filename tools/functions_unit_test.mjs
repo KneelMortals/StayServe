@@ -203,6 +203,7 @@ const liveStudent = {
   registrationCompleted: true,
   isActive: true,
   role: 'student',
+  phoneVerified: true,
 };
 check(
   'a live, registered student may book a room',
@@ -225,6 +226,11 @@ check(
   false,
 );
 check(
+  'a stale false student phone cache does not decide booking access',
+  canBookAsStudent({ ...liveStudent, phoneVerified: false }),
+  true,
+);
+check(
   'a missing student profile may not book a room',
   canBookAsStudent({ ...liveStudent, exists: false }),
   false,
@@ -235,6 +241,7 @@ const liveOwner = {
   registrationCompleted: true,
   isActive: true,
   role: 'owner',
+  phoneVerified: true,
 };
 check(
   'a live owner may manage an owner-side booking',
@@ -255,6 +262,11 @@ check(
   'an incomplete owner registration may not manage a booking',
   canActAsRoomOwner({ ...liveOwner, registrationCompleted: false }),
   false,
+);
+check(
+  'a stale false owner phone cache does not decide owner access',
+  canActAsRoomOwner({ ...liveOwner, phoneVerified: false }),
+  true,
 );
 
 // ---------------------------------------------------------------------------

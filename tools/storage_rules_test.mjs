@@ -28,15 +28,43 @@ function jwt(claims) {
 }
 
 const TOKENS = {
-  owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner' }),
-  owner2: jwt({ sub: 'owner2', user_id: 'owner2', role: 'owner' }),
-  student: jwt({ sub: 'student1', user_id: 'student1', role: 'student' }),
-  pending: jwt({ sub: 'pending1', user_id: 'pending1', role: 'student' }),
-  inactive: jwt({ sub: 'inactive1', user_id: 'inactive1', role: 'owner' }),
+  owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner', phone_number: '+919876500001' }),
+  owner2: jwt({ sub: 'owner2', user_id: 'owner2', role: 'owner', phone_number: '+919876500002' }),
+  student: jwt({ sub: 'student1', user_id: 'student1', role: 'student', phone_number: '+919876500003' }),
+  pending: jwt({ sub: 'pending1', user_id: 'pending1', role: 'student', phone_number: '+919876500004' }),
+  inactive: jwt({ sub: 'inactive1', user_id: 'inactive1', role: 'owner', phone_number: '+919876500005' }),
   unregistered: jwt({
     sub: 'unregistered1',
     user_id: 'unregistered1',
     role: 'owner',
+    phone_number: '+919876500006',
+  }),
+  unverifiedOwner: jwt({
+    sub: 'unverified-owner1',
+    user_id: 'unverified-owner1',
+    role: 'owner',
+  }),
+  unverifiedStudent: jwt({
+    sub: 'unverified-student1',
+    user_id: 'unverified-student1',
+    role: 'student',
+  }),
+  ownerWithoutPhoneToken: jwt({
+    sub: 'owner-without-phone-token',
+    user_id: 'owner-without-phone-token',
+    role: 'owner',
+  }),
+  ownerWithEmptyPhoneToken: jwt({
+    sub: 'owner-with-empty-phone-token',
+    user_id: 'owner-with-empty-phone-token',
+    role: 'owner',
+    phone_number: '',
+  }),
+  legacyOwner: jwt({
+    sub: 'legacy-owner1',
+    user_id: 'legacy-owner1',
+    role: 'owner',
+    phone_number: '+919876500013',
   }),
   admin: jwt({
     sub: 'admin1',
@@ -44,7 +72,7 @@ const TOKENS = {
     role: 'admin',
     admin: true,
   }),
-  demotedOwner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner' }),
+  demotedOwner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner', phone_number: '+919876500001' }),
   demotedAdmin: jwt({
     sub: 'admin1',
     user_id: 'admin1',
@@ -69,25 +97,30 @@ async function seedUser(uid, {
   role = 'student',
   isActive = true,
   registrationCompleted = true,
+  phoneVerified = role !== 'admin',
+  includePhoneVerification = true,
 } = {}) {
+  const fields = {
+    uid: string(uid),
+    name: string(uid),
+    email: string(`${uid}@example.com`),
+    role: string(role),
+    isActive: bool(isActive),
+    registrationCompleted: bool(registrationCompleted),
+    createdAt: timestamp(),
+    updatedAt: timestamp(),
+  };
+  if (includePhoneVerification) {
+    fields.phoneVerified = bool(phoneVerified);
+  }
+
   const response = await fetch(`${FIRESTORE_HOST}/users/${uid}`, {
     method: 'PATCH',
     headers: {
       Authorization: 'Bearer owner',
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      fields: {
-        uid: string(uid),
-        name: string(uid),
-        email: string(`${uid}@example.com`),
-        role: string(role),
-        isActive: bool(isActive),
-        registrationCompleted: bool(registrationCompleted),
-        createdAt: timestamp(),
-        updatedAt: timestamp(),
-      },
-    }),
+    body: JSON.stringify({ fields }),
   });
 
   if (!response.ok) {
@@ -258,6 +291,22 @@ async function main() {
   await seedUser('owner1', { role: 'owner' });
   await seedUser('owner2', { role: 'owner' });
   await seedUser('student1', { role: 'student' });
+  await seedUser('unverified-owner1', {
+    role: 'owner',
+    phoneVerified: false,
+  });
+  await seedUser('unverified-student1', {
+    role: 'student',
+    phoneVerified: false,
+  });
+  // The Firestore cache still says the phone was verified, but this token has
+  // no phone provider. The stale grant must not reach Storage.
+  await seedUser('owner-without-phone-token', { role: 'owner' });
+  await seedUser('owner-with-empty-phone-token', { role: 'owner' });
+  await seedUser('legacy-owner1', {
+    role: 'owner',
+    includePhoneVerification: false,
+  });
   await seedUser('pending1', {
     role: 'owner',
     registrationCompleted: false,
@@ -339,6 +388,38 @@ async function main() {
     false,
   );
   check(
+    'an owner without a verified phone may not upload a room photo',
+    await upload(
+      TOKENS.unverifiedOwner,
+      'rooms/unverified-owner1/room/photo.jpg',
+    ),
+    false,
+  );
+  check(
+    'an owner with a stale cached phone but no phone token may not upload a room photo',
+    await upload(
+      TOKENS.ownerWithoutPhoneToken,
+      'rooms/owner-without-phone-token/room/photo.jpg',
+    ),
+    false,
+  );
+  check(
+    'an owner with an empty phone token may not upload a room photo',
+    await upload(
+      TOKENS.ownerWithEmptyPhoneToken,
+      'rooms/owner-with-empty-phone-token/room/photo.jpg',
+    ),
+    false,
+  );
+  check(
+    'a legacy owner with a signed phone token may upload while the cache is backfilled',
+    await upload(
+      TOKENS.legacyOwner,
+      'rooms/legacy-owner1/room/photo.jpg',
+    ),
+    true,
+  );
+  check(
     'an anonymous caller may not upload a room photo',
     await upload(null, 'rooms/anonymous/room/photo.jpg'),
     false,
@@ -415,6 +496,21 @@ async function main() {
     'a live owner may read another owner photo',
     await get(TOKENS.owner, OTHER_OBJECT),
     true,
+  );
+  check(
+    'a student without a verified phone may not read a room photo',
+    await get(TOKENS.unverifiedStudent, OWN_OBJECT),
+    false,
+  );
+  check(
+    'an owner with a stale cached phone but no phone token may not read a room photo',
+    await get(TOKENS.ownerWithoutPhoneToken, OWN_OBJECT),
+    false,
+  );
+  check(
+    'an owner with an empty phone token may not read a room photo',
+    await get(TOKENS.ownerWithEmptyPhoneToken, OWN_OBJECT),
+    false,
   );
   check(
     'an anonymous caller may not read a room photo',

@@ -1,6 +1,7 @@
 import * as functions from 'firebase-functions/v1';
 import { callableHttps } from './appCheck';
 import * as firestore from 'firebase-admin/firestore';
+import * as firebaseAuth from 'firebase-admin/auth';
 import * as crypto from 'crypto';
 
 // Creates the default Firebase app before this module opens Firestore —
@@ -20,8 +21,102 @@ import {
   publishLatestRoleClaims,
   roleRevisionOf,
 } from './roleClaims';
+import {
+  firebaseIdentityFromAuthUser,
+  type FirebaseAuthIdentity,
+  hasVerifiedRegistrationContact,
+  legacyEmailProofMatches,
+  LEGACY_EMAIL_PROOF_SOURCE,
+} from './authIdentity';
 
 const db = firestore.getFirestore();
+
+/**
+ * Durable rollback requests for an incomplete sign-up.
+ *
+ * The registration transactions read this server-only marker. It makes a
+ * rollback and a successful registration mutually exclusive even though
+ * Firebase Auth and Firestore cannot be committed in one transaction.
+ */
+export const REGISTRATION_ROLLBACK_OPERATIONS =
+  'registrationRollbackOperations';
+
+/**
+ * Reads the current identity of an account from Firebase Auth.
+ *
+ * Registration must not trust the phone or email claims in an old ID token:
+ * the token can remain valid for a short time after a provider is unlinked.
+ * A failed lookup fails closed so a transient Auth error can never turn into
+ * an unverified registration.
+ */
+async function liveFirebaseIdentity(
+  uid: string,
+): Promise<FirebaseAuthIdentity> {
+  try {
+    const user = await firebaseAuth.getAuth().getUser(uid);
+    return firebaseIdentityFromAuthUser(user);
+  } catch (error) {
+    const code = String((error as { code?: unknown })?.code || '').trim();
+    console.error('Could not read the live Firebase Auth identity:', error);
+    throw new functions.https.HttpsError(
+      code === 'auth/user-not-found' ? 'failed-precondition' : 'internal',
+      code === 'auth/user-not-found'
+        ? 'Your authentication account no longer exists.'
+        : 'The account state could not be verified. Please try again.',
+    );
+  }
+}
+
+/**
+ * Resolves the server-owned contact fields for a registration write.
+ *
+ * The live Firebase Auth record is authoritative for both the address and
+ * its verification flag. A one-time StayServe email proof may authorise the
+ * registration, but it is retained under a separate legacy-proof marker so
+ * it cannot preserve a stale verified address after Auth changes. The phone
+ * is never inherited from the profile for the same reason.
+ */
+function resolveRegistrationContact(
+  identity: FirebaseAuthIdentity,
+  profile: Record<string, any>,
+  emailChallengeVerified = false,
+): {
+  email: string;
+  emailVerified: boolean;
+  legacyEmailProofVerified: boolean;
+  phone: string | null;
+  phoneVerified: boolean;
+} {
+  const legacyProofVerified =
+    legacyEmailProofMatches(profile, identity.email) ||
+    (emailChallengeVerified && identity.email !== '');
+
+  return {
+    email: identity.email,
+    emailVerified: identity.emailVerified,
+    legacyEmailProofVerified: legacyProofVerified,
+    phone: identity.phoneVerified ? identity.phone : null,
+    phoneVerified: identity.phoneVerified,
+  };
+}
+
+/** The server-owned profile fields derived from a registration contact. */
+function registrationContactFields(contact: {
+  email: string;
+  emailVerified: boolean;
+  legacyEmailProofVerified: boolean;
+}): Record<string, unknown> {
+  return {
+    email: contact.email,
+    emailVerified: contact.emailVerified,
+    legacyEmailProofSource: contact.legacyEmailProofVerified
+      ? LEGACY_EMAIL_PROOF_SOURCE
+      : null,
+    legacyEmailProofEmail: contact.legacyEmailProofVerified
+      ? contact.email
+      : null,
+  };
+}
 
 /**
  * OTP verification for email addresses and mobile numbers.
@@ -63,6 +158,8 @@ type VerifyOtpResult =
   | { kind: 'verified'; challenge: string };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+/** The maximum length of an email address accepted by Auth and Firestore. */
+const MAX_EMAIL_LENGTH = 320;
 // Accepts 10-digit Indian numbers as well as international numbers with an
 // optional country code (stored in E.164-ish form, e.g. +919876543210).
 const PHONE_RE = /^\+?[1-9]\d{7,14}$/;
@@ -73,6 +170,17 @@ function hash(value: string): string {
 
 function documentId(channel: OtpChannel, identifier: string): string {
   return `${channel}_${hash(identifier.toLowerCase())}`;
+}
+
+/**
+ * The deterministic Firestore id of an email OTP record.
+ *
+ * The account-linking callable has to address exactly the same document as
+ * [sendOtp] and [verifyOtp]. Keeping the construction in this module avoids
+ * two subtly different identifier rules.
+ */
+export function emailOtpDocumentId(identifier: string): string {
+  return documentId('email', identifier.trim().toLowerCase());
 }
 
 /**
@@ -177,7 +285,7 @@ function assertValid(channel: OtpChannel, identifier: string): string {
   }
 
   if (channel === 'email') {
-    if (!EMAIL_RE.test(value)) {
+    if (value.length > MAX_EMAIL_LENGTH || !EMAIL_RE.test(value)) {
       throw new functions.https.HttpsError('invalid-argument', 'Enter a valid email address');
     }
     return value.toLowerCase();
@@ -643,11 +751,42 @@ export const verifyOtp = callableHttps.onCall(async (data, context) => {
         // that really entered the code, and nobody else may pick it up.
         //
         // The one exception is the client that verified the address itself
-        // (the verification was done while it was signed in) — it may ask for
-        // a fresh challenge, because it proved that it owns the address.
+        // (the verification was done while it was signed in). It may ask for
+        // a fresh challenge only after it proves possession of the currently
+        // active OTP again. Without this second check, any signed-in client
+        // which knew the uid could renew a consumed challenge indefinitely.
         // -----------------------------------------------------------------
         const verifiedBy = String(record.verifiedByUid || '');
         if (context.auth && verifiedBy && verifiedBy === context.auth.uid) {
+          const expiresAt = timestampMillis(record.expiresAt);
+          if (expiresAt === null || expiresAt < Date.now()) {
+            return { kind: 'expired' };
+          }
+
+          const attempts = counterValue(record.attempts);
+          if (attempts > MAX_VERIFY_ATTEMPTS) {
+            return { kind: 'too-many-attempts', attempts };
+          }
+
+          const salt = typeof record.salt === 'string' ? record.salt : '';
+          const codeHash = typeof record.codeHash === 'string' ? record.codeHash : '';
+          if (!salt || !codeHash) {
+            return { kind: 'expired' };
+          }
+          const expected = hash(`${code}:${salt}`);
+          if (!constantTimeEquals(expected, codeHash)) {
+            const nextAttempts = attempts + 1;
+            transaction.set(
+              ref,
+              { attempts: nextAttempts, verified: true },
+              { merge: true },
+            );
+            return {
+              kind: nextAttempts > MAX_VERIFY_ATTEMPTS ? 'too-many-attempts' : 'incorrect',
+              attempts: nextAttempts,
+            };
+          }
+
           const challenge = newChallenge();
           transaction.set(
             ref,
@@ -656,6 +795,7 @@ export const verifyOtp = callableHttps.onCall(async (data, context) => {
               challengeUsed: false,
               challengeIssuedAt: firestore.FieldValue.serverTimestamp(),
               challengeExpiresAt: newChallengeExpiry(),
+              lastVerifiedAt: firestore.FieldValue.serverTimestamp(),
             },
             { merge: true },
           );
@@ -818,11 +958,12 @@ function newChallengeExpiry(): firestore.Timestamp {
  * in the same transaction that writes the registration profile, so a failed
  * profile write cannot burn the proof.
  */
-function assertOtpChallenge(
+export function assertOtpChallenge(
   snapshot: firestore.DocumentSnapshot,
   channel: OtpChannel,
   challenge: string,
   requiredUid?: string,
+  allowUnboundRequiredUid = false,
 ): void {
   if (!snapshot.exists || snapshot.get('verified') !== true) {
     throw new functions.https.HttpsError(
@@ -843,7 +984,16 @@ function assertOtpChallenge(
   }
 
   const verifiedBy = String(snapshot.get('verifiedByUid') || '').trim();
-  if (requiredUid && verifiedBy !== requiredUid) {
+  // A challenge verified while signed in is bound to that account and may
+  // not be spent by another one. A challenge verified before the Firebase
+  // account existed is intentionally unbound; registration callables may
+  // accept that one, while the later email-linking callable keeps the strict
+  // exact-uid requirement.
+  const belongsToAnotherAccount =
+    requiredUid &&
+    verifiedBy !== requiredUid &&
+    !(allowUnboundRequiredUid && !verifiedBy);
+  if (belongsToAnotherAccount) {
     throw new functions.https.HttpsError(
       'failed-precondition',
       channel === 'email'
@@ -944,13 +1094,16 @@ function assertRegistrationMayBeCompleted(
 /**
  * Completes a sign-up.
  *
- * The email address always has to be verified with an OTP. The server
- * checks the `otpCodes` collection itself, so a modified client cannot skip
- * the verification, and the profile is written by the server.
+ * A Firebase phone account may register without an email address. Google
+ * accounts use Firebase's verified OIDC email fact. Email/password accounts
+ * keep the existing StayServe email-OTP proof for backwards compatibility.
+ * In every case the server copies the live Auth and verification facts into
+ * the profile itself; the client cannot forge them.
  *
- * The phone number is optional contact information while phone verification
- * is disabled (see [phoneOtpRequired]); when it is enabled the number
- * becomes mandatory and has to be OTP-verified as well.
+ * A verified phone is not a prerequisite for *registration* — it is a
+ * prerequisite for using the booking services. The phone-verification screen
+ * links and verifies it, and [syncAuthProfile] then copies the live Firebase
+ * Auth phone into the server-owned profile field.
  */
 export const completeRegistration = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
@@ -958,36 +1111,49 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
   }
 
   const uid = context.auth.uid;
-  const email = String(context.auth.token.email || '').trim().toLowerCase();
+  const identity = await liveFirebaseIdentity(uid);
   const name = String(data?.name || '').trim();
   const role = String(data?.role || 'student');
   const pincode = data?.pincode ? String(data.pincode).trim() : null;
   const challenge = String(data?.challenge || '').trim();
-  const phoneChallenge = String(data?.phoneChallenge || '').trim();
 
-  if (!email) {
-    throw new functions.https.HttpsError('failed-precondition', 'No email address on this account');
-  }
-
-  const phoneRequired = phoneOtpRequired();
-  const rawPhone = String(data?.phone || '').trim();
-  const phone = rawPhone ? normalisePhone(rawPhone) : '';
+  // The contact facts come only from the live Firebase Auth record. A client
+  // supplied `phone` value is deliberately ignored, and an old ID token can
+  // neither preserve nor grant a verified phone after a provider was unlinked.
+  const liveEmail = identity.email;
 
   const userRef = db.collection('users').doc(uid);
-  const emailRef = db.collection('otpCodes').doc(documentId('email', email));
-  const mobileRef = phone
-    ? db.collection('otpCodes').doc(documentId('mobile', phone))
+  const rollbackRef = db
+    .collection(REGISTRATION_ROLLBACK_OPERATIONS)
+    .doc(uid);
+  const emailRef = liveEmail
+    ? db.collection('otpCodes').doc(documentId('email', liveEmail))
     : null;
 
   let registeredRole: RegistrationRole = 'student';
   let registeredPhone: string | null = null;
+  let registeredEmail = '';
+  let registeredEmailVerified = false;
+  let registeredPhoneVerified = false;
   let registeredRoleRevision = 0;
 
   // The OTP challenges and the profile are committed in one Firestore
   // transaction. A failed profile write therefore cannot consume a valid
   // challenge, and two registrations cannot use the same proof.
   await db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(userRef);
+    const [snapshot, rollbackSnapshot] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(rollbackRef),
+    ]);
+    if (
+      rollbackSnapshot.exists &&
+      String(rollbackSnapshot.get('status') || '') === 'rollbackRequested'
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This registration was rolled back. Please sign up again.',
+      );
+    }
     const state = registrationProfileState(snapshot);
 
     // A profile may already be complete when the previous call committed
@@ -1017,10 +1183,28 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
         false,
       );
       const profile = snapshot.data() as Record<string, any>;
-      registeredPhone =
-        typeof profile.phone === 'string' && profile.phone.trim() !== ''
-          ? profile.phone
-          : null;
+      const contact = resolveRegistrationContact(identity, profile);
+      registeredEmail = contact.email;
+      registeredEmailVerified = contact.emailVerified;
+      registeredPhone = contact.phone;
+      registeredPhoneVerified = contact.phoneVerified;
+
+      // Reconcile the cached contact facts as part of the idempotent retry.
+      // This makes a phone unlink effective immediately instead of allowing an
+      // old profile value to survive merely because the Auth role-claim
+      // publication had to be retried. The live Auth email likewise replaces
+      // a stale profile address; the legacy one-time proof remains separate.
+      transaction.set(
+        userRef,
+        {
+          ...registrationContactFields(contact),
+          phone: registeredPhone,
+          phoneVerified: registeredPhoneVerified,
+          authProviders: identity.providers,
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
       return;
     }
 
@@ -1032,15 +1216,17 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
     if (role !== 'student' && role !== 'owner') {
       throw new functions.https.HttpsError('invalid-argument', 'Invalid role');
     }
-    if (phoneRequired) {
-      // The mobile number is mandatory once phone verification is switched on.
-      if (!phone || !PHONE_RE.test(phone)) {
-        throw new functions.https.HttpsError('invalid-argument', 'Enter a valid mobile number');
-      }
-    } else if (phone && !PHONE_RE.test(phone)) {
-      // Still reject a malformed number when one was supplied, so the profile
-      // never stores something unusable.
-      throw new functions.https.HttpsError('invalid-argument', 'Enter a valid mobile number');
+    if (!identity.emailVerified && !identity.phoneVerified && !challenge) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'Verify your phone number or email address before completing registration.',
+      );
+    }
+    if (challenge && !liveEmail) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'The email verification does not match this account.',
+      );
     }
 
     const resolvedRole = resolveRegistrationRole(resolvedState, role);
@@ -1051,7 +1237,6 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
       );
     }
     registeredRole = resolvedRole;
-    registeredPhone = phone || null;
     const currentRole = String(resolvedState.role || '')
       .trim()
       .toLowerCase();
@@ -1063,22 +1248,54 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
           ? currentRevision
           : currentRevision + 1;
 
-    const emailSnapshot = await transaction.get(emailRef);
-    assertOtpChallenge(emailSnapshot, 'email', challenge);
+    let emailSnapshot: firestore.DocumentSnapshot | null = null;
+    if (challenge) {
+      if (!emailRef) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'The email verification does not match this account.',
+        );
+      }
+      emailSnapshot = await transaction.get(emailRef);
+      assertOtpChallenge(emailSnapshot, 'email', challenge, uid, true);
+    }
 
-    let mobileSnapshot: firestore.DocumentSnapshot | null = null;
-    if (phoneRequired && mobileRef) {
-      mobileSnapshot = await transaction.get(mobileRef);
-      assertOtpChallenge(mobileSnapshot, 'mobile', phoneChallenge);
+    const emailChallengeVerified = emailSnapshot !== null;
+    const contact = resolveRegistrationContact(
+      identity,
+      (snapshot.data() || {}) as Record<string, any>,
+      emailChallengeVerified,
+    );
+    registeredEmail = contact.email;
+    registeredEmailVerified = contact.emailVerified;
+    registeredPhone = contact.phone;
+    registeredPhoneVerified = contact.phoneVerified;
+    if (
+      !hasVerifiedRegistrationContact(identity, emailChallengeVerified)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'Verify your phone number or email address before completing registration.',
+      );
     }
 
     const profile: Record<string, any> = {
       uid,
       name,
-      email,
+      // An empty string means that the account deliberately has no email
+      // address yet. A phone-only account may add one later. The legacy OTP
+      // proof is recorded separately and never impersonates Firebase Auth's
+      // live `emailVerified` fact.
+      ...registrationContactFields({
+        email: registeredEmail,
+        emailVerified: registeredEmailVerified,
+        legacyEmailProofVerified: contact.legacyEmailProofVerified,
+      }),
       // Stored as null (not "") when no number was supplied, so the app can
       // tell "not provided" apart from "empty".
       phone: registeredPhone,
+      phoneVerified: registeredPhoneVerified,
+      authProviders: identity.providers,
       // This is the server-owned proof that the registration challenge was
       // completed. Clients and the Auth trigger may not set it themselves.
       registrationCompleted: true,
@@ -1116,24 +1333,15 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
       registeredRoleRevision,
       false,
     );
-    transaction.set(
-      emailRef,
-      {
-        challengeUsed: true,
-        challengeConsumedAt: firestore.FieldValue.serverTimestamp(),
-        // Bind the consumed contact record to the account which used the
-        // challenge. An account-deletion cleanup can then find and erase the
-        // identifier hash deterministically.
-        verifiedByUid: uid,
-      },
-      { merge: true },
-    );
-    if (phoneRequired && mobileRef && mobileSnapshot) {
+    if (challenge && emailRef && emailSnapshot) {
       transaction.set(
-        mobileRef,
+        emailRef,
         {
           challengeUsed: true,
           challengeConsumedAt: firestore.FieldValue.serverTimestamp(),
+          // Bind the consumed contact record to the account which used the
+          // challenge. An account-deletion cleanup can then find and erase the
+          // identifier hash deterministically.
           verifiedByUid: uid,
         },
         { merge: true },
@@ -1146,7 +1354,10 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
   return {
     success: true,
     role: published.role || registeredRole,
+    email: registeredEmail,
+    emailVerified: registeredEmailVerified,
     phone: registeredPhone,
+    phoneVerified: registeredPhoneVerified,
   };
 });
 
@@ -1154,8 +1365,9 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
  * Lets a signed-in user claim their role during sign-up.
  *
  * Only `student` and `owner` can be self-assigned — `admin` has to be
- * granted by an existing admin. The call is rejected unless the user's email
- * address has been verified through [verifyOtp].
+ * granted by an existing admin. A Firebase-verified phone or Google email is
+ * sufficient by itself. An email/password account keeps the legacy
+ * StayServe email-OTP proof.
  */
 export const registerUserRole = callableHttps.onCall(async (data, context) => {
   if (!context.auth) {
@@ -1168,47 +1380,95 @@ export const registerUserRole = callableHttps.onCall(async (data, context) => {
   if (role !== 'student' && role !== 'owner') {
     throw new functions.https.HttpsError('invalid-argument', 'Invalid role');
   }
-  if (!challenge) {
-    throw new functions.https.HttpsError(
-      'failed-precondition',
-      'Verify your email address before continuing',
-    );
-  }
 
-  const email = String(context.auth.token.email || '').trim().toLowerCase();
-  if (!email) {
-    throw new functions.https.HttpsError('failed-precondition', 'No email address on this account');
-  }
-
-  const emailRef = db.collection('otpCodes').doc(documentId('email', email));
+  const identity = await liveFirebaseIdentity(uid);
+  const liveEmail = identity.email;
+  const emailRef = liveEmail
+    ? db.collection('otpCodes').doc(documentId('email', liveEmail))
+    : null;
   const userRef = db.collection('users').doc(uid);
+  const rollbackRef = db
+    .collection(REGISTRATION_ROLLBACK_OPERATIONS)
+    .doc(uid);
+
+  let claimedEmail = '';
+  let claimedEmailVerified = false;
+  let claimedPhone: string | null = null;
+  let claimedPhoneVerified = false;
+
   await db.runTransaction(async (transaction) => {
     // The profile and the one-time proof are read in the same transaction as
     // the role claim. A concurrent send which resets `verified=false`, or a
     // second role claim which consumes the challenge, therefore wins or
     // loses as one serialized operation.
-    const snapshot = await transaction.get(userRef);
-    const emailSnapshot = await transaction.get(emailRef);
+    const [snapshot, rollbackSnapshot] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(rollbackRef),
+    ]);
+    if (
+      rollbackSnapshot.exists &&
+      String(rollbackSnapshot.get('status') || '') === 'rollbackRequested'
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This registration was rolled back. Please sign up again.',
+      );
+    }
     const state = registrationProfileState(snapshot);
     const currentRole = String(state.role || '')
       .trim()
       .toLowerCase();
 
+    // The matching-role branch is an idempotent retry of an already
+    // committed role transition. It does not need the consumed challenge;
+    // it only republishes the missing Auth role claim and reconciles the
+    // contact facts with the live Firebase Auth record.
     if (hasClaimedRegistrationRole(state) && currentRole === role) {
-      // The Firestore role transition already committed but its Auth claim
-      // publication may have failed. Reconcile that one remaining step
-      // idempotently. A consumed challenge is not needed because this call
-      // cannot select or change the role.
-      //
-      // An inactive or malformed account never receives a fresh role claim.
-      // The durable worker remains responsible for accounts which were
-      // already active when their publication failed.
       if (state.isActive !== true) {
         throw new functions.https.HttpsError(
           'permission-denied',
           'This account has been disabled. Please contact support.',
         );
       }
+
+      const profile = snapshot.data() as Record<string, any>;
+      const contact = resolveRegistrationContact(identity, profile);
+      claimedEmail = contact.email;
+      claimedEmailVerified = contact.emailVerified;
+      claimedPhone = contact.phone;
+      claimedPhoneVerified = contact.phoneVerified;
+
+      // A matching role can be a retry of a committed claim. If the profile
+      // is still marked incomplete, it may only be completed when Firebase
+      // Auth contains a verified contact or the profile still carries the
+      // matching legacy one-time email proof. This prevents an arbitrary role
+      // claim from turning an incomplete profile into a usable tenant
+      // account.
+      const registrationCompleted = state.registrationCompleted === true;
+      if (
+        !registrationCompleted &&
+        !claimedEmailVerified &&
+        !claimedPhoneVerified &&
+        !contact.legacyEmailProofVerified
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Verify your phone number or email address before continuing',
+        );
+      }
+
+      transaction.set(
+        userRef,
+        {
+          registrationCompleted: true,
+          ...registrationContactFields(contact),
+          phone: claimedPhone,
+          phoneVerified: claimedPhoneVerified,
+          authProviders: identity.providers,
+          updatedAt: firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
       enqueueRoleClaimPublication(
         transaction,
         uid,
@@ -1219,7 +1479,30 @@ export const registerUserRole = callableHttps.onCall(async (data, context) => {
       return;
     }
 
-    assertOtpChallenge(emailSnapshot, 'email', challenge, uid);
+    let emailSnapshot: firestore.DocumentSnapshot | null = null;
+    if (challenge) {
+      if (!emailRef) {
+        throw new functions.https.HttpsError(
+          'invalid-argument',
+          'The email verification does not match this account.',
+        );
+      }
+      emailSnapshot = await transaction.get(emailRef);
+      assertOtpChallenge(emailSnapshot, 'email', challenge, uid, true);
+    } else if (!identity.emailVerified && !identity.phoneVerified) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'Verify your phone number or email address before continuing',
+      );
+    }
+
+    const emailChallengeVerified = emailSnapshot !== null;
+    if (!hasVerifiedRegistrationContact(identity, emailChallengeVerified)) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'Verify your phone number or email address before continuing',
+      );
+    }
 
     assertRegistrationMayBeCompleted(snapshot);
     if (!canClaimRegistrationRole(state)) {
@@ -1237,18 +1520,40 @@ export const registerUserRole = callableHttps.onCall(async (data, context) => {
           ? currentRevision
           : currentRevision + 1;
 
+    const profileData = (snapshot.data() || {}) as Record<string, any>;
+    const contact = resolveRegistrationContact(
+      identity,
+      profileData,
+      emailChallengeVerified,
+    );
+    claimedEmail = contact.email;
+    claimedEmailVerified = contact.emailVerified;
+    claimedPhone = contact.phone;
+    claimedPhoneVerified = contact.phoneVerified;
+
     const profile: Record<string, any> = {
       role,
       // The marker is the one-time proof that this role was selected.
       roleClaimed: true,
       roleRevision: claimedRoleRevision,
+      // Claiming the role and completing the registration are one server
+      // operation. A phone-only or Google account therefore needs no second
+      // call before it can reach the role-specific service area.
+      registrationCompleted: true,
+      ...registrationContactFields({
+        email: claimedEmail,
+        emailVerified: claimedEmailVerified,
+        legacyEmailProofVerified: contact.legacyEmailProofVerified,
+      }),
+      phone: claimedPhone,
+      phoneVerified: claimedPhoneVerified,
+      authProviders: identity.providers,
       updatedAt: firestore.FieldValue.serverTimestamp(),
     };
 
     if (!snapshot.exists) {
       profile.uid = uid;
       profile.isActive = true;
-      profile.registrationCompleted = false;
       profile.createdAt = firestore.FieldValue.serverTimestamp();
       profile.savedRooms = [];
     }
@@ -1261,18 +1566,27 @@ export const registerUserRole = callableHttps.onCall(async (data, context) => {
       claimedRoleRevision,
       false,
     );
-    transaction.set(
-      emailRef,
-      {
-        challengeUsed: true,
-        challengeConsumedAt: firestore.FieldValue.serverTimestamp(),
-        verifiedByUid: uid,
-      },
-      { merge: true },
-    );
+    if (challenge && emailRef && emailSnapshot) {
+      transaction.set(
+        emailRef,
+        {
+          challengeUsed: true,
+          challengeConsumedAt: firestore.FieldValue.serverTimestamp(),
+          verifiedByUid: uid,
+        },
+        { merge: true },
+      );
+    }
   });
 
   const published = await publishLatestRoleClaims(uid);
 
-  return { success: true, role: published.role || role };
+  return {
+    success: true,
+    role: published.role || role,
+    email: claimedEmail,
+    emailVerified: claimedEmailVerified,
+    phone: claimedPhone,
+    phoneVerified: claimedPhoneVerified,
+  };
 });

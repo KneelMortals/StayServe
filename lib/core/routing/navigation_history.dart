@@ -17,6 +17,8 @@ const Set<String> kAuthLocations = {
   '/forgot-password',
   '/role-selection',
   '/verify-otp',
+  '/phone-auth',
+  '/verify-phone',
 };
 
 /// The pages the user visited, in the order they visited them.

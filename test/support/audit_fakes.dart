@@ -216,21 +216,36 @@ class FakeVisitRepository extends VisitRepository {
 /// The repository that writes the reviews.
 class FakeReviewRepository extends ReviewRepository {
   FakeReviewRepository()
-    : super(
-        firestore: FakeFirestore(),
-        auth: MockFirebaseAuth(),
-        functions: FakeFunctionsService(),
-      );
+    : super(auth: MockFirebaseAuth(), functions: FakeFunctionsService());
 
   @override
-  Future<void> submitReview({
+  Future<List<RoomReviewModel>> getRoomReviews(String roomId) async => const [];
+
+  @override
+  Future<ReviewSubmissionResult> submitReview({
     required String roomId,
     required int rating,
     required String comment,
+    String? expectedReviewInstanceId,
+  }) async => ReviewSubmissionResult(
+    reviewId: 'REV-$roomId-test-student',
+    reviewInstanceId: expectedReviewInstanceId ?? 'review-instance-test',
+  );
+
+  @override
+  Future<void> deleteReview({
+    required String roomId,
+    required String reviewInstanceId,
   }) async {}
 
   @override
-  Future<void> deleteReview({required String roomId}) async {}
+  Future<AdminReviewDeletionResult> deleteReviewAsAdmin({
+    required String reviewId,
+    required String reviewInstanceId,
+  }) async => AdminReviewDeletionResult(
+    reviewId: reviewId,
+    reviewInstanceId: reviewInstanceId,
+  );
 }
 
 /// The repository of the conversations.
@@ -491,12 +506,46 @@ class FakeAdminRepository extends AdminRepository {
 // ---------------------------------------------------------------------------
 
 /// The auth repository — every action succeeds and does nothing.
+/// A credential without the extra provider-specific data which none of the
+/// audited screens reads.
+class FakeUserCredential implements UserCredential {
+  final User _user;
+
+  FakeUserCredential(this._user);
+
+  @override
+  User get user => _user;
+
+  @override
+  AdditionalUserInfo? get additionalUserInfo => null;
+
+  @override
+  AuthCredential? get credential => null;
+}
+
 class FakeAuthRepository implements AuthRepository {
   @override
   Stream<User?> get authStateChanges => Stream.value(null);
 
   @override
   User? get currentUser => null;
+
+  @override
+  Future<User?> reloadCurrentUser() async => null;
+
+  @override
+  Future<List<FirebaseProviderIdentity>> linkedGoogleProviderIdentities({
+    bool refresh = false,
+  }) async => const <FirebaseProviderIdentity>[];
+
+  @override
+  Future<Map<String, dynamic>> rollbackIncompleteRegistration({
+    required String uid,
+  }) async => <String, dynamic>{
+    'success': true,
+    'rolledBack': false,
+    'registrationCompleted': true,
+  };
 
   @override
   Future<void> refreshIdToken() async {}
@@ -524,6 +573,79 @@ class FakeAuthRepository implements AuthRepository {
 
   @override
   Future<void> deleteAccount() async {}
+
+  @override
+  Future<UserCredential> signUpWithEmailAndPassword({
+    required String email,
+    required String password,
+  }) async => FakeUserCredential(MockUser(email: email));
+
+  @override
+  Future<UserCredential> signInWithEmailAndPassword({
+    required String email,
+    required String password,
+  }) async => FakeUserCredential(MockUser(email: email));
+
+  @override
+  Future<UserCredential> signInWithGoogle() async =>
+      FakeUserCredential(MockUser(email: 'google@example.test'));
+
+  @override
+  Future<UserCredential> linkGoogleProvider() async =>
+      FakeUserCredential(MockUser(uid: 'linked-user'));
+
+  @override
+  Future<void> startPhoneVerification({
+    required String phoneNumber,
+    required void Function(PhoneAuthCredential credential)
+    onVerificationCompleted,
+    required void Function(FirebaseAuthException error) onVerificationFailed,
+    required void Function(String verificationId, int? resendToken) onCodeSent,
+    void Function(String verificationId)? onCodeAutoRetrievalTimeout,
+    int? forceResendingToken,
+  }) async {
+    onCodeSent('audit-verification-id', 0);
+  }
+
+  @override
+  PhoneAuthCredential phoneCredential({
+    required String verificationId,
+    required String smsCode,
+  }) => PhoneAuthProvider.credential(
+    verificationId: verificationId,
+    smsCode: smsCode,
+  );
+
+  @override
+  Future<UserCredential> signInWithPhoneCredential(
+    PhoneAuthCredential credential,
+  ) async => FakeUserCredential(
+    MockUser(uid: 'phone-user', phoneNumber: '+919876543210'),
+  );
+
+  @override
+  Future<UserCredential> linkPhoneCredential(
+    PhoneAuthCredential credential,
+  ) async => FakeUserCredential(
+    MockUser(uid: 'linked-user', phoneNumber: '+919876543210'),
+  );
+
+  @override
+  Future<Map<String, dynamic>> syncAuthProfile() async => <String, dynamic>{
+    'success': true,
+    'phoneVerified': true,
+    'emailVerified': true,
+  };
+
+  @override
+  Future<Map<String, dynamic>> linkVerifiedEmail({
+    required String email,
+    required String challenge,
+  }) async => <String, dynamic>{
+    'success': true,
+    'email': email,
+    'emailVerified': true,
+  };
 
   @override
   dynamic noSuchMethod(Invocation invocation) => null;
@@ -566,14 +688,14 @@ class FakeOtpService extends OtpService {
   }) async {}
 
   @override
-  Future<String> completeRegistration({
+  Future<RegistrationResult> completeRegistration({
     required String name,
     required String role,
     required String challenge,
     String? phone,
     String? phoneChallenge,
     String? pincode,
-  }) async => role;
+  }) async => RegistrationResult(role: role, phoneVerified: false);
 }
 
 /// The location service — it always knows where the device is.
@@ -624,6 +746,32 @@ class FakeAuthController extends AuthController {
 
   @override
   Future<void> signOut() async {}
+
+  @override
+  Future<void> signInWithGoogle() async {}
+
+  @override
+  Future<void> signInWithPhoneCredential(
+    PhoneAuthCredential credential,
+  ) async {}
+
+  @override
+  Future<void> linkPhoneCredential(
+    PhoneAuthCredential credential, {
+    String? phoneNumber,
+  }) async {}
+
+  @override
+  Future<void> linkGoogleProvider() async {}
+
+  @override
+  Future<void> syncAuthProfile() async {}
+
+  @override
+  Future<void> linkVerifiedEmail({
+    required String email,
+    required String challenge,
+  }) async {}
 }
 
 /// A location that is always the same.
@@ -660,6 +808,12 @@ UserModel auditUser({
     email: email,
     phone: '9000000000',
     role: role,
+    // The shared audit fixture represents a live account. Missing server
+    // markers fail closed in the router and in the security rules, so the
+    // fixture states them explicitly instead of relying on a permissive
+    // model default.
+    registrationCompleted: true,
+    phoneVerified: true,
     createdAt: auditNow(),
     updatedAt: auditNow(),
     pincode: '560001',
@@ -794,6 +948,7 @@ PaymentModel auditPayment({
 RoomReviewModel auditReview() {
   return RoomReviewModel(
     reviewId: 'REV-room-1-student-1',
+    reviewInstanceId: 'review-instance-1',
     roomId: 'room-1',
     studentId: 'student-1',
     ownerId: 'owner-1',

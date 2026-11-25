@@ -25,5 +25,19 @@ void main() {
         isTrue,
       );
     });
+
+    test('keeps the native Google OAuth Custom Tab task affinity valid', () {
+      final manifest = File(
+        'android/app/src/main/AndroidManifest.xml',
+      ).readAsStringSync();
+
+      // Firebase Auth's native provider flow returns through a Chrome Custom
+      // Tab. Flutter's old empty affinity makes that return fail with
+      // `web-context-already-presented` on Android.
+      expect(
+        RegExp(r'android:taskAffinity\s*=\s*""').hasMatch(manifest),
+        isFalse,
+      );
+    });
   });
 }

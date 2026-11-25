@@ -109,6 +109,8 @@ UserModel _profile() {
     name: 'Asha',
     email: 'asha@example.com',
     role: UserRole.student,
+    registrationCompleted: true,
+    phoneVerified: true,
     createdAt: DateTime(2026, 1, 1),
     updatedAt: DateTime(2026, 1, 1),
   );
@@ -225,7 +227,10 @@ void main() {
       router.push('/student/profile/edit');
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Save changes'));
+      final saveButton = find.text('Save changes');
+      await tester.ensureVisible(saveButton);
+      await tester.pumpAndSettle();
+      await tester.tap(saveButton);
       await tester.pumpAndSettle();
 
       // The screen must **not** say that the profile was updated.
@@ -265,7 +270,10 @@ void main() {
       router.push('/student/profile/edit');
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Save changes'));
+      final saveButton = find.text('Save changes');
+      await tester.ensureVisible(saveButton);
+      await tester.pumpAndSettle();
+      await tester.tap(saveButton);
       await tester.pumpAndSettle();
 
       expect(controller.savedName, 'Asha');

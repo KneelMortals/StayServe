@@ -1,9 +1,11 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../../../../core/index.dart';
 import '../../../../models/user_model.dart';
 import '../providers/admin_providers.dart';
+import '../widgets/admin_message_dialog.dart';
 import '../widgets/admin_scaffold.dart';
 
 class AdminUsersScreen extends ConsumerStatefulWidget {
@@ -62,6 +64,7 @@ class _AdminUsersScreenState extends ConsumerState<AdminUsersScreen> {
                       _showBanDialog(context, ref, user);
                     }
                   },
+                  onMessage: () => _messageUser(context, user),
                   onChangeRole: (newRole) async {
                     final error = await ref
                         .read(adminControllerProvider.notifier)
@@ -82,6 +85,19 @@ class _AdminUsersScreenState extends ConsumerState<AdminUsersScreen> {
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (error, stack) => Center(child: Text('Error: $error')),
       ),
+    );
+  }
+
+  /// Sends a verified administrator message and opens the support chat.
+  Future<void> _messageUser(BuildContext context, UserModel user) async {
+    final result = await AdminMessageDialog.show(context, user);
+    if (result == null || !context.mounted) return;
+
+    await context.push(
+      Uri(
+        path: '/chat/${result.conversationId}',
+        queryParameters: {'peer': result.peerId, 'support': '1'},
+      ).toString(),
     );
   }
 
@@ -372,9 +388,21 @@ class _GracePeriodPicker {
   static const List<int> options = [1, 7, 14, 30];
 }
 
+/// Whether the server will accept an administrator message for [user].
+///
+/// The same live-profile checks are made again by `sendAdminMessage`; this
+/// helper only keeps unavailable actions out of the menu.
+bool _canReceiveAdminMessage(UserModel user) {
+  return user.role != UserRole.admin &&
+      user.isActive &&
+      user.registrationCompleted &&
+      user.phoneVerified;
+}
+
 class _UserCard extends ConsumerWidget {
   final UserModel user;
   final ValueChanged<bool> onToggleActive;
+  final VoidCallback onMessage;
   final ValueChanged<UserRole> onChangeRole;
   final VoidCallback onScheduleDeletion;
   final VoidCallback onCancelDeletion;
@@ -383,6 +411,7 @@ class _UserCard extends ConsumerWidget {
   const _UserCard({
     required this.user,
     required this.onToggleActive,
+    required this.onMessage,
     required this.onChangeRole,
     required this.onScheduleDeletion,
     required this.onCancelDeletion,
@@ -453,6 +482,9 @@ class _UserCard extends ConsumerWidget {
                   tooltip: 'Actions',
                   onSelected: (value) {
                     switch (value) {
+                      case 'message':
+                        onMessage();
+                        break;
                       case 'role':
                         _showRoleDialog(context);
                         break;
@@ -468,6 +500,11 @@ class _UserCard extends ConsumerWidget {
                     }
                   },
                   itemBuilder: (context) => [
+                    if (_canReceiveAdminMessage(user))
+                      const PopupMenuItem(
+                        value: 'message',
+                        child: Text('Message user'),
+                      ),
                     const PopupMenuItem(
                       value: 'role',
                       child: Text('Change Role'),

@@ -64,8 +64,16 @@ export interface BookingAccountState {
  * This is deliberately stricter than checking the role alone. The account
  * must also have completed registration and must still be active; otherwise
  * a banned or half-registered account could pass the student-role check.
+ *
+ * The live Firebase Auth phone is deliberately not part of this pure
+ * Firestore-state decision. Callers authorize the phone separately before
+ * entering a transaction, because the server-owned `phoneVerified` field is
+ * only a rules-facing cache and a best-effort cache refresh must never
+ * invalidate an otherwise valid live identity.
  */
-export function canBookAsStudent(profile: BookingAccountState): boolean {
+export function canBookAsStudent<T extends BookingAccountState>(
+  profile: T,
+): boolean {
   return (
     profile.exists &&
     profile.registrationCompleted === true &&
@@ -80,9 +88,13 @@ export function canBookAsStudent(profile: BookingAccountState): boolean {
  * Owner approval and cancellation are owner-only operations. The role is
  * checked in Firestore (the live source of truth), together with the
  * registration and activation state, so a demoted or banned owner cannot
- * keep using an already-issued owner token.
+ * keep using an already-issued owner token. The verified phone is checked
+ * separately against live Firebase Auth for the same reason described on
+ * [canBookAsStudent].
  */
-export function canActAsRoomOwner(profile: BookingAccountState): boolean {
+export function canActAsRoomOwner<T extends BookingAccountState>(
+  profile: T,
+): boolean {
   return (
     profile.exists &&
     profile.registrationCompleted === true &&

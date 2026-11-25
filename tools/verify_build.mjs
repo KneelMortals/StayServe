@@ -5,17 +5,36 @@
 // a byte — an em-dash for example). A search that only looks for ASCII
 // gives a false "missing" for the second kind.
 //
-//   node tools/verify_build.mjs <path-to-libapp.so>
+//   node tools/verify_build.mjs [path-to-apk]
 
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const APK =
-  process.argv[2] ||
-  '/Users/shauryaprataprai/Desktop/stayserve/build/app/outputs/flutter-apk/app-release.apk';
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const DEFAULT_APK = resolve(
+  ROOT,
+  'build/app/outputs/flutter-apk/app-arm64-v8a-release.apk',
+);
+
+if (process.argv.length > 3) {
+  console.error('Usage: node tools/verify_build.mjs [path-to-apk]');
+  process.exit(64);
+}
+
+const APK = process.argv[2]
+  ? resolve(process.cwd(), process.argv[2])
+  : DEFAULT_APK;
+if (!existsSync(APK)) {
+  console.error(
+    `Release APK not found: ${APK}\n` +
+      'Build it with: flutter build apk --release --split-per-abi',
+  );
+  process.exit(64);
+}
 
 const dir = mkdtempSync(join(tmpdir(), 'stayserve-verify-'));
 execFileSync('unzip', ['-q', '-o', APK, 'lib/arm64-v8a/libapp.so', '-d', dir]);

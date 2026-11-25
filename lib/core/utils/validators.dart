@@ -115,7 +115,9 @@ class AppValidators {
     if (value == null || value.trim().isEmpty) {
       return null; // Optional
     }
-    final urlRegex = RegExp(r'^(https?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$');
+    final urlRegex = RegExp(
+      r'^(https?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$',
+    );
     if (!urlRegex.hasMatch(value.trim())) {
       return 'Enter a valid URL';
     }
@@ -133,7 +135,10 @@ class AppFormatters {
     return formatter.format(amount);
   }
 
-  static String formatCurrencyWithDecimals(double amount, {String symbol = '₹'}) {
+  static String formatCurrencyWithDecimals(
+    double amount, {
+    String symbol = '₹',
+  }) {
     final formatter = NumberFormat.currency(
       locale: 'en_IN',
       symbol: symbol,
@@ -151,7 +156,10 @@ class AppFormatters {
     return DateFormat(pattern).format(date);
   }
 
-  static String formatDateTime(DateTime date, {String pattern = 'dd MMM yyyy, hh:mm a'}) {
+  static String formatDateTime(
+    DateTime date, {
+    String pattern = 'dd MMM yyyy, hh:mm a',
+  }) {
     return DateFormat(pattern).format(date);
   }
 
@@ -188,8 +196,11 @@ class AppHelpers {
   /// whitespace-only) name, which threw a `RangeError` and took the whole
   /// avatar widget down.
   static String getInitials(String name) {
-    final parts =
-        name.trim().split(RegExp(r'\s+')).where((part) => part.isNotEmpty).toList();
+    final parts = name
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty)
+        .toList();
     if (parts.isEmpty) return '?';
     if (parts.length == 1) return parts.first.substring(0, 1).toUpperCase();
     return '${parts[0].substring(0, 1)}${parts[1].substring(0, 1)}'
@@ -212,20 +223,25 @@ class AppHelpers {
   }
 
   static String maskEmail(String email) {
-    final parts = email.split('@');
-    if (parts.length != 2) return email;
+    final trimmed = email.trim();
+    final parts = trimmed.split('@');
+    if (parts.length != 2 || parts[0].isEmpty || parts[1].isEmpty) {
+      return '***';
+    }
     final name = parts[0];
-    if (name.length <= 2) return email;
-    return '${name[0]}${'*' * (name.length - 2)}${name[name.length - 1]}@${parts[1]}';
+    if (name.length == 1) return '*@${parts[1]}';
+    return '${name[0]}${'*' * (name.length - 1)}@${parts[1]}';
   }
 }
 
 extension StringExtensions on String {
-  String get capitalize => isEmpty ? this : '${this[0].toUpperCase()}${substring(1).toLowerCase()}';
+  String get capitalize =>
+      isEmpty ? this : '${this[0].toUpperCase()}${substring(1).toLowerCase()}';
 
   String get titleCase => split(' ').map((word) => word.capitalize).join(' ');
 
-  bool get isValidEmail => RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$').hasMatch(this);
+  bool get isValidEmail =>
+      RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$').hasMatch(this);
 
   String get removeHtmlTags => replaceAll(RegExp(r'<[^>]*>'), '');
 
@@ -239,7 +255,8 @@ extension DateTimeExtensions on DateTime {
   DateTime get startOfDay => DateTime(year, month, day);
   DateTime get endOfDay => DateTime(year, month, day, 23, 59, 59, 999);
   DateTime get startOfWeek => subtract(Duration(days: weekday - 1)).startOfDay;
-  DateTime get endOfWeek => add(Duration(days: DateTime.daysPerWeek - weekday)).endOfDay;
+  DateTime get endOfWeek =>
+      add(Duration(days: DateTime.daysPerWeek - weekday)).endOfDay;
   DateTime get startOfMonth => DateTime(year, month, 1);
   DateTime get endOfMonth => DateTime(year, month + 1, 0, 23, 59, 59, 999);
 }

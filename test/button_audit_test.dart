@@ -100,6 +100,11 @@ const List<String> kAuditRoutes = [
   '/notifications',
   '/forgot-password',
   '/login',
+  '/register',
+  '/role-selection',
+  '/verify-otp',
+  '/phone-auth',
+  '/verify-phone',
   '/student/home',
   '/student/search',
   '/student/saved',
@@ -1015,11 +1020,9 @@ void main() {
           visitRepositoryProvider.overrideWithValue(FakeVisitRepository()),
           reviewRepositoryProvider.overrideWithValue(FakeReviewRepository()),
           roomReviewsProvider.overrideWith(
-            (ref, roomId) => Stream.value([auditReview()]),
+            (ref, roomId) async => [auditReview()],
           ),
-          myRoomReviewProvider.overrideWith(
-            (ref, roomId) => Stream.value(auditReview()),
-          ),
+          myRoomReviewProvider.overrideWith((ref, roomId) => auditReview()),
           platformSettingsProvider.overrideWith(
             (ref) async => const PlatformSettings(feePercentage: 30),
           ),
@@ -1044,11 +1047,9 @@ void main() {
           ),
           reviewRepositoryProvider.overrideWithValue(FakeReviewRepository()),
           roomReviewsProvider.overrideWith(
-            (ref, roomId) => Stream.value([auditReview()]),
+            (ref, roomId) async => [auditReview()],
           ),
-          myRoomReviewProvider.overrideWith(
-            (ref, roomId) => Stream.value(auditReview()),
-          ),
+          myRoomReviewProvider.overrideWith((ref, roomId) => auditReview()),
         ],
       );
     });

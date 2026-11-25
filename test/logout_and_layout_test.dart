@@ -84,6 +84,8 @@ UserModel _profile(String uid, UserRole role) {
     name: 'Test $role',
     email: '$uid@example.com',
     role: role,
+    registrationCompleted: true,
+    phoneVerified: true,
     createdAt: now,
     updatedAt: now,
   );

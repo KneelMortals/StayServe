@@ -4,15 +4,15 @@ import 'package:go_router/go_router.dart';
 
 import '../../../../core/index.dart';
 import '../../../../models/user_model.dart';
+import '../../../../firebase/otp/otp_service.dart';
 import '../../../auth/presentation/providers/auth_provider.dart';
 
-/// Lets the signed-in user change their name, phone number and profile
-/// picture.
+/// Lets the signed-in user change their name and profile picture and manage
+/// their verified authentication methods.
 ///
-/// This screen used to be linked from the student profile
-/// (`/student/profile/edit`) but **did not exist** — the router fell
-/// through to its "Page Not Found" error page. It is now registered for
-/// both the student and the owner area.
+/// The phone number and its verification flag are server-owned. They can
+/// only be changed through Firebase Phone Auth. A phone-first account may
+/// add a verified email later with StayServe's one-time email proof.
 class EditProfileScreen extends ConsumerStatefulWidget {
   const EditProfileScreen({super.key});
 
@@ -23,7 +23,6 @@ class EditProfileScreen extends ConsumerStatefulWidget {
 class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
-  final _phoneController = TextEditingController();
   final _imageController = TextEditingController();
 
   bool _isSaving = false;
@@ -32,7 +31,6 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
   @override
   void dispose() {
     _nameController.dispose();
-    _phoneController.dispose();
     _imageController.dispose();
     super.dispose();
   }
@@ -43,7 +41,6 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
     if (_prefilled) return;
     _prefilled = true;
     _nameController.text = profile.name;
-    _phoneController.text = profile.phone ?? '';
     _imageController.text = profile.profileImage ?? '';
   }
 
@@ -53,9 +50,10 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
     setState(() => _isSaving = true);
     try {
       final image = _imageController.text.trim();
-      await ref.read(authControllerProvider.notifier).updateProfile(
+      await ref
+          .read(authControllerProvider.notifier)
+          .updateProfile(
             name: _nameController.text.trim(),
-            phone: _phoneController.text.trim(),
             profileImage: image.isEmpty ? null : image,
             // An empty field removes the picture — the old code silently
             // kept the old one.
@@ -65,13 +63,79 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
       if (!mounted) return;
       context.showSuccessSnackBar('Profile updated');
       context.pop();
-    } catch (e) {
+    } catch (error) {
       if (!mounted) return;
-      context.showErrorSnackBar(
-        e.toString().replaceFirst('Exception: ', ''),
-      );
+      context.showErrorSnackBar(readableAuthError(error));
     } finally {
       if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  Future<void> _addVerifiedEmail() async {
+    var enteredEmail = '';
+    final email = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Add verified email'),
+        content: TextFormField(
+          autofocus: true,
+          keyboardType: TextInputType.emailAddress,
+          initialValue: enteredEmail,
+          onChanged: (value) => enteredEmail = value.trim(),
+          decoration: const InputDecoration(
+            labelText: 'Email address',
+            prefixIcon: Icon(Icons.email_outlined),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (AppValidators.validateEmail(enteredEmail) != null) return;
+              Navigator.of(dialogContext).pop(enteredEmail);
+            },
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted || email == null || email.trim().isEmpty) return;
+
+    final challenge = await context.push<String>(
+      Uri(
+        path: '/verify-otp',
+        queryParameters: {
+          'channel': OtpChannel.email.name,
+          'identifier': email.trim(),
+        },
+      ).toString(),
+    );
+    if (!mounted || challenge == null || challenge.isEmpty) return;
+
+    try {
+      await ref
+          .read(authControllerProvider.notifier)
+          .linkVerifiedEmail(email: email.trim(), challenge: challenge);
+      if (!mounted) return;
+      context.showSuccessSnackBar('Verified email added');
+    } catch (error) {
+      if (!mounted) return;
+      context.showErrorSnackBar(readableAuthError(error));
+    }
+  }
+
+  Future<void> _linkGoogle() async {
+    try {
+      await ref.read(authControllerProvider.notifier).linkGoogleProvider();
+      if (!mounted) return;
+      context.showSuccessSnackBar('Google account linked');
+    } catch (error) {
+      if (!mounted) return;
+      context.showErrorSnackBar(readableAuthError(error));
     }
   }
 
@@ -79,6 +143,7 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
   Widget build(BuildContext context) {
     final session = ref.watch(authSessionProvider).valueOrNull;
     final profile = session?.profile;
+    final profileBusy = ref.watch(profileMutationBusyProvider);
 
     if (profile != null) _prefill(profile);
 
@@ -107,7 +172,9 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                           ),
                           const SizedBox(height: AppSpacing.sm),
                           Text(
-                            profile.email,
+                            profile.email.isEmpty
+                                ? 'No email address yet'
+                                : profile.email,
                             style: Theme.of(context).textTheme.bodyMedium,
                           ),
                         ],
@@ -118,21 +185,11 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                       label: 'Full name',
                       hint: 'Your name',
                       controller: _nameController,
-                      validator: (value) => AppValidators.validateRequired(
-                        value,
-                        'Name',
-                      ),
+                      validator: (value) =>
+                          AppValidators.validateRequired(value, 'Name'),
                       prefixIcon: const Icon(Icons.person_outline),
+                      enabled: !profileBusy,
                       onChanged: (_) => setState(() {}),
-                    ),
-                    const SizedBox(height: AppSpacing.md),
-                    AppTextField(
-                      label: 'Phone number (optional)',
-                      hint: '10-digit mobile number',
-                      controller: _phoneController,
-                      keyboardType: TextInputType.phone,
-                      validator: AppValidators.validatePhone,
-                      prefixIcon: const Icon(Icons.phone_outlined),
                     ),
                     const SizedBox(height: AppSpacing.md),
                     AppTextField(
@@ -141,12 +198,96 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                       controller: _imageController,
                       keyboardType: TextInputType.url,
                       prefixIcon: const Icon(Icons.image_outlined),
+                      enabled: !profileBusy,
                     ),
+                    const SizedBox(height: AppSpacing.lg),
+                    Text(
+                      'Verified sign-in methods',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: AppSpacing.sm),
+                    Card(
+                      child: ListTile(
+                        leading: Icon(
+                          profile.phoneVerified
+                              ? Icons.verified
+                              : Icons.phone_outlined,
+                          color: profile.phoneVerified
+                              ? Theme.of(context).colorScheme.primary
+                              : Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                        title: Text(
+                          profile.phone?.isNotEmpty == true
+                              ? profile.phone!
+                              : 'No verified phone number',
+                        ),
+                        subtitle: Text(
+                          profile.phoneVerified
+                              ? 'Firebase SMS verified'
+                              : 'A verified phone is required for services',
+                        ),
+                        trailing: profile.phoneVerified
+                            ? null
+                            : TextButton(
+                                onPressed: profileBusy
+                                    ? null
+                                    : () => context.go('/verify-phone'),
+                                child: const Text('Verify'),
+                              ),
+                      ),
+                    ),
+                    const SizedBox(height: AppSpacing.sm),
+                    Card(
+                      child: ListTile(
+                        leading: Icon(
+                          profile.emailVerified
+                              ? Icons.verified
+                              : Icons.email_outlined,
+                          color: profile.emailVerified
+                              ? Theme.of(context).colorScheme.primary
+                              : Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                        title: Text(
+                          profile.email.isEmpty
+                              ? 'No email address'
+                              : profile.email,
+                        ),
+                        subtitle: Text(
+                          profile.emailVerified
+                              ? 'Email ownership verified'
+                              : 'You can add a verified email later',
+                        ),
+                        trailing: profile.emailVerified
+                            ? null
+                            : TextButton(
+                                onPressed: profileBusy
+                                    ? null
+                                    : _addVerifiedEmail,
+                                child: const Text('Add'),
+                              ),
+                      ),
+                    ),
+                    if (!profile.authProviders.contains('google.com')) ...[
+                      const SizedBox(height: AppSpacing.sm),
+                      Card(
+                        child: ListTile(
+                          leading: const Icon(Icons.g_mobiledata),
+                          title: const Text('Google account'),
+                          subtitle: const Text(
+                            'Link Google OpenID Connect for another sign-in method',
+                          ),
+                          trailing: TextButton(
+                            onPressed: profileBusy ? null : _linkGoogle,
+                            child: const Text('Link'),
+                          ),
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: AppSpacing.lg),
                     AppButton(
                       label: 'Save changes',
-                      isLoading: _isSaving,
-                      onPressed: _isSaving ? null : _save,
+                      isLoading: _isSaving || profileBusy,
+                      onPressed: _isSaving || profileBusy ? null : _save,
                       type: ButtonType.primary,
                     ),
                   ],

@@ -23,7 +23,7 @@ process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${PORT}`;
 process.env.GCLOUD_PROJECT = PROJECT;
 process.env.GCLOUD_PROJECT_ID = PROJECT;
 process.env.FIREBASE_CONFIG = JSON.stringify({ projectId: PROJECT });
-// No Auth request is made by this suite. Point the SDK at the emulator
+// The suite supplies its own live Auth records. Point the SDK at the emulator
 // protocol so it does not look for application-default credentials while it
 // initializes the shared Auth service.
 process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9099';
@@ -75,10 +75,33 @@ const {
   setRoomListingAvailability,
   adminSetRoomListingStatus,
 } = require(path.join(ROOT, 'lib', 'rooms.js'));
-const { registerUserRole } = require(path.join(ROOT, 'lib', 'otp.js'));
+const {
+  registerUserRole,
+  completeRegistration,
+} = require(path.join(ROOT, 'lib', 'otp.js'));
+const {
+  syncAuthProfile,
+  linkVerifiedEmail,
+  processRegistrationRollbackOperations,
+  rollbackIncompleteRegistration,
+} = require(path.join(ROOT, 'lib', 'authProfile.js'));
+const {
+  ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+  adminMessageNotificationId,
+  adminSupportIdentityFor,
+  sendAdminMessage,
+} = require(path.join(ROOT, 'lib', 'adminMessaging.js'));
+const {
+  getRoomReviews,
+  deleteAnyRoomReview,
+  reviewNotificationId,
+} = require(path.join(ROOT, 'lib', 'reviews.js'));
 const {
   processRoleClaimPublicationJobs,
 } = require(path.join(ROOT, 'lib', 'roleClaims.js'));
+const {
+  ensureUserProfile,
+} = require(path.join(ROOT, 'lib', 'profileBootstrap.js'));
 const {
   setRoomPrivateLocation,
   migrateRoomPrivateLocations,
@@ -109,12 +132,28 @@ const {
   processScheduledDeletions,
   scheduleAccountDeletionJob,
   deleteUserConversations,
+  deleteAttributedNotificationsForUser,
+  deleteUserEverywhere,
 } = require(path.join(ROOT, 'lib', 'admin.js'));
 
 // The compiled modules initialize the default Admin app when they are
 // loaded. Open Firestore and Auth only after that initialization.
 const db = firestore.getFirestore();
 const auth = authSdk.getAuth();
+
+// Registration and profile synchronisation read the live Auth user record.
+// The Firestore-only suite supplies a deterministic live identity instead of
+// requiring the Auth emulator. Tests which exercise a specific Auth state
+// override this getter and restore it afterwards.
+auth.getUser = async (uid) => ({
+  uid,
+  email: `${uid}@example.test`,
+  emailVerified: false,
+  // The callable suite models a live linked phone by default. Tests which
+  // exercise an unlinked provider override this getter explicitly.
+  phoneNumber: '+919876500000',
+  providerData: [{ providerId: 'password' }],
+});
 
 let pass = 0;
 let fail = 0;
@@ -138,12 +177,16 @@ function section(title) {
   console.log(`\n=== ${title} ===`);
 }
 
-async function invoke(callable, data, uid) {
+async function invoke(callable, data, uid, tokenOverrides = {}) {
   return callable.run(data, {
     auth: uid
       ? {
           uid,
-          token: { email: `${uid}@example.test` },
+          token: {
+            email: `${uid}@example.test`,
+            email_verified: true,
+            ...tokenOverrides,
+          },
         }
       : undefined,
     rawRequest: {},
@@ -151,13 +194,14 @@ async function invoke(callable, data, uid) {
   });
 }
 
-function emulatorJwt(uid) {
+function emulatorJwt(uid, claims = {}) {
   const encode = (value) =>
     Buffer.from(JSON.stringify(value)).toString('base64url');
   return `${encode({ alg: 'none', typ: 'JWT' })}.${encode({
     sub: uid,
     user_id: uid,
     role: 'student',
+    ...claims,
   })}.`;
 }
 
@@ -200,16 +244,45 @@ async function createClientMessage({
   return { status: response.status, body };
 }
 
+async function readDocumentAsClient({
+  collection,
+  documentId,
+  uid,
+  claims = {},
+}) {
+  const host = `http://127.0.0.1:${PORT}/v1/projects/${PROJECT}/databases/(default)/documents`;
+  const response = await fetch(
+    `${host}/${collection}/${documentId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${emulatorJwt(uid, claims)}`,
+      },
+    },
+  );
+  const text = await response.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = text;
+  }
+  return { status: response.status, body };
+}
+
 async function expectDenied(label, action, expectedCode = 'permission-denied') {
   try {
     await action();
     check(label, 'allowed', `rejected (${expectedCode})`);
+    return 'allowed';
   } catch (error) {
     const code = String(error?.code || '');
     const message = String(error?.message || '');
     const ok = code.includes(expectedCode) || message.includes(expectedCode);
-    check(label, ok ? `rejected (${code || expectedCode})` : `${code}: ${message}`,
-      `rejected (${expectedCode})`);
+    const outcome = ok
+      ? `rejected (${code || expectedCode})`
+      : `${code}: ${message}`;
+    check(label, outcome, `rejected (${expectedCode})`);
+    return outcome;
   }
 }
 
@@ -222,6 +295,10 @@ function profile(uid, role, active = true) {
     isActive: active,
     name: uid,
     email: `${uid}@example.test`,
+    emailVerified: true,
+    phone: `+9198765${String(uid).replace(/\D/g, '').padStart(5, '0').slice(-5)}`,
+    phoneVerified: true,
+    authProviders: [role === 'admin' ? 'admin' : 'password'],
   };
 }
 
@@ -312,6 +389,11 @@ async function reset() {
   const blocks = await db.collectionGroup('blockedUsers').get();
   await Promise.all(blocks.docs.map((block) => block.ref.delete()));
 
+  // The opaque administrator identity is stored in a nested server-only
+  // profile. A collection-group sweep removes both it and ordinary profiles.
+  const users = await db.collectionGroup('users').get();
+  await Promise.all(users.docs.map((doc) => doc.ref.delete()));
+
   const collections = [
     'users',
     'joinRequests',
@@ -319,9 +401,16 @@ async function reset() {
     'commissionInvoices',
     'joinRequestLocks',
     'notifications',
+    'notificationAttributions',
+    'adminMessageNotificationOperations',
+    'adminSupportConversationOperations',
     'rooms',
     'roomPrivate',
     'roomReviews',
+    'reviewDeletionAudit',
+    'reviewDeletionState',
+    'emailLinkOperations',
+    'registrationRollbackOperations',
     'paymentReferences',
     'cleanupJobs',
     'roomDeletionTombstones',
@@ -706,6 +795,40 @@ async function testConversationCleanupMarksBeforeDeletingMessages() {
     receiverId: 'owner-1',
     content: 'Hello',
   });
+  await db.collection('notifications').doc('legacy-message-notification').set({
+    userId: 'owner-1',
+    title: 'New message',
+    body: 'Hello',
+    type: 'newMessage',
+    data: { conversationId: 'conversation-1', messageId: 'message-1' },
+    read: false,
+  });
+  const attributedNotificationId = adminMessageNotificationId('message-1');
+  await db
+    .collection('notificationAttributions')
+    .doc(attributedNotificationId)
+    .set({
+      notificationId: attributedNotificationId,
+      userId: 'owner-1',
+      sourceType: 'chatMessage',
+      sourceAuthorUid: 'student-1',
+      sourceRecipientUid: 'owner-1',
+      sourceId: 'message-1',
+      sourceMessageId: 'message-1',
+    });
+  await db
+    .collection('adminMessageNotificationOperations')
+    .doc('message-1')
+    .set({
+      operationId: 'message-1',
+      notificationId: attributedNotificationId,
+      messageId: 'message-1',
+      conversationId: 'conversation-1',
+      sourceAuthorUid: 'student-1',
+      sourceRecipientUid: 'owner-1',
+      recipientId: 'owner-1',
+      sourceType: 'adminMessage',
+    });
 
   const originalDeleteWhere = batches.deleteWhere;
   let markerVisibleAtMessageScan = false;
@@ -767,6 +890,30 @@ async function testConversationCleanupMarksBeforeDeletingMessages() {
     'the message subcollection was deleted',
     (await conversationRef.collection('messages').get()).empty,
     true,
+  );
+  check(
+    'the legacy notification copy of the deleted message was removed',
+    (await db
+      .collection('notifications')
+      .doc('legacy-message-notification')
+      .get()).exists,
+    false,
+  );
+  check(
+    'the server-only attribution of the deleted message was removed',
+    (await db
+      .collection('notificationAttributions')
+      .doc(attributedNotificationId)
+      .get()).exists,
+    false,
+  );
+  check(
+    'the server-only delivery operation of the deleted message was removed',
+    (await db
+      .collection('adminMessageNotificationOperations')
+      .doc('message-1')
+      .get()).exists,
+    false,
   );
 }
 
@@ -887,6 +1034,69 @@ async function testAuthDeleteCleanupIsDurableAndRetryable() {
     .collection('otpSendQuota')
     .doc(`uid_${crypto.createHash('sha256').update('target-1').digest('hex')}`);
   await uidQuotaRef.set({ sendCount: 1, windowStart: firestore.Timestamp.now() });
+  const emailLinkOperationRef = db
+    .collection('emailLinkOperations')
+    .doc('email-link-target-1');
+  await emailLinkOperationRef.set({
+    operationId: emailLinkOperationRef.id,
+    uid: 'target-1',
+    email: 'target-1@example.test',
+    status: 'complete',
+  });
+  const peerEmailLinkOperationRef = db
+    .collection('emailLinkOperations')
+    .doc('email-link-peer-1');
+  await peerEmailLinkOperationRef.set({
+    operationId: peerEmailLinkOperationRef.id,
+    uid: 'peer-1',
+    email: 'peer-1@example.test',
+    status: 'complete',
+  });
+  const registrationRollbackRef = db
+    .collection('registrationRollbackOperations')
+    .doc('target-1');
+  await registrationRollbackRef.set({
+    operationId: 'target-1',
+    uid: 'target-1',
+    status: 'rollbackRequested',
+    attempts: 0,
+  });
+  const adminModerationAuditRef = db
+    .collection('reviewDeletionAudit')
+    .doc('admin-moderation-target-1');
+  await adminModerationAuditRef.set({
+    reviewId: 'review-by-target-1',
+    studentId: 'peer-1',
+    ownerId: 'owner-1',
+    deletedByAdminId: 'target-1',
+  });
+  const peerModerationAuditRef = db
+    .collection('reviewDeletionAudit')
+    .doc('admin-moderation-peer-1');
+  await peerModerationAuditRef.set({
+    reviewId: 'review-by-peer-1',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    deletedByAdminId: 'peer-1',
+  });
+  const adminModerationStateRef = db
+    .collection('reviewDeletionState')
+    .doc('review-by-target-1');
+  await adminModerationStateRef.set({
+    reviewId: 'review-by-target-1',
+    studentId: 'peer-1',
+    ownerId: 'owner-1',
+    deletedByAdminId: 'target-1',
+  });
+  const peerModerationStateRef = db
+    .collection('reviewDeletionState')
+    .doc('review-by-peer-1');
+  await peerModerationStateRef.set({
+    reviewId: 'review-by-peer-1',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    deletedByAdminId: 'peer-1',
+  });
 
   const originalUpdateUser = auth.updateUser;
   const originalRevoke = auth.revokeRefreshTokens;
@@ -917,6 +1127,11 @@ async function testAuthDeleteCleanupIsDurableAndRetryable() {
       'the failed trigger reports the cleanup failure',
       String(cleanupError?.message || '').includes('Storage outage'),
       true,
+    );
+    check(
+      'the failed cleanup kept the pending registration rollback marker',
+      (await registrationRollbackRef.get()).get('status'),
+      'rollbackRequested',
     );
 
     const jobRef = db
@@ -983,6 +1198,41 @@ async function testAuthDeleteCleanupIsDurableAndRetryable() {
       false,
     );
     check(
+      'the verified-email linking operation was removed with the account',
+      (await emailLinkOperationRef.get()).exists,
+      false,
+    );
+    check(
+      'another account verified-email linking operation was preserved',
+      (await peerEmailLinkOperationRef.get()).exists,
+      true,
+    );
+    check(
+      'the completed account cleanup removed the registration rollback marker',
+      (await registrationRollbackRef.get()).exists,
+      false,
+    );
+    check(
+      'the deleted administrator was removed from moderation history',
+      (await adminModerationAuditRef.get()).exists,
+      false,
+    );
+    check(
+      'another administrator was preserved in moderation history',
+      (await peerModerationAuditRef.get()).exists,
+      true,
+    );
+    check(
+      'the deleted administrator was removed from the moderation state',
+      (await adminModerationStateRef.get()).exists,
+      false,
+    );
+    check(
+      'another administrator was preserved in the moderation state',
+      (await peerModerationStateRef.get()).exists,
+      true,
+    );
+    check(
       'the outgoing personal block was removed with the account',
       (await outgoingBlockRef.get()).exists,
       false,
@@ -1006,6 +1256,245 @@ async function testAuthDeleteCleanupIsDurableAndRetryable() {
       'the server-owned conversation context was removed with the account',
       (await cleanupContextRef.get()).exists,
       false,
+    );
+  } finally {
+    auth.updateUser = originalUpdateUser;
+    auth.revokeRefreshTokens = originalRevoke;
+    auth.deleteUser = originalDeleteUser;
+    storageSdk.getStorage = originalGetStorage;
+  }
+}
+
+async function testAccountCleanupRemovesReviewNotificationDependents() {
+  section('account cleanup removes review notification dependents first');
+
+  await reset();
+  await seedUser('student-1', 'student');
+  await seedUser('owner-1', 'owner');
+  const reviewId = 'REV-ACCOUNT-CLEANUP-student-1';
+  const reviewInstanceId = 'review-account-cleanup-lifecycle';
+  const notificationId = reviewNotificationId(
+    reviewId,
+    reviewInstanceId,
+    'owner-1',
+  );
+  await db.collection('roomReviews').doc(reviewId).set({
+    reviewId,
+    reviewInstanceId,
+    roomId: 'RM-ACCOUNT-CLEANUP',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    rating: 4,
+    comment: 'Private review text',
+  });
+  await db.collection('notifications').doc(notificationId).set({
+    userId: 'owner-1',
+    title: 'New review',
+    body: 'A student rated your room 4/5',
+    type: 'review',
+    data: { roomId: 'RM-ACCOUNT-CLEANUP' },
+    read: false,
+  });
+  await db.collection('notifications').doc('legacy-account-review').set({
+    userId: 'owner-1',
+    title: 'New review',
+    body: 'Private review text',
+    type: 'review',
+    data: { roomId: 'RM-ACCOUNT-CLEANUP', reviewId },
+    read: false,
+  });
+  await db.collection('notificationAttributions').doc(notificationId).set({
+    notificationId,
+    userId: 'owner-1',
+    sourceType: 'roomReview',
+    sourceAuthorUid: 'student-1',
+    sourceRecipientUid: 'owner-1',
+    sourceId: reviewInstanceId,
+    sourceReviewId: reviewId,
+  });
+
+  const originalUpdateUser = auth.updateUser;
+  const originalRevoke = auth.revokeRefreshTokens;
+  const originalDeleteUser = auth.deleteUser;
+  const originalGetStorage = storageSdk.getStorage;
+  auth.updateUser = async () => undefined;
+  auth.revokeRefreshTokens = async () => undefined;
+  auth.deleteUser = async () => undefined;
+  storageSdk.getStorage = () => ({
+    bucket: () => ({ getFiles: async () => [[]] }),
+  });
+
+  try {
+    await deleteUserEverywhere('student-1');
+    check(
+      'the account cleanup removed the review source',
+      (await db.collection('roomReviews').doc(reviewId).get()).exists,
+      false,
+    );
+    check(
+      'the account cleanup removed the deterministic review notification',
+      (await db.collection('notifications').doc(notificationId).get()).exists,
+      false,
+    );
+    check(
+      'the account cleanup removed the legacy review notification',
+      (await db.collection('notifications').doc('legacy-account-review').get()).exists,
+      false,
+    );
+    check(
+      'the account cleanup removed the server-only review attribution',
+      (await db
+        .collection('notificationAttributions')
+        .doc(notificationId)
+        .get()).exists,
+      false,
+    );
+
+    // Every cleanup step is idempotent, so an interrupted job can safely
+    // repeat the whole operation.
+    await deleteUserEverywhere('student-1');
+    check(
+      'the repeated account cleanup remains successful',
+      (await db.collection('roomReviews').doc(reviewId).get()).exists,
+      false,
+    );
+  } finally {
+    auth.updateUser = originalUpdateUser;
+    auth.revokeRefreshTokens = originalRevoke;
+    auth.deleteUser = originalDeleteUser;
+    storageSdk.getStorage = originalGetStorage;
+  }
+}
+
+async function testAccountDeletionPreservesPendingRegistrationRollback() {
+  section('account deletion preserves a pending rollback until Auth is removed');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await db.collection('users').doc('incomplete-rollback-user').set({
+    uid: 'incomplete-rollback-user',
+    role: 'student',
+    roleClaimed: false,
+    registrationCompleted: false,
+    isActive: true,
+    phoneVerified: false,
+  });
+  const rollbackRef = db
+    .collection('registrationRollbackOperations')
+    .doc('incomplete-rollback-user');
+  await rollbackRef.set({
+    operationId: 'incomplete-rollback-user',
+    uid: 'incomplete-rollback-user',
+    status: 'rollbackRequested',
+    attempts: 0,
+  });
+
+  const originalUpdateUser = auth.updateUser;
+  const originalRevoke = auth.revokeRefreshTokens;
+  const originalDeleteUser = auth.deleteUser;
+  const originalGetStorage = storageSdk.getStorage;
+  const deletedAuthUids = [];
+  let failStorage = true;
+
+  auth.updateUser = async () => undefined;
+  auth.revokeRefreshTokens = async () => undefined;
+  auth.deleteUser = async (uid) => {
+    deletedAuthUids.push(uid);
+  };
+  storageSdk.getStorage = () => ({
+    bucket: () => ({
+      getFiles: async () => {
+        if (failStorage) throw new Error('simulated Storage outage');
+        return [[]];
+      },
+    }),
+  });
+
+  try {
+    let cleanupError = null;
+    try {
+      await deleteUserEverywhere('incomplete-rollback-user');
+    } catch (error) {
+      cleanupError = error;
+    }
+    check(
+      'the account cleanup failed before Auth deletion',
+      String(cleanupError?.message || '').includes('Storage outage'),
+      true,
+    );
+    check(
+      'the failed account cleanup kept the rollback worker instruction',
+      (await rollbackRef.get()).get('status'),
+      'rollbackRequested',
+    );
+    check(
+      'the failed account cleanup did not delete the Auth account',
+      deletedAuthUids,
+      [],
+    );
+
+    // The rollback worker can now finish the incomplete registration even
+    // though the broader account cleanup was interrupted.
+    failStorage = false;
+    const rollbackSummary = await processRegistrationRollbackOperations();
+    check('the rollback worker deleted the pending Auth account', rollbackSummary.deleted, 1);
+    check(
+      'the rollback worker deleted the expected Auth uid',
+      deletedAuthUids,
+      ['incomplete-rollback-user'],
+    );
+    check(
+      'the rollback worker completed the durable marker',
+      (await rollbackRef.get()).get('status'),
+      'authDeleted',
+    );
+
+    // A successful account-cleanup retry removes the completed marker. It
+    // can therefore never be picked up as future work for the deleted uid.
+    await deleteUserEverywhere('incomplete-rollback-user');
+    check(
+      'the completed account cleanup removed the rollback marker',
+      (await rollbackRef.get()).exists,
+      false,
+    );
+    check(
+      'the completed account cleanup removed the incomplete profile',
+      (await db
+        .collection('users')
+        .doc('incomplete-rollback-user')
+        .get()).exists,
+      false,
+    );
+
+    // These operation collections contain uids and proofs. Even a trusted
+    // administrator client must not be able to read them.
+    await db.collection('emailLinkOperations').doc('private-email-link').set({
+      operationId: 'private-email-link',
+      uid: 'incomplete-rollback-user',
+      email: 'private@example.test',
+      status: 'authorised',
+    });
+    const rollbackRead = await readDocumentAsClient({
+      collection: 'registrationRollbackOperations',
+      documentId: 'incomplete-rollback-user',
+      uid: 'admin-1',
+      claims: { admin: true },
+    });
+    check(
+      'an administrator client cannot read the rollback operation',
+      rollbackRead.status >= 400,
+      true,
+    );
+    const emailLinkRead = await readDocumentAsClient({
+      collection: 'emailLinkOperations',
+      documentId: 'private-email-link',
+      uid: 'admin-1',
+      claims: { admin: true },
+    });
+    check(
+      'an administrator client cannot read the email-link operation',
+      emailLinkRead.status >= 400,
+      true,
     );
   } finally {
     auth.updateUser = originalUpdateUser;
@@ -1172,6 +1661,7 @@ async function testScheduledCancellationAndClaimRace() {
     roleClaimed: true,
     registrationCompleted: true,
     isActive: false,
+    phoneVerified: true,
     deletionScheduled: true,
     deleteAfter: firestore.Timestamp.fromMillis(Date.now() - 1000),
   });
@@ -1220,6 +1710,7 @@ async function testScheduledCancellationAndClaimRace() {
     roleClaimed: true,
     registrationCompleted: true,
     isActive: false,
+    phoneVerified: true,
     deletionScheduled: true,
     deleteAfter: firestore.Timestamp.fromMillis(Date.now() - 1000),
   });
@@ -1330,6 +1821,7 @@ async function testAuthLifecycleTransitionsRemainRetryable() {
     roleClaimed: true,
     registrationCompleted: true,
     isActive: false,
+    phoneVerified: true,
     deletionScheduled: true,
     deletionState: 'scheduled',
     deletionPreviousIsActive: true,
@@ -4012,6 +4504,7 @@ async function testReviewAndNotificationAuthorizationsAreTransactional() {
     .doc('REV-RM-REVIEW-student-1');
   await reviewRef.set({
     reviewId: 'REV-RM-REVIEW-student-1',
+    reviewInstanceId: 'review-instance-existing',
     roomId: 'RM-REVIEW',
     studentId: 'student-1',
     ownerId: 'owner-1',
@@ -4029,7 +4522,15 @@ async function testReviewAndNotificationAuthorizationsAreTransactional() {
   try {
     await expectDenied(
       'an inactive student cannot delete a review',
-      () => invoke(deleteRoomReview, { roomId: 'RM-REVIEW' }, 'student-1'),
+      () =>
+        invoke(
+          deleteRoomReview,
+          {
+            roomId: 'RM-REVIEW',
+            expectedReviewInstanceId: 'review-instance-existing',
+          },
+          'student-1',
+        ),
       'permission-denied',
     );
   } finally {
@@ -5845,8 +6346,15 @@ async function testListingDeletionRemovesOrphanReviews() {
     roomId: 'RM-REVIEW-CLEANUP',
     status: 'cancelled',
   });
+  const reviewLifecycleId = 'review-lifecycle-listing-cleanup';
+  const reviewNotificationIdForCleanup = reviewNotificationId(
+    'REV-OLD-ROOM',
+    reviewLifecycleId,
+    'owner-1',
+  );
   await db.collection('roomReviews').doc('REV-OLD-ROOM').set({
     reviewId: 'REV-OLD-ROOM',
+    reviewInstanceId: reviewLifecycleId,
     roomId: 'RM-REVIEW-CLEANUP',
     studentId: 'student-1',
     ownerId: 'owner-1',
@@ -5854,6 +6362,41 @@ async function testListingDeletionRemovesOrphanReviews() {
     comment: 'Old review',
     createdAt: firestore.Timestamp.now(),
     updatedAt: firestore.Timestamp.now(),
+  });
+  await db
+    .collection('notifications')
+    .doc(reviewNotificationIdForCleanup)
+    .set({
+      userId: 'owner-1',
+      title: 'New review',
+      body: 'student-1 rated your room 5/5',
+      type: 'review',
+      data: { roomId: 'RM-REVIEW-CLEANUP' },
+      read: false,
+      createdAt: firestore.Timestamp.now(),
+    });
+  await db
+    .collection('notificationAttributions')
+    .doc(reviewNotificationIdForCleanup)
+    .set({
+      notificationId: reviewNotificationIdForCleanup,
+      userId: 'owner-1',
+      sourceType: 'roomReview',
+      sourceAuthorUid: 'student-1',
+      sourceRecipientUid: 'owner-1',
+      sourceId: reviewLifecycleId,
+      sourceReviewId: 'REV-OLD-ROOM',
+      createdAt: firestore.Timestamp.now(),
+      updatedAt: firestore.Timestamp.now(),
+    });
+  await db.collection('notifications').doc('legacy-listing-review-notification').set({
+    userId: 'owner-1',
+    title: 'New review',
+    body: 'Old review',
+    type: 'review',
+    data: { roomId: 'RM-REVIEW-CLEANUP', reviewId: 'REV-OLD-ROOM' },
+    read: false,
+    createdAt: firestore.Timestamp.now(),
   });
 
   const originalGetStorage = storageSdk.getStorage;
@@ -5876,6 +6419,36 @@ async function testListingDeletionRemovesOrphanReviews() {
   check(
     'the review of the deleted listing was removed',
     (await db.collection('roomReviews').doc('REV-OLD-ROOM').get()).exists,
+    false,
+  );
+  check(
+    'the deterministic review notification was removed',
+    (
+      await db
+        .collection('notifications')
+        .doc(reviewNotificationIdForCleanup)
+        .get()
+    ).exists,
+    false,
+  );
+  check(
+    'the review notification attribution was removed',
+    (
+      await db
+        .collection('notificationAttributions')
+        .doc(reviewNotificationIdForCleanup)
+        .get()
+    ).exists,
+    false,
+  );
+  check(
+    'the legacy review notification was removed',
+    (
+      await db
+        .collection('notifications')
+        .doc('legacy-listing-review-notification')
+        .get()
+    ).exists,
     false,
   );
 }
@@ -7573,7 +8146,2469 @@ async function testBlockedPaymentCanStillBeRejectedByTheAdmin() {
   );
 }
 
+async function testPhoneAndGoogleRegistrationIdentities() {
+  section('phone and Google identities can complete registration');
+
+  const originalSetClaims = auth.setCustomUserClaims;
+  const originalGetUser = auth.getUser;
+  const liveAuthUsers = new Map([
+    [
+      'phone-user',
+      {
+        email: null,
+        emailVerified: false,
+        phoneNumber: '+919876543210',
+        providerData: [{ providerId: 'phone' }],
+      },
+    ],
+    [
+      'google-user',
+      {
+        email: 'google-user@example.test',
+        emailVerified: true,
+        phoneNumber: null,
+        providerData: [{ providerId: 'google.com' }],
+      },
+    ],
+    [
+      'role-phone-user',
+      {
+        email: null,
+        emailVerified: false,
+        phoneNumber: '+919876543212',
+        providerData: [{ providerId: 'phone' }],
+      },
+    ],
+    [
+      'bound-user',
+      {
+        email: 'bound-user@example.test',
+        emailVerified: false,
+        phoneNumber: null,
+        providerData: [{ providerId: 'password' }],
+      },
+    ],
+    [
+      'stale-phone-user',
+      {
+        email: null,
+        emailVerified: false,
+        phoneNumber: null,
+        providerData: [{ providerId: 'password' }],
+      },
+    ],
+    [
+      'stale-role-user',
+      {
+        email: null,
+        emailVerified: false,
+        phoneNumber: null,
+        providerData: [{ providerId: 'password' }],
+      },
+    ],
+    [
+      'stale-completed-user',
+      {
+        email: 'stale-completed-user@example.test',
+        emailVerified: true,
+        phoneNumber: null,
+        providerData: [{ providerId: 'password' }],
+      },
+    ],
+    [
+      'stale-email-user',
+      {
+        email: 'stale-email-user@example.test',
+        emailVerified: false,
+        phoneNumber: null,
+        providerData: [{ providerId: 'password' }],
+      },
+    ],
+    [
+      'stale-profile-email-user',
+      {
+        email: null,
+        emailVerified: false,
+        phoneNumber: null,
+        providerData: [{ providerId: 'password' }],
+      },
+    ],
+  ]);
+  auth.setCustomUserClaims = async () => undefined;
+  auth.getUser = async (uid) => ({
+    uid,
+    email: null,
+    emailVerified: false,
+    phoneNumber: null,
+    providerData: [],
+    ...(liveAuthUsers.get(uid) || {}),
+  });
+  try {
+    await reset();
+  await db.collection('users').doc('phone-user').set({
+    uid: 'phone-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    phone: '+919876543210',
+    phoneVerified: true,
+  });
+
+  const phoneResult = await invoke(
+    completeRegistration,
+    { name: 'Phone User', role: 'student' },
+    'phone-user',
+    {
+      email: '',
+      email_verified: false,
+      phone_number: '+919876543210',
+      phone_number_verified: true,
+      firebase: {
+        identities: { phone: ['+919876543210'] },
+        sign_in_provider: 'phone',
+      },
+    },
+  );
+  check('a phone-only account completes registration', phoneResult.success, true);
+  check(
+    'the phone-only account keeps its verified phone',
+    (await db.collection('users').doc('phone-user').get()).get('phoneVerified'),
+    true,
+  );
+  check(
+    'the phone-only account has no verified email',
+    (await db.collection('users').doc('phone-user').get()).get('emailVerified'),
+    false,
+  );
+
+  await reset();
+  await db.collection('users').doc('google-user').set({
+    uid: 'google-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    email: 'google-user@example.test',
+    emailVerified: true,
+  });
+  const googleResult = await invoke(
+    completeRegistration,
+    { name: 'Google User', role: 'student' },
+    'google-user',
+    {
+      email: 'google-user@example.test',
+      email_verified: true,
+      firebase: {
+        identities: { 'google.com': ['google-user@example.test'] },
+        sign_in_provider: 'google.com',
+      },
+    },
+  );
+  check('a Google account completes registration', googleResult.success, true);
+  check(
+    'the Google account keeps its verified email',
+    (await db.collection('users').doc('google-user').get()).get('emailVerified'),
+    true,
+  );
+  check(
+    'the Google provider is recorded on the profile',
+    (await db.collection('users').doc('google-user').get()).get('authProviders'),
+    ['google.com'],
+  );
+
+  await reset();
+  await db.collection('users').doc('role-phone-user').set({
+    uid: 'role-phone-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    phone: '+919876543212',
+    phoneVerified: true,
+  });
+  const roleResult = await invoke(
+    registerUserRole,
+    { role: 'owner', challenge: '' },
+    'role-phone-user',
+    {
+      email: '',
+      email_verified: false,
+      phone_number: '+919876543212',
+      phone_number_verified: true,
+      firebase: {
+        identities: { phone: ['+919876543212'] },
+        sign_in_provider: 'phone',
+      },
+    },
+  );
+  check('a verified phone can claim a role without an email challenge', roleResult.success, true);
+  const roleProfile = await db.collection('users').doc('role-phone-user').get();
+  check('the role claim completes the registration', roleProfile.get('registrationCompleted'), true);
+  check('the role claim stores the selected role', roleProfile.get('role'), 'owner');
+  check('the role claim keeps the verified phone', roleProfile.get('phoneVerified'), true);
+
+  await reset();
+  await db.collection('users').doc('bound-user').set({
+    uid: 'bound-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    email: 'bound-user@example.test',
+    emailVerified: false,
+  });
+  const boundChallenge = 'bound-to-another-user';
+  await db.collection('otpCodes').doc(testOtpDocumentId('email', 'bound-user@example.test')).set({
+    channel: 'email',
+    identifierHash: crypto
+      .createHash('sha256')
+      .update('bound-user@example.test')
+      .digest('hex'),
+    verified: true,
+    verifiedByUid: 'another-user',
+    challengeHash: crypto.createHash('sha256').update(boundChallenge).digest('hex'),
+    challengeUsed: false,
+    challengeIssuedAt: firestore.Timestamp.now(),
+    challengeExpiresAt: firestore.Timestamp.fromMillis(Date.now() + 10 * 60 * 1000),
+  });
+  await expectDenied(
+    'a challenge bound to another signed-in account cannot complete registration',
+    () =>
+      invoke(
+        completeRegistration,
+        { name: 'Bound User', role: 'student', challenge: boundChallenge },
+        'bound-user',
+        {
+          email: 'bound-user@example.test',
+          email_verified: false,
+        },
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the foreign challenge did not complete the registration',
+    (await db.collection('users').doc('bound-user').get()).get('registrationCompleted'),
+    false,
+  );
+
+  // A phone provider may be unlinked after an ID token was issued. The old
+  // token is still cryptographically valid and still carries the phone, but
+  // the live Auth record does not. Registration must not accept that stale
+  // phone as a verified registration contact.
+  await reset();
+  await db.collection('users').doc('stale-phone-user').set({
+    uid: 'stale-phone-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    phone: '+919876543219',
+    phoneVerified: true,
+  });
+  await expectDenied(
+    'a stale token cannot complete registration with an unlinked phone',
+    () =>
+      invoke(
+        completeRegistration,
+        { name: 'Stale Phone User', role: 'student' },
+        'stale-phone-user',
+        {
+          email: '',
+          email_verified: false,
+          phone_number: '+919876543219',
+          phone_number_verified: true,
+          firebase: {
+            identities: { phone: ['+919876543219'] },
+            sign_in_provider: 'phone',
+          },
+        },
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the stale phone did not complete the registration',
+    (await db.collection('users').doc('stale-phone-user').get()).get('registrationCompleted'),
+    false,
+  );
+
+  await reset();
+  await db.collection('users').doc('stale-role-user').set({
+    uid: 'stale-role-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    phone: '+919876543219',
+    phoneVerified: true,
+  });
+  await expectDenied(
+    'a stale token cannot claim a role with an unlinked phone',
+    () =>
+      invoke(
+        registerUserRole,
+        { role: 'owner', challenge: '' },
+        'stale-role-user',
+        {
+          email: '',
+          email_verified: false,
+          phone_number: '+919876543219',
+          phone_number_verified: true,
+          firebase: {
+            identities: { phone: ['+919876543219'] },
+            sign_in_provider: 'phone',
+          },
+        },
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the stale phone did not claim a role',
+    (await db.collection('users').doc('stale-role-user').get()).get('roleClaimed'),
+    false,
+  );
+
+  // The idempotent role-publication retry must reconcile the cached phone as
+  // well. Otherwise the missing Auth claim would provide a convenient way to
+  // preserve a phone which had already been unlinked.
+  await reset();
+  await db.collection('users').doc('stale-completed-user').set({
+    uid: 'stale-completed-user',
+    role: 'student',
+    roleClaimed: true,
+    roleRevision: 0,
+    registrationCompleted: true,
+    isActive: true,
+    email: 'stale-completed-user@example.test',
+    emailVerified: true,
+    phone: '+919876543219',
+    phoneVerified: true,
+  });
+  const reconciled = await invoke(
+    registerUserRole,
+    { role: 'student', challenge: '' },
+    'stale-completed-user',
+    {
+      email: 'stale-completed-user@example.test',
+      email_verified: true,
+      phone_number: '+919876543219',
+      phone_number_verified: true,
+      firebase: {
+        identities: { phone: ['+919876543219'] },
+        sign_in_provider: 'phone',
+      },
+    },
+  );
+  check('the idempotent role retry succeeds', reconciled.success, true);
+  check(
+    'the idempotent role retry revokes an unlinked phone',
+    (await db.collection('users').doc('stale-completed-user').get()).get('phoneVerified'),
+    false,
+  );
+  check(
+    'the idempotent role retry removes the unlinked phone',
+    (await db.collection('users').doc('stale-completed-user').get()).get('phone'),
+    null,
+  );
+
+  // A legacy profile may contain a stale verified address. The live Auth
+  // record is authoritative, so an idempotent registration retry must not
+  // preserve that address after Auth removed or replaced it.
+  await reset();
+  await db.collection('users').doc('stale-profile-email-user').set({
+    uid: 'stale-profile-email-user',
+    role: 'student',
+    roleClaimed: true,
+    roleRevision: 0,
+    registrationCompleted: true,
+    isActive: true,
+    email: 'removed-profile@example.test',
+    emailVerified: true,
+    emailVerifiedAt: firestore.Timestamp.now(),
+    phone: null,
+    phoneVerified: false,
+  });
+  const reconciledEmail = await invoke(
+    registerUserRole,
+    { role: 'student', challenge: '' },
+    'stale-profile-email-user',
+    {
+      email: 'removed-profile@example.test',
+      email_verified: true,
+    },
+  );
+  check('the idempotent email reconciliation succeeds', reconciledEmail.success, true);
+  const reconciledEmailProfile = await db
+    .collection('users')
+    .doc('stale-profile-email-user')
+    .get();
+  check(
+    'the removed live email is not preserved on the profile',
+    reconciledEmailProfile.get('email'),
+    '',
+  );
+  check(
+    'the removed live email is no longer marked verified',
+    reconciledEmailProfile.get('emailVerified'),
+    false,
+  );
+
+  // The same rule applies to an email claim: only the live Auth record may
+  // establish that the address is currently verified.
+  await reset();
+  await db.collection('users').doc('stale-email-user').set({
+    uid: 'stale-email-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    email: 'stale-email-user@example.test',
+    emailVerified: false,
+  });
+  await expectDenied(
+    'a stale token cannot complete registration with an unverified live email',
+    () =>
+      invoke(
+        completeRegistration,
+        { name: 'Stale Email User', role: 'student' },
+        'stale-email-user',
+        {
+          email: 'stale-email-user@example.test',
+          email_verified: true,
+        },
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the stale email claim did not complete the registration',
+    (await db.collection('users').doc('stale-email-user').get()).get('registrationCompleted'),
+    false,
+  );
+
+  // An Auth lookup failure is not proof of a verified contact. Registration
+  // must fail closed instead of falling back to the signed token.
+  await reset();
+  await db.collection('users').doc('auth-failure-user').set({
+    uid: 'auth-failure-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+  });
+  const liveGetter = auth.getUser;
+  auth.getUser = async () => {
+    throw new Error('simulated Auth lookup failure');
+  };
+  try {
+    await expectDenied(
+      'a live Auth lookup failure does not complete registration',
+      () =>
+        invoke(
+          completeRegistration,
+          { name: 'Auth Failure User', role: 'student' },
+          'auth-failure-user',
+          {
+            email: '',
+            email_verified: false,
+            phone_number: '+919876543219',
+            phone_number_verified: true,
+          },
+        ),
+      'internal',
+    );
+  } finally {
+    auth.getUser = liveGetter;
+  }
+  check(
+    'the Auth lookup failure did not complete the registration',
+    (await db.collection('users').doc('auth-failure-user').get()).get('registrationCompleted'),
+    false,
+  );
+  } finally {
+    auth.setCustomUserClaims = originalSetClaims;
+    auth.getUser = originalGetUser;
+  }
+}
+
+async function testAuthProfileSyncAndEmailLink() {
+  section('Auth profile synchronisation and later email linking are server-owned');
+
+  const originalGetUser = auth.getUser;
+  const originalUpdateUser = auth.updateUser;
+  const authState = {
+    uid: 'sync-user',
+    email: null,
+    emailVerified: false,
+    phoneNumber: '+919876543211',
+    providerData: [{ providerId: 'phone' }],
+  };
+  let updateProperties = null;
+  let failNextAuthUpdate = true;
+  auth.getUser = async () => ({ ...authState });
+  auth.updateUser = async (uid, properties) => {
+    updateProperties = { uid, properties };
+    if (failNextAuthUpdate) {
+      failNextAuthUpdate = false;
+      throw new Error('simulated transient Auth update failure');
+    }
+    authState.email = properties.email;
+    authState.emailVerified = properties.emailVerified;
+    return { ...authState };
+  };
+
+  try {
+    await reset();
+  await db.collection('users').doc('sync-user').set({
+    uid: 'sync-user',
+    role: 'student',
+    registrationCompleted: true,
+    isActive: true,
+    name: 'Sync User',
+    email: '',
+    emailVerified: false,
+    phone: null,
+    phoneVerified: false,
+  });
+  const synced = await invoke(
+    syncAuthProfile,
+    {},
+    'sync-user',
+    {
+      email: '',
+      email_verified: false,
+      phone_number: '+919876543211',
+      phone_number_verified: true,
+      firebase: {
+        identities: { phone: ['+919876543211'] },
+        sign_in_provider: 'phone',
+      },
+    },
+  );
+  check('the Auth profile sync succeeds', synced.success, true);
+  check(
+    'the signed phone claim is copied to the profile',
+    (await db.collection('users').doc('sync-user').get()).get('phoneVerified'),
+    true,
+  );
+
+  // Simulate a phone provider which was unlinked after the ID token was
+  // issued. The old token is still cryptographically valid and still carries
+  // the phone, but the live Auth record does not. The server must revoke the
+  // stale verified-phone grant instead of preserving it.
+  authState.phoneNumber = null;
+  authState.providerData = [{ providerId: 'password' }];
+  const revoked = await invoke(
+    syncAuthProfile,
+    {},
+    'sync-user',
+    {
+      email: '',
+      email_verified: false,
+      phone_number: '+919876543211',
+      phone_number_verified: true,
+      firebase: {
+        identities: { phone: ['+919876543211'] },
+        sign_in_provider: 'phone',
+      },
+    },
+  );
+  check('the profile sync accepts the live Auth state', revoked.success, true);
+  check(
+    'an unlinked phone is no longer verified on the profile',
+    (await db.collection('users').doc('sync-user').get()).get('phoneVerified'),
+    false,
+  );
+  check(
+    'an unlinked phone is removed from the profile',
+    (await db.collection('users').doc('sync-user').get()).get('phone'),
+    null,
+  );
+
+  // Restore the phone for the separate email-linking regression below.
+  authState.phoneNumber = '+919876543211';
+  authState.providerData = [{ providerId: 'phone' }];
+  await invoke(
+    syncAuthProfile,
+    {},
+    'sync-user',
+    {
+      email: '',
+      email_verified: false,
+      phone_number: '+919876543211',
+      phone_number_verified: true,
+      firebase: {
+        identities: { phone: ['+919876543211'] },
+        sign_in_provider: 'phone',
+      },
+    },
+  );
+
+  // The live Auth record is authoritative for the address as well as its
+  // verification flag. A removed or replaced address must not survive in the
+  // profile merely because an older copy was marked verified.
+  await db.collection('users').doc('sync-user').set({
+    email: 'removed@example.test',
+    emailVerified: true,
+  }, { merge: true });
+  authState.email = 'replacement@example.test';
+  authState.emailVerified = false;
+  const replacedEmail = await invoke(
+    syncAuthProfile,
+    {},
+    'sync-user',
+    {
+      email: 'removed@example.test',
+      email_verified: true,
+    },
+  );
+  check('the live email replacement is synchronised', replacedEmail.success, true);
+  const replacedProfile = await db.collection('users').doc('sync-user').get();
+  check(
+    'the profile contains the live replacement address',
+    replacedProfile.get('email'),
+    'replacement@example.test',
+  );
+  check(
+    'the replaced address is not marked verified by the stale profile',
+    replacedProfile.get('emailVerified'),
+    false,
+  );
+
+  // Restore the phone-only state for the separate email-linking regression.
+  authState.email = null;
+  authState.emailVerified = false;
+  await db.collection('users').doc('sync-user').set({
+    email: '',
+    emailVerified: false,
+  }, { merge: true });
+
+  const identifier = 'linked@example.test';
+  const challenge = 'linked-email-challenge';
+  await db.collection('otpCodes').doc(testOtpDocumentId('email', identifier)).set({
+    channel: 'email',
+    identifierHash: crypto
+      .createHash('sha256')
+      .update(identifier)
+      .digest('hex'),
+    verified: true,
+    verifiedByUid: 'sync-user',
+    challengeHash: crypto.createHash('sha256').update(challenge).digest('hex'),
+    challengeUsed: false,
+    challengeIssuedAt: firestore.Timestamp.now(),
+    challengeExpiresAt: firestore.Timestamp.fromMillis(Date.now() + 10 * 60 * 1000),
+  });
+
+    await expectDenied(
+      'a transient Auth failure does not discard the authorised link request',
+      () =>
+        invoke(
+          linkVerifiedEmail,
+          { email: identifier, challenge },
+          'sync-user',
+          { email: '', email_verified: false },
+        ),
+      'internal',
+    );
+    check(
+      'the authorised retry record survives the transient Auth failure',
+      (await db.collection('emailLinkOperations').get()).size,
+      1,
+    );
+    check(
+      'the consumed email proof is retained for the authorised retry',
+      (await db.collection('otpCodes').doc(testOtpDocumentId('email', identifier)).get()).get('challengeUsed'),
+      true,
+    );
+
+    const linked = await invoke(
+      linkVerifiedEmail,
+      { email: identifier, challenge },
+      'sync-user',
+      { email: '', email_verified: false },
+    );
+    check('the authorised email link retry succeeds', linked.success, true);
+    check(
+      'Firebase Auth receives the verified address',
+      updateProperties?.properties,
+      { email: identifier, emailVerified: true },
+    );
+    check(
+      'the linked email is copied to the profile',
+      (await db.collection('users').doc('sync-user').get()).get('emailVerified'),
+      true,
+    );
+    check(
+      'adding an email does not claim a password provider',
+      (await db.collection('users').doc('sync-user').get()).get('authProviders'),
+      ['phone'],
+    );
+
+    // Simulate the narrow cross-system failure window: Auth already contains
+    // the verified address, but the Firestore profile write was lost. The
+    // same authorised request must repair the profile without a new code.
+    await db.collection('users').doc('sync-user').set(
+      {
+        email: '',
+        emailVerified: false,
+      },
+      { merge: true },
+    );
+    const operationSnapshot = await db
+      .collection('emailLinkOperations')
+      .doc((await db.collection('emailLinkOperations').get()).docs[0].id)
+      .get();
+    await operationSnapshot.ref.set(
+      { status: 'authorised' },
+      { merge: true },
+    );
+    const recovered = await invoke(
+      linkVerifiedEmail,
+      { email: identifier, challenge },
+      'sync-user',
+      { email: '', email_verified: false },
+    );
+    check('the partial cross-system link is recoverable', recovered.success, true);
+    check(
+      'the recovered profile contains the verified email',
+      (await db.collection('users').doc('sync-user').get()).get('emailVerified'),
+      true,
+    );
+
+    // The durable retry window is finite even after the operation completed.
+    // Otherwise the consumed code could be replayed forever and restore an
+    // address which was subsequently removed from the live Auth account.
+    await operationSnapshot.ref.set(
+      {
+        status: 'complete',
+        expiresAt: firestore.Timestamp.fromMillis(Date.now() - 1000),
+      },
+      { merge: true },
+    );
+    authState.email = null;
+    authState.emailVerified = false;
+    await expectDenied(
+      'an expired email-link retry cannot restore the removed address',
+      () =>
+        invoke(
+          linkVerifiedEmail,
+          { email: identifier, challenge },
+          'sync-user',
+          { email: '', email_verified: false },
+        ),
+      'failed-precondition',
+    );
+    check(
+      'the expired retry did not restore the address in Firebase Auth',
+      authState.email,
+      null,
+    );
+  } finally {
+    auth.getUser = originalGetUser;
+    auth.updateUser = originalUpdateUser;
+  }
+}
+
+async function testConcurrentEmailLinksAreSerialized() {
+  section('concurrent different email links are serialised per account');
+
+  const originalGetUser = auth.getUser;
+  const originalUpdateUser = auth.updateUser;
+  const authState = {
+    email: null,
+    emailVerified: false,
+    phoneNumber: '+919876543213',
+    providerData: [{ providerId: 'phone' }],
+  };
+  auth.getUser = async (uid) => ({ uid, ...authState });
+  auth.updateUser = async (uid, properties) => {
+    // Keep the winning request inside the Auth/Firestore hand-off long
+    // enough for the other request to attempt the same account lock.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    authState.email = properties.email;
+    authState.emailVerified = properties.emailVerified;
+    return { uid, ...authState };
+  };
+
+  const firstEmail = 'first-concurrent@example.test';
+  const secondEmail = 'second-concurrent@example.test';
+  const firstChallenge = 'first-concurrent-challenge';
+  const secondChallenge = 'second-concurrent-challenge';
+
+  const seedChallenge = async (email, challenge) => {
+    await db.collection('otpCodes').doc(testOtpDocumentId('email', email)).set({
+      channel: 'email',
+      identifierHash: crypto
+        .createHash('sha256')
+        .update(email)
+        .digest('hex'),
+      verified: true,
+      verifiedByUid: 'concurrent-link-user',
+      challengeHash: crypto.createHash('sha256').update(challenge).digest('hex'),
+      challengeUsed: false,
+      challengeIssuedAt: firestore.Timestamp.now(),
+      challengeExpiresAt: firestore.Timestamp.fromMillis(Date.now() + 10 * 60 * 1000),
+    });
+  };
+
+  try {
+    await reset();
+    await db.collection('users').doc('concurrent-link-user').set({
+      uid: 'concurrent-link-user',
+      role: 'student',
+      roleClaimed: true,
+      registrationCompleted: true,
+      isActive: true,
+      email: '',
+      emailVerified: false,
+      phone: '+919876543213',
+      phoneVerified: true,
+      authProviders: ['phone'],
+    });
+    await seedChallenge(firstEmail, firstChallenge);
+    await seedChallenge(secondEmail, secondChallenge);
+
+    const results = await Promise.allSettled([
+      invoke(
+        linkVerifiedEmail,
+        { email: firstEmail, challenge: firstChallenge },
+        'concurrent-link-user',
+      ),
+      invoke(
+        linkVerifiedEmail,
+        { email: secondEmail, challenge: secondChallenge },
+        'concurrent-link-user',
+      ),
+    ]);
+    const fulfilled = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+    check('exactly one concurrent email link succeeds', fulfilled.length, 1);
+    check('the other concurrent email link is refused', rejected.length, 1);
+    check(
+      'the losing email link reports a precondition failure',
+      String(rejected[0]?.reason?.code || '').includes('failed-precondition'),
+      true,
+    );
+
+    const linkedProfile = await db
+      .collection('users')
+      .doc('concurrent-link-user')
+      .get();
+    check(
+      'the profile email matches the final live Auth email',
+      linkedProfile.get('email'),
+      authState.email,
+    );
+    check(
+      'the profile verification flag matches the final live Auth state',
+      linkedProfile.get('emailVerified'),
+      authState.emailVerified,
+    );
+    check(
+      'the profile contains the address which won the Auth update',
+      authState.email === firstEmail || authState.email === secondEmail,
+      true,
+    );
+
+    const losingEmail = authState.email === firstEmail ? secondEmail : firstEmail;
+    check(
+      'the rejected request did not consume its email proof',
+      (await db
+        .collection('otpCodes')
+        .doc(testOtpDocumentId('email', losingEmail))
+        .get()).get('challengeUsed'),
+      false,
+    );
+    check(
+      'the rejected request did not change the winning Auth address',
+      authState.email !== losingEmail,
+      true,
+    );
+    check(
+      'the winning request kept its consumed proof',
+      (await db
+        .collection('otpCodes')
+        .doc(
+          testOtpDocumentId(
+            'email',
+            authState.email === firstEmail ? firstEmail : secondEmail,
+          ),
+        )
+        .get()).get('challengeUsed'),
+      true,
+    );
+
+    const linkOperations = await db.collection('emailLinkOperations').get();
+    check(
+      'the successful request released its account lock',
+      linkOperations.docs.filter((doc) => doc.id.startsWith('lock_')).length,
+      0,
+    );
+    check(
+      'only the winning durable operation remains',
+      linkOperations.docs.filter((doc) => !doc.id.startsWith('lock_')).length,
+      1,
+    );
+    check(
+      'the rejected request did not create a second durable operation',
+      linkOperations.docs.filter(
+        (doc) =>
+          !doc.id.startsWith('lock_') &&
+          doc.get('email') === losingEmail,
+      ).length,
+      0,
+    );
+    check(
+      'the winning proof remains bound to the account',
+      (await db
+        .collection('otpCodes')
+        .doc(
+          testOtpDocumentId(
+            'email',
+            authState.email === firstEmail ? firstEmail : secondEmail,
+          ),
+        )
+        .get()).get('verifiedByUid'),
+      'concurrent-link-user',
+    );
+  } finally {
+    auth.getUser = originalGetUser;
+    auth.updateUser = originalUpdateUser;
+  }
+}
+
+async function testAdminMessagingAndReviewDeletion() {
+  section('administrators can message users and delete any review');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await seedUser('owner-1', 'owner');
+  // `sendAdminMessage` uses the same phone-verified tenant policy as every
+  // other service, so the fixture deliberately includes the proof.
+  await db.collection('users').doc('student-1').set({
+    ...profile('student-1', 'student'),
+    phoneVerified: true,
+  });
+
+  await expectDenied(
+    'a student cannot send an administrator message',
+    () =>
+      invoke(
+        sendAdminMessage,
+        {
+          userId: 'owner-1',
+          content: 'Pretend I am support',
+          requestId: 'forged-admin-message',
+        },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+
+  const sent = await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'Please update your room details.',
+      requestId: 'admin-message-test-1',
+    },
+    'admin-1',
+  );
+  check('the administrator message is stored', sent.success, true);
+  const adminMessage = await db
+    .collection('conversations')
+    .doc(sent.conversationId)
+    .collection('messages')
+    .doc(sent.messageId)
+    .get();
+  check(
+    'the server marks the message as sent by an administrator',
+    adminMessage.get('senderType'),
+    'admin',
+  );
+  check(
+    'the server marks the administrator as verified',
+    adminMessage.get('adminVerified'),
+    true,
+  );
+
+  const adminIdentity = adminSupportIdentityFor('admin-1');
+  const supportConversation = await db
+    .collection('conversations')
+    .doc(sent.conversationId)
+    .get();
+  check(
+    'the recipient-readable conversation uses the stable administrator tick',
+    supportConversation.get('participantIds'),
+    [adminIdentity, 'student-1'],
+  );
+  check(
+    'the recipient-readable conversation does not expose the administrator uid',
+    supportConversation.get('adminId'),
+    adminIdentity,
+  );
+  check(
+    'the support conversation contains no raw administrator uid',
+    JSON.stringify(supportConversation.data() || {}).includes('admin-1'),
+    false,
+  );
+  check(
+    'the recipient-readable message uses the stable administrator tick',
+    adminMessage.get('senderId'),
+    adminIdentity,
+  );
+  check(
+    'the recipient-readable message has no raw administrator uid',
+    JSON.stringify(adminMessage.data() || {}).includes('admin-1'),
+    false,
+  );
+
+  const adminOperation = await db
+    .collection('adminMessageNotificationOperations')
+    .doc(sent.messageId)
+    .get();
+  check(
+    'the server-only delivery operation keeps the administrator attribution',
+    adminOperation.get('sourceAuthorUid'),
+    'admin-1',
+  );
+  const conversationOperation = await db
+    .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+    .doc(sent.conversationId)
+    .get();
+  check(
+    'the server-only conversation operation keeps the administrator attribution',
+    conversationOperation.get('adminUid'),
+    'admin-1',
+  );
+  check(
+    'the server-only conversation operation keeps the opaque identity',
+    conversationOperation.get('adminIdentity'),
+    adminIdentity,
+  );
+  const conversationOperationRead = await readDocumentAsClient({
+    collection: ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+    documentId: sent.conversationId,
+    uid: 'admin-1',
+    claims: { admin: true },
+  });
+  check(
+    'an administrator client cannot read the conversation operation',
+    conversationOperationRead.status >= 400,
+    true,
+  );
+  check(
+    'the opaque administrator profile is stored outside the readable user directory',
+    (await db.collection('users').doc(adminIdentity).get()).exists,
+    true,
+  );
+  const identityProfileRead = await readDocumentAsClient({
+    collection: 'users',
+    documentId: adminIdentity,
+    uid: 'admin-1',
+    claims: { admin: true },
+  });
+  check(
+    'an administrator client cannot read the opaque support profile directly',
+    identityProfileRead.status >= 400,
+    true,
+  );
+  check(
+    'the opaque administrator profile is not a top-level user document',
+    (await db.collection('users').get()).docs.some(
+      (document) => document.id === adminIdentity,
+    ),
+    false,
+  );
+
+  // Support details must derive the administrator's live role from the real
+  // administrator profile. They must not depend on a readable synthetic
+  // profile which may be absent from a migrated conversation.
+  await db.collection('users').doc(adminIdentity).delete();
+  check(
+    'the synthetic administrator profile is absent for the tenant-support check',
+    (await db.collection('users').doc(adminIdentity).get()).exists,
+    false,
+  );
+
+  const supportDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId: sent.conversationId },
+    'student-1',
+  );
+  check(
+    'the tenant resolves the trusted support identity through the server',
+    supportDetails.peerId,
+    adminIdentity,
+  );
+  check(
+    'the tenant sees the administrator support conversation',
+    supportDetails.isAdminSupport,
+    true,
+  );
+
+  const administratorSupportDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId: sent.conversationId },
+    'admin-1',
+  );
+  check(
+    'the mapped administrator resolves the tenant peer',
+    administratorSupportDetails.peerId,
+    'student-1',
+  );
+  check(
+    'the mapped administrator sees the support conversation',
+    administratorSupportDetails.isAdminSupport,
+    true,
+  );
+
+  const administratorConversationRead = await readDocumentAsClient({
+    collection: 'conversations',
+    documentId: sent.conversationId,
+    uid: 'admin-1',
+    claims: { admin: true },
+  });
+  check(
+    'the mapped administrator can read the support conversation',
+    administratorConversationRead.status < 400,
+    true,
+  );
+  const administratorMessageRead = await readDocumentAsClient({
+    collection: `conversations/${sent.conversationId}/messages`,
+    documentId: sent.messageId,
+    uid: 'admin-1',
+    claims: { admin: true },
+  });
+  check(
+    'the mapped administrator can read the support messages',
+    administratorMessageRead.status < 400,
+    true,
+  );
+
+  const studentReplyId = 'student-support-reply';
+  await db
+    .collection('conversations')
+    .doc(sent.conversationId)
+    .collection('messages')
+    .doc(studentReplyId)
+    .set({
+      messageId: studentReplyId,
+      conversationId: sent.conversationId,
+      senderId: 'student-1',
+      receiverId: adminIdentity,
+      content: 'I have updated the room details.',
+      type: 'text',
+      createdAt: firestore.Timestamp.now(),
+      readAt: null,
+      roomId: '',
+      imageUrl: null,
+    });
+  await db.collection('users').doc('admin-1').update({
+    fcmToken: 'admin-support-device-token',
+  });
+  const supportPushes = [];
+  const supportMessagingGetter = messagingSdk.getMessaging;
+  messagingSdk.getMessaging = () => ({
+    send: async (message) => {
+      supportPushes.push(message);
+      return 'support-message-id';
+    },
+  });
+  let replyNotification;
+  try {
+    replyNotification = await invoke(
+      notifyUser,
+      {
+        userId: adminIdentity,
+        type: 'newMessage',
+        data: {
+          conversationId: sent.conversationId,
+          messageId: studentReplyId,
+        },
+      },
+      'student-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = supportMessagingGetter;
+  }
+  check('the support reply creates a notification', replyNotification.created, true);
+  const administratorReplyNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', 'admin-1')
+    .get();
+  check(
+    'the support reply notification is addressed to the real administrator',
+    administratorReplyNotifications.size,
+    1,
+  );
+  check(
+    'the support reply notification points at the support conversation',
+    administratorReplyNotifications.docs[0]?.get('data')?.conversationId,
+    sent.conversationId,
+  );
+  check(
+    'the support reply notification does not copy the private reply text',
+    String(administratorReplyNotifications.docs[0]?.get('body') || '').includes(
+      'I have updated the room details.',
+    ),
+    false,
+  );
+  check(
+    'the support reply notification uses a generic administrator prompt',
+    administratorReplyNotifications.docs[0]?.get('body'),
+    'You have a new support reply.',
+  );
+  check('the support reply sends one device push', supportPushes.length, 1);
+  check(
+    'the support reply push does not copy the private reply text',
+    String(supportPushes[0]?.notification?.body || '').includes(
+      'I have updated the room details.',
+    ),
+    false,
+  );
+  check(
+    'the support reply push data does not copy the private reply text',
+    String(supportPushes[0]?.data?.body || '').includes(
+      'I have updated the room details.',
+    ),
+    false,
+  );
+  const syntheticReplyNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', adminIdentity)
+    .get();
+  check(
+    'the support reply does not notify the synthetic identity',
+    syntheticReplyNotifications.size,
+    0,
+  );
+
+  const retried = await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'Please update your room details.',
+      requestId: 'admin-message-test-1',
+    },
+    'admin-1',
+  );
+  check('the administrator message retry is idempotent', retried.alreadySent, true);
+  check(
+    'the administrator message retry did not create a duplicate',
+    (await db
+      .collection('conversations')
+      .doc(sent.conversationId)
+      .collection('messages')
+      .where('messageId', '==', sent.messageId)
+      .get()).size,
+    1,
+  );
+
+  await db.collection('roomReviews').doc('review-1').set({
+    reviewId: 'review-1',
+    reviewInstanceId: 'review-instance-1',
+    roomId: 'room-1',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    rating: 1,
+    comment: 'Moderate this review',
+  });
+  await expectDenied(
+    'a student cannot delete an arbitrary review',
+    () =>
+      invoke(
+        deleteAnyRoomReview,
+        {
+          reviewId: 'review-1',
+          expectedReviewInstanceId: 'review-instance-1',
+        },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  const deleted = await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId: 'review-1',
+      expectedReviewInstanceId: 'review-instance-1',
+    },
+    'admin-1',
+  );
+  check('the administrator deletes the review', deleted.success, true);
+  check(
+    'the deleted review no longer exists',
+    (await db.collection('roomReviews').doc('review-1').get()).exists,
+    false,
+  );
+  const firstAuditSnapshot = await db
+    .collection('reviewDeletionAudit')
+    .where('reviewId', '==', 'review-1')
+    .get();
+  check(
+    'the administrator moderation action is audited',
+    firstAuditSnapshot.docs[0]?.get('deletedByAdminId'),
+    'admin-1',
+  );
+  check(
+    'the first moderation event keeps its review lifecycle',
+    firstAuditSnapshot.docs[0]?.get('reviewInstanceId'),
+    'review-instance-1',
+  );
+  const deletedAgain = await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId: 'review-1',
+      expectedReviewInstanceId: 'review-instance-1',
+    },
+    'admin-1',
+  );
+  check('the administrator deletion retry is idempotent', deletedAgain.alreadyDeleted, true);
+  check(
+    'the idempotent retry does not create another audit event',
+    (await db.collection('reviewDeletionAudit').where('reviewId', '==', 'review-1').get()).size,
+    1,
+  );
+
+  // The deterministic review id can be used again after a moderation. The
+  // recreated review is a new lifecycle, so its later moderation must append
+  // a new event instead of overwriting the first administrator's history.
+  await seedUser('admin-2', 'admin');
+  await db.collection('roomReviews').doc('review-1').set({
+    reviewId: 'review-1',
+    reviewInstanceId: 'review-instance-2',
+    roomId: 'room-1',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    rating: 2,
+    comment: 'Recreated review',
+  });
+  const deletedAgainLifecycle = await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId: 'review-1',
+      expectedReviewInstanceId: 'review-instance-2',
+    },
+    'admin-2',
+  );
+  check(
+    'the recreated review can be deleted independently',
+    deletedAgainLifecycle.success,
+    true,
+  );
+  const auditEvents = await db
+    .collection('reviewDeletionAudit')
+    .where('reviewId', '==', 'review-1')
+    .get();
+  check('the recreated review has a separate audit event', auditEvents.size, 2);
+  const firstEvent = auditEvents.docs.find(
+    (event) => event.get('reviewInstanceId') === 'review-instance-1',
+  );
+  const secondEvent = auditEvents.docs.find(
+    (event) => event.get('reviewInstanceId') === 'review-instance-2',
+  );
+  check(
+    'the earlier moderation history is preserved',
+    firstEvent?.get('deletedByAdminId'),
+    'admin-1',
+  );
+  check(
+    'the later moderation is attributed to the second administrator',
+    secondEvent?.get('deletedByAdminId'),
+    'admin-2',
+  );
+  const retriedSecondLifecycle = await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId: 'review-1',
+      expectedReviewInstanceId: 'review-instance-2',
+    },
+    'admin-2',
+  );
+  check(
+    'the second lifecycle retry is idempotent',
+    retriedSecondLifecycle.alreadyDeleted,
+    true,
+  );
+  check(
+    'the second lifecycle retry does not append another event',
+    (await db.collection('reviewDeletionAudit').where('reviewId', '==', 'review-1').get()).size,
+    2,
+  );
+
+  // The raw administrator uid is not a conversation participant. The
+  // server-only conversation operation is therefore the durable mapping which
+  // lets the administrator's own account cleanup discover and remove the
+  // support channel.
+  await deleteUserConversations('admin-1');
+  check(
+    'administrator cleanup removed the opaque support conversation',
+    (await db.collection('conversations').doc(sent.conversationId).get()).exists,
+    false,
+  );
+  check(
+    'administrator cleanup removed the server-only conversation operation',
+    (await db
+      .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+      .doc(sent.conversationId)
+      .get()).exists,
+    false,
+  );
+  check(
+    'administrator cleanup removed the server-only delivery operation',
+    (await db
+      .collection('adminMessageNotificationOperations')
+      .doc(sent.messageId)
+      .get()).exists,
+    false,
+  );
+  check(
+    'administrator cleanup removed the recipient notification',
+    (await db
+      .collection('notifications')
+      .where('userId', '==', 'student-1')
+      .get()).size,
+    0,
+  );
+}
+
+async function testLegacyAdminSupportPrivacyMigration() {
+  section('legacy support conversations migrate without exposing the administrator uid');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+
+  const conversationId = 'ADMIN-LEGACY-SUPPORT';
+  await db.collection('conversations').doc(conversationId).set({
+    conversationId,
+    participantIds: ['admin-1', 'student-1'],
+    participantNames: {
+      'admin-1': 'Admin',
+      'student-1': 'Student',
+    },
+    conversationType: 'adminSupport',
+    adminId: 'admin-1',
+    adminVerified: true,
+    createdByServer: true,
+    roomId: '',
+    roomTitle: 'StayServe Support',
+    unreadCount: {
+      'admin-1': 1,
+      'student-1': 2,
+    },
+    createdAt: firestore.Timestamp.now(),
+    updatedAt: firestore.Timestamp.now(),
+  });
+  await db
+    .collection('conversations')
+    .doc(conversationId)
+    .collection('messages')
+    .doc('legacy-admin-message')
+    .set({
+      messageId: 'legacy-admin-message',
+      conversationId,
+      senderId: 'admin-1',
+      receiverId: 'student-1',
+      content: 'Legacy administrator support message.',
+      type: 'text',
+      senderType: 'admin',
+      adminVerified: true,
+      adminId: 'admin-1',
+      createdAt: firestore.Timestamp.now(),
+    });
+  await db
+    .collection('conversations')
+    .doc(conversationId)
+    .collection('messages')
+    .doc('legacy-student-reply')
+    .set({
+      messageId: 'legacy-student-reply',
+      conversationId,
+      senderId: 'student-1',
+      receiverId: 'admin-1',
+      content: 'Legacy student support reply.',
+      type: 'text',
+      createdAt: firestore.Timestamp.now(),
+    });
+
+  const legacyConversationRead = await readDocumentAsClient({
+    collection: 'conversations',
+    documentId: conversationId,
+    uid: 'student-1',
+    claims: { phone_number: '+919876500001' },
+  });
+  check(
+    'a tenant cannot directly read a legacy raw-uid support conversation',
+    legacyConversationRead.status >= 400,
+    true,
+  );
+  const legacyMessageRead = await readDocumentAsClient({
+    collection: `conversations/${conversationId}/messages`,
+    documentId: 'legacy-admin-message',
+    uid: 'student-1',
+    claims: { phone_number: '+919876500001' },
+  });
+  check(
+    'a tenant cannot directly read a legacy raw-uid support message',
+    legacyMessageRead.status >= 400,
+    true,
+  );
+
+  const tenantDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId },
+    'student-1',
+  );
+  check(
+    'the tenant receives the opaque administrator peer after migration',
+    tenantDetails.peerId,
+    adminSupportIdentityFor('admin-1'),
+  );
+  check(
+    'the tenant support response does not contain the raw administrator uid',
+    JSON.stringify(tenantDetails).includes('admin-1'),
+    false,
+  );
+
+  const migratedConversation = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .get();
+  check(
+    'the migrated support parent uses the opaque administrator identity',
+    migratedConversation.get('adminId'),
+    adminSupportIdentityFor('admin-1'),
+  );
+  check(
+    'the migrated support parent has no raw administrator uid',
+    JSON.stringify(migratedConversation.data() || {}).includes('admin-1'),
+    false,
+  );
+  const migratedMessages = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .collection('messages')
+    .get();
+  check(
+    'the migrated support messages have no raw administrator uid',
+    migratedMessages.docs.some((message) =>
+      JSON.stringify(message.data() || {}).includes('admin-1'),
+    ),
+    false,
+  );
+  const migratedOperation = await db
+    .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+    .doc(conversationId)
+    .get();
+  check(
+    'the server-only mapping keeps the legacy administrator attribution',
+    migratedOperation.get('adminUid'),
+    'admin-1',
+  );
+
+  const administratorDetails = await invoke(
+    getConversationInteractionDetails,
+    { conversationId },
+    'admin-1',
+  );
+  check(
+    'the mapped administrator resolves the tenant after migration',
+    administratorDetails.peerId,
+    'student-1',
+  );
+
+  const migratedConversationRead = await readDocumentAsClient({
+    collection: 'conversations',
+    documentId: conversationId,
+    uid: 'student-1',
+    claims: { phone_number: '+919876500001' },
+  });
+  check(
+    'the tenant can read the migrated opaque support conversation',
+    migratedConversationRead.status < 400,
+    true,
+  );
+  check(
+    'the tenant-visible migrated conversation contains no raw administrator uid',
+    JSON.stringify(migratedConversationRead.body || {}).includes('admin-1'),
+    false,
+  );
+  const migratedMessageRead = await readDocumentAsClient({
+    collection: `conversations/${conversationId}/messages`,
+    documentId: 'legacy-admin-message',
+    uid: 'student-1',
+    claims: { phone_number: '+919876500001' },
+  });
+  check(
+    'the tenant can read the migrated opaque support messages',
+    migratedMessageRead.status < 400,
+    true,
+  );
+  check(
+    'the tenant-visible migrated message contains no raw administrator uid',
+    JSON.stringify(migratedMessageRead.body || {}).includes('admin-1'),
+    false,
+  );
+}
+
+async function testReviewAndAdminMessagingEnforceLiveVerifiedPhone() {
+  section('review and support operations enforce the live verified phone');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await seedUser('owner-1', 'owner');
+  await seedRoom('RM-LIVE-PHONE', 'owner-1');
+  await seedRequest('JRQ-LIVE-PHONE', {
+    roomId: 'RM-LIVE-PHONE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'ownerConfirmed',
+  });
+
+  const originalGetUser = auth.getUser;
+  auth.getUser = async (uid) => ({
+    uid,
+    email: `${uid}@example.test`,
+    emailVerified: false,
+    // The administrator is exempt from the tenant phone policy. The student
+    // still has a stale Firestore grant, but Firebase Auth no longer has the
+    // phone provider. The owner has a live phone.
+    phoneNumber:
+      uid === 'admin-1' || uid === 'student-1'
+        ? null
+        : '+919876500001',
+    providerData: [{ providerId: 'password' }],
+  });
+
+  try {
+    await expectDenied(
+      'a tenant with an unlinked live phone cannot read room reviews',
+      () =>
+        invoke(
+          getRoomReviews,
+          { roomId: 'RM-LIVE-PHONE' },
+          'student-1',
+        ),
+      'permission-denied',
+    );
+    await expectDenied(
+      'a tenant with an unlinked live phone cannot submit a review',
+      () =>
+        invoke(
+          submitRoomReview,
+          {
+            roomId: 'RM-LIVE-PHONE',
+            rating: 5,
+            comment: 'This review must not be stored.',
+          },
+          'student-1',
+        ),
+      'permission-denied',
+    );
+    check(
+      'the rejected review was not stored',
+      (await db
+        .collection('roomReviews')
+        .where('roomId', '==', 'RM-LIVE-PHONE')
+        .get()).size,
+      0,
+    );
+    check(
+      'the stale cached phone grant was revoked',
+      (await db.collection('users').doc('student-1').get()).get('phoneVerified'),
+      false,
+    );
+
+    await expectDenied(
+      'an administrator cannot send support data to a tenant without a live phone',
+      () =>
+        invoke(
+          sendAdminMessage,
+          {
+            userId: 'student-1',
+            content: 'This support message must not be stored.',
+            requestId: 'live-phone-rejected-message',
+          },
+          'admin-1',
+        ),
+      'permission-denied',
+    );
+    check(
+      'the rejected support message was not stored',
+      (await db.collection('conversations').get()).size,
+      0,
+    );
+    check(
+      'the rejected support message left no delivery operation',
+      (await db.collection('adminMessageNotificationOperations').get()).size,
+      0,
+    );
+
+    const accepted = await invoke(
+      sendAdminMessage,
+      {
+        userId: 'owner-1',
+        content: 'A support message for a live tenant.',
+        requestId: 'live-phone-accepted-message',
+      },
+      'admin-1',
+    );
+    check(
+      'an administrator without a tenant phone can message a live tenant',
+      accepted.success,
+      true,
+    );
+  } finally {
+    auth.getUser = originalGetUser;
+  }
+}
+
+async function testDurableAdminNotificationsAndReviewLifecyclePrivacy() {
+  section('administrator notifications and review lifecycles are durable and private');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('admin-2', 'admin');
+  await seedUser('student-1', 'student');
+  await seedUser('student-2', 'student');
+  await seedUser('owner-1', 'owner');
+  await seedRoom('RM-PRIVATE', 'owner-1');
+  await seedRequest('JRQ-PRIVATE', {
+    roomId: 'RM-PRIVATE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'ownerConfirmed',
+  });
+
+  const reviewId = 'REV-RM-PRIVATE-student-1';
+  await db.collection('roomReviews').doc(reviewId).set({
+    reviewId,
+    reviewInstanceId: 'review-lifecycle-1',
+    roomId: 'RM-PRIVATE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    rating: 1,
+    comment: 'Private review text',
+    studentName: 'Alice',
+    createdAt: firestore.Timestamp.now(),
+    updatedAt: firestore.Timestamp.now(),
+  });
+  await db.collection('users').doc('student-1').update({ name: 'Alice' });
+
+  // Model the notification and attribution created for the original 1/5
+  // review. The edit must update this deterministic copy in place.
+  const deterministicReviewNotificationId = reviewNotificationId(
+    reviewId,
+    'review-lifecycle-1',
+    'owner-1',
+  );
+  const originalReviewNotificationCreatedAt = firestore.Timestamp.now();
+  await db
+    .collection('notifications')
+    .doc(deterministicReviewNotificationId)
+    .set({
+      userId: 'owner-1',
+      title: 'New review',
+      body: 'Alice rated your room 1/5',
+      type: 'review',
+      data: { roomId: 'RM-PRIVATE' },
+      read: false,
+      createdAt: originalReviewNotificationCreatedAt,
+    });
+  await db
+    .collection('notificationAttributions')
+    .doc(deterministicReviewNotificationId)
+    .set({
+      notificationId: deterministicReviewNotificationId,
+      userId: 'owner-1',
+      sourceType: 'roomReview',
+      sourceAuthorUid: 'student-1',
+      sourceRecipientUid: 'owner-1',
+      sourceId: 'review-lifecycle-1',
+      sourceReviewId: reviewId,
+      createdAt: firestore.Timestamp.now(),
+      updatedAt: firestore.Timestamp.now(),
+    });
+
+  const unrelatedStudentView = await invoke(
+    getRoomReviews,
+    { roomId: 'RM-PRIVATE' },
+    'student-2',
+  );
+  const unrelatedReview = unrelatedStudentView.reviews?.[0] || {};
+  check(
+    'an unrelated tenant cannot read the reviewer uid',
+    unrelatedReview.studentId,
+    '',
+  );
+  check(
+    'an unrelated tenant sees an anonymized reviewer',
+    unrelatedReview.studentName,
+    'A student',
+  );
+  check(
+    'an unrelated tenant receives an opaque review id',
+    unrelatedReview.reviewId?.startsWith('PUBLIC-'),
+    true,
+  );
+
+  const ownerView = await invoke(
+    getRoomReviews,
+    { roomId: 'RM-PRIVATE' },
+    'owner-1',
+  );
+  check(
+    'the room owner can identify the reviewer for moderation',
+    ownerView.reviews?.[0]?.studentId,
+    'student-1',
+  );
+  const adminView = await invoke(
+    getRoomReviews,
+    { roomId: 'RM-PRIVATE' },
+    'admin-1',
+  );
+  check(
+    'an administrator can identify the reviewer for moderation',
+    adminView.reviews?.[0]?.studentId,
+    'student-1',
+  );
+
+  await expectDenied(
+    'a delayed moderation request cannot delete another lifecycle',
+    () =>
+      invoke(
+        deleteAnyRoomReview,
+        {
+          reviewId,
+          expectedReviewInstanceId: 'review-lifecycle-2',
+        },
+        'admin-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the mismatched moderation request kept the current review',
+    (await db.collection('roomReviews').doc(reviewId).get()).exists,
+    true,
+  );
+
+  const edited = await invoke(
+    submitRoomReview,
+    {
+      roomId: 'RM-PRIVATE',
+      rating: 5,
+      comment: 'Updated private review text',
+      expectedReviewInstanceId: 'review-lifecycle-1',
+    },
+    'student-1',
+  );
+  check(
+    'the student edit keeps the expected lifecycle',
+    edited.reviewInstanceId,
+    'review-lifecycle-1',
+  );
+
+  const reviewNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', 'owner-1')
+    .get();
+  check(
+    'the review owner receives one notification',
+    reviewNotifications.size,
+    1,
+  );
+  check(
+    'the edited review keeps the deterministic notification id',
+    reviewNotifications.docs[0]?.id,
+    deterministicReviewNotificationId,
+  );
+  check(
+    'the edited review notification contains the current rating',
+    reviewNotifications.docs[0]?.get('body'),
+    'Alice rated your room 5/5',
+  );
+  check(
+    'the edited review notification keeps its original creation time',
+    reviewNotifications.docs[0]?.get('createdAt')?.toMillis(),
+    originalReviewNotificationCreatedAt.toMillis(),
+  );
+  check(
+    'the review notification does not persist the comment',
+    String(reviewNotifications.docs[0]?.get('body') || '').includes(
+      'Updated private review text',
+    ),
+    false,
+  );
+  const reviewAttributions = await db
+    .collection('notificationAttributions')
+    .where('sourceReviewId', '==', reviewId)
+    .get();
+  check(
+    'the review notification has server-only attribution',
+    reviewAttributions.size,
+    1,
+  );
+  check(
+    'the review attribution names the reviewer author',
+    reviewAttributions.docs[0]?.get('sourceAuthorUid'),
+    'student-1',
+  );
+  check(
+    'the edited review attribution keeps the same lifecycle',
+    reviewAttributions.docs[0]?.get('sourceId'),
+    'review-lifecycle-1',
+  );
+
+  await db.collection('notifications').doc('legacy-review-notification').set({
+    userId: 'owner-1',
+    title: 'New review',
+    body: 'Private review text',
+    type: 'review',
+    data: { roomId: 'RM-PRIVATE', reviewId },
+    read: false,
+  });
+  await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId,
+      expectedReviewInstanceId: 'review-lifecycle-1',
+    },
+    'admin-1',
+  );
+  check(
+    'moderation removes a legacy notification copy of the review',
+    (await db
+      .collection('notifications')
+      .doc('legacy-review-notification')
+      .get()).exists,
+    false,
+  );
+  check(
+    'moderation removes the attributable review notification',
+    (await db
+      .collection('notifications')
+      .where('userId', '==', 'owner-1')
+      .get()).size,
+    0,
+  );
+  check(
+    'moderation removes the server-only review attribution',
+    (await db
+      .collection('notificationAttributions')
+      .where('sourceReviewId', '==', reviewId)
+      .get()).size,
+    0,
+  );
+
+  await expectDenied(
+    'a delayed student edit cannot resurrect a moderated review',
+    () =>
+      invoke(
+        submitRoomReview,
+        {
+          roomId: 'RM-PRIVATE',
+          rating: 4,
+          comment: 'Late resurrection',
+          expectedReviewInstanceId: 'review-lifecycle-1',
+        },
+        'student-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the delayed edit did not recreate the review',
+    (await db.collection('roomReviews').doc(reviewId).get()).exists,
+    false,
+  );
+
+  // Recreate the review as a new lifecycle. A retry for the old lifecycle
+  // remains idempotent, but it must not delete or report success for the new
+  // one.
+  await db.collection('roomReviews').doc(reviewId).set({
+    reviewId,
+    reviewInstanceId: 'review-lifecycle-2',
+    roomId: 'RM-PRIVATE',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    rating: 3,
+    comment: 'New lifecycle',
+    studentName: 'Alice',
+    createdAt: firestore.Timestamp.now(),
+    updatedAt: firestore.Timestamp.now(),
+  });
+  const oldLifecycleRetry = await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId,
+      expectedReviewInstanceId: 'review-lifecycle-1',
+    },
+    'admin-2',
+  );
+  check(
+    'a historical lifecycle retry is idempotent for another administrator',
+    oldLifecycleRetry.alreadyDeleted,
+    true,
+  );
+  check(
+    'the historical retry did not delete the recreated review',
+    (await db.collection('roomReviews').doc(reviewId).get()).exists,
+    true,
+  );
+  await invoke(
+    deleteAnyRoomReview,
+    {
+      reviewId,
+      expectedReviewInstanceId: 'review-lifecycle-2',
+    },
+    'admin-2',
+  );
+  check(
+    'each review lifecycle keeps its own moderation state',
+    (await db
+      .collection('reviewDeletionState')
+      .where('reviewId', '==', reviewId)
+      .get()).size,
+    2,
+  );
+
+  // The administrator message notification is deterministic and contains no
+  // copy of the private support text.
+  await db
+    .collection('users')
+    .doc('student-1')
+    .update({ fcmToken: 'device-token-1' });
+  const originalGetMessaging = messagingSdk.getMessaging;
+  const pushes = [];
+  let failPush = true;
+  messagingSdk.getMessaging = () => ({
+    send: async (message) => {
+      if (failPush) throw new Error('simulated FCM failure');
+      pushes.push(message);
+      return 'message-id';
+    },
+  });
+  let sent;
+  try {
+    sent = await invoke(
+      sendAdminMessage,
+      {
+        userId: 'student-1',
+        content: 'This private support text must not be copied.',
+        requestId: 'durable-admin-message-1',
+      },
+      'admin-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = originalGetMessaging;
+  }
+  check('the administrator message is stored', sent.success, true);
+  const operationId = sent.messageId;
+  const operationRef = db
+    .collection('adminMessageNotificationOperations')
+    .doc(operationId);
+  const operation = await operationRef.get();
+  check(
+    'the delivery operation attributes the administrator author',
+    operation.get('sourceAuthorUid'),
+    'admin-1',
+  );
+  check(
+    'the delivery operation keeps the push retryable',
+    operation.get('pushDeliveryState'),
+    'pending',
+  );
+  const adminNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', 'student-1')
+    .get();
+  check(
+    'the recipient gets one in-app administrator notification',
+    adminNotifications.size,
+    1,
+  );
+  check(
+    'the administrator notification does not copy the message text',
+    String(adminNotifications.docs[0]?.get('body') || '').includes(
+      'This private support text must not be copied.',
+    ),
+    false,
+  );
+
+  // Simulate a failed in-app delivery. Retrying the original request must
+  // repair the deterministic notification without duplicating the message.
+  const notificationId = operation.get('notificationId');
+  await db.collection('notifications').doc(notificationId).delete();
+  await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'This private support text must not be copied.',
+      requestId: 'durable-admin-message-1',
+    },
+    'admin-1',
+  );
+  check(
+    'the idempotent retry repairs the missing in-app notification',
+    (await db.collection('notifications').doc(notificationId).get()).exists,
+    true,
+  );
+  check(
+    'the notification repair did not duplicate the message',
+    (await db
+      .collection('conversations')
+      .doc(sent.conversationId)
+      .collection('messages')
+      .get()).size,
+    1,
+  );
+
+  // A failed FCM delivery is also repairable by the same request id.
+  failPush = false;
+  messagingSdk.getMessaging = () => ({
+    send: async (message) => {
+      pushes.push(message);
+      return 'message-id';
+    },
+  });
+  try {
+    await invoke(
+      sendAdminMessage,
+      {
+        userId: 'student-1',
+        content: 'This private support text must not be copied.',
+        requestId: 'durable-admin-message-1',
+      },
+      'admin-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = originalGetMessaging;
+  }
+  check('the FCM retry delivered one device push', pushes.length, 1);
+  check(
+    'the durable operation records the successful push',
+    (await operationRef.get()).get('pushDeliveryState'),
+    'delivered',
+  );
+
+  // A delayed retry cannot recreate a notification after the administrator
+  // has been fenced.
+  await db.collection('notifications').doc(notificationId).delete();
+  await db.collection('users').doc('admin-1').update({ isActive: false });
+  await expectDenied(
+    'a fenced administrator cannot retry the delayed message',
+    () =>
+      invoke(
+        sendAdminMessage,
+        {
+          userId: 'student-1',
+          content: 'This private support text must not be copied.',
+          requestId: 'durable-admin-message-1',
+        },
+        'admin-1',
+      ),
+    'permission-denied',
+  );
+  check(
+    'a fenced administrator cannot recreate a delayed notification',
+    (await db.collection('notifications').doc(notificationId).get()).exists,
+    false,
+  );
+  await db.collection('users').doc('admin-1').update({ isActive: true });
+
+  // Account cleanup removes notification copies attributed to the deleted
+  // author, including copies addressed to somebody else.
+  await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'A second support message.',
+      requestId: 'durable-admin-message-2',
+    },
+    'admin-1',
+  );
+  const secondNotification = await db
+    .collection('notifications')
+    .where('userId', '==', 'student-1')
+    .get();
+  check(
+    'the second administrator message has a recipient notification',
+    secondNotification.size,
+    1,
+  );
+  await deleteAttributedNotificationsForUser('admin-1');
+  check(
+    'account cleanup removes a notification attributed to the author',
+    (await db
+      .collection('notifications')
+      .where('userId', '==', 'student-1')
+      .get()).size,
+    0,
+  );
+  check(
+    'account cleanup removes the administrator delivery operation',
+    (await db
+      .collection('adminMessageNotificationOperations')
+      .where('sourceAuthorUid', '==', 'admin-1')
+      .get()).size,
+    0,
+  );
+}
+
+async function testUserProfileBootstrapRepairsMalformedFcmDocument() {
+  section('the Auth bootstrap repairs a malformed FCM-only profile');
+
+  await reset();
+  const profileRef = db.collection('users').doc('bootstrap-user');
+  await profileRef.set({
+    fcmToken: 'device-token',
+    updatedAt: firestore.Timestamp.now(),
+  });
+
+  const result = await ensureUserProfile({
+    uid: 'bootstrap-user',
+    displayName: 'Bootstrap User',
+    email: 'bootstrap@example.test',
+    emailVerified: true,
+    phoneNumber: '+919876500001',
+    providerData: [{ providerId: 'google.com' }, { providerId: 'phone' }],
+  });
+  const profile = await profileRef.get();
+
+  check('the malformed profile was repaired', result, 'repaired');
+  check('the repaired profile has the account uid', profile.get('uid'), 'bootstrap-user');
+  check('the repaired profile has a display name', profile.get('name'), 'Bootstrap User');
+  check(
+    'the repaired profile has the live email',
+    profile.get('email'),
+    'bootstrap@example.test',
+  );
+  check(
+    'the repaired profile has the live verification state',
+    profile.get('emailVerified'),
+    true,
+  );
+  check(
+    'the repaired profile has the live phone',
+    profile.get('phone'),
+    '+919876500001',
+  );
+  check(
+    'the repaired profile has the live phone verification state',
+    profile.get('phoneVerified'),
+    true,
+  );
+  check('the repaired profile has the live providers', profile.get('authProviders'), [
+    'google.com',
+    'phone',
+  ]);
+  check('the repaired profile has the default role', profile.get('role'), 'student');
+  check(
+    'the repaired profile has an explicit unclaimed role marker',
+    profile.get('roleClaimed'),
+    false,
+  );
+  check(
+    'the repaired profile has an explicit inactive-state marker',
+    profile.get('isActive'),
+    true,
+  );
+  check(
+    'the repaired profile has an explicit registration marker',
+    profile.get('registrationCompleted'),
+    false,
+  );
+  check('the repaired profile kept the FCM token', profile.get('fcmToken'), 'device-token');
+  check('the repaired profile has a creation timestamp', profile.get('createdAt') !== undefined, true);
+
+  const retryResult = await ensureUserProfile({
+    uid: 'bootstrap-user',
+    displayName: 'Bootstrap User',
+    email: 'bootstrap@example.test',
+    emailVerified: true,
+    phoneNumber: '+919876500001',
+    providerData: [{ providerId: 'google.com' }, { providerId: 'phone' }],
+  });
+  check('a trigger retry preserves the complete profile', retryResult, 'preserved');
+
+  const forgedAdminRef = db.collection('users').doc('forged-admin');
+  await forgedAdminRef.set({
+    fcmToken: 'another-token',
+    role: 'admin',
+    roleClaimed: true,
+  });
+  await ensureUserProfile({
+    uid: 'forged-admin',
+    email: 'forged@example.test',
+    emailVerified: false,
+    phoneNumber: null,
+    providerData: [{ providerId: 'password' }],
+  });
+  const forgedAdmin = await forgedAdminRef.get();
+  check(
+    'a client-written admin role is not preserved',
+    forgedAdmin.get('role'),
+    'student',
+  );
+  check(
+    'a client-written admin role is not treated as claimed',
+    forgedAdmin.get('roleClaimed'),
+    false,
+  );
+  check(
+    'a client-written admin role does not complete registration',
+    forgedAdmin.get('registrationCompleted'),
+    false,
+  );
+}
+
+async function testIncompleteRegistrationRollback() {
+  section('an incomplete registration can be rolled back safely');
+
+  await reset();
+  await db.collection('users').doc('incomplete-user').set({
+    uid: 'incomplete-user',
+    role: 'student',
+    roleClaimed: false,
+    registrationCompleted: false,
+    isActive: true,
+    createdAt: firestore.Timestamp.now(),
+  });
+  await db.collection('users').doc('complete-user').set({
+    uid: 'complete-user',
+    role: 'student',
+    roleClaimed: true,
+    registrationCompleted: true,
+    isActive: true,
+    createdAt: firestore.Timestamp.now(),
+  });
+
+  const originalDeleteUser = auth.deleteUser;
+  const deletedUids = [];
+  auth.deleteUser = async (uid) => {
+    deletedUids.push(uid);
+  };
+  try {
+    await expectDenied(
+      'a rollback cannot target a different account',
+      () =>
+        invoke(
+          rollbackIncompleteRegistration,
+          { uid: 'another-user' },
+          'incomplete-user',
+        ),
+      'failed-precondition',
+    );
+    check(
+      'the mismatched rollback did not delete an Auth account',
+      deletedUids,
+      [],
+    );
+
+    const rolledBack = await invoke(
+      rollbackIncompleteRegistration,
+      { uid: 'incomplete-user' },
+      'incomplete-user',
+    );
+    check('the incomplete account was rolled back', rolledBack.rolledBack, true);
+    check(
+      'the rollback deleted only the incomplete Auth account',
+      deletedUids,
+      ['incomplete-user'],
+    );
+    check(
+      'the rollback left a durable server-only marker',
+      (await db
+        .collection('registrationRollbackOperations')
+        .doc('incomplete-user')
+        .get()).get('status'),
+      'authDeleted',
+    );
+
+    const completed = await invoke(
+      rollbackIncompleteRegistration,
+      { uid: 'complete-user' },
+      'complete-user',
+    );
+    check('a committed registration is not rolled back', completed.rolledBack, false);
+    check(
+      'the committed Auth account was kept',
+      deletedUids,
+      ['incomplete-user'],
+    );
+    check(
+      'the committed registration was reported as complete',
+      completed.registrationCompleted,
+      true,
+    );
+  } finally {
+    auth.deleteUser = originalDeleteUser;
+  }
+
+  // A rollback marker which wins the race prevents the registration
+  // transaction from committing the account afterwards.
+  await db.collection('users').doc('race-user').set({
+    uid: 'race-user',
+    role: 'student',
+    roleClaimed: false,
+    registrationCompleted: false,
+    isActive: true,
+    createdAt: firestore.Timestamp.now(),
+  });
+  await db.collection('registrationRollbackOperations').doc('race-user').set({
+    uid: 'race-user',
+    status: 'rollbackRequested',
+  });
+  const originalGetUser = auth.getUser;
+  auth.getUser = async (uid) => ({
+    uid,
+    email: null,
+    emailVerified: false,
+    phoneNumber: '+919876500001',
+    providerData: [{ providerId: 'phone' }],
+  });
+  try {
+    await expectDenied(
+      'a rolled-back registration cannot complete afterwards',
+      () =>
+        invoke(
+          completeRegistration,
+          { name: 'Race User', role: 'student' },
+          'race-user',
+        ),
+      'failed-precondition',
+    );
+  } finally {
+    auth.getUser = originalGetUser;
+  }
+  check(
+    'the rolled-back profile did not become complete',
+    (await db.collection('users').doc('race-user').get()).get(
+      'registrationCompleted',
+    ),
+    false,
+  );
+}
+
 async function main() {
+  await testPhoneAndGoogleRegistrationIdentities();
+  await testUserProfileBootstrapRepairsMalformedFcmDocument();
+  await testAuthProfileSyncAndEmailLink();
+  await testConcurrentEmailLinksAreSerialized();
+  await testIncompleteRegistrationRollback();
+  await testAdminMessagingAndReviewDeletion();
+  await testLegacyAdminSupportPrivacyMigration();
+  await testReviewAndAdminMessagingEnforceLiveVerifiedPhone();
+  await testDurableAdminNotificationsAndReviewLifecyclePrivacy();
   await testInteractionMetadataUsesRealParticipantNames();
   await testInteractionMetadataChecksLiveRolesInTheTransaction();
   await testMalformedRequestApprovalReturnsAPreconditionError();
@@ -7631,6 +10666,8 @@ async function main() {
   await testConversationCreationIsServerVerified();
   await testConversationCleanupMarksBeforeDeletingMessages();
   await testAuthDeleteCleanupIsDurableAndRetryable();
+  await testAccountCleanupRemovesReviewNotificationDependents();
+  await testAccountDeletionPreservesPendingRegistrationRollback();
   await testAccountDeletionDoesNotEraseLiveBookings();
   await testAdminDeletionDistinguishesBlockedAndTransientFailures();
   await testScheduledCancellationAndClaimRace();

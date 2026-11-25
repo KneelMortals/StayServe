@@ -17,7 +17,6 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
   final _emailController = TextEditingController();
-  final _phoneController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
   bool _obscurePassword = true;
@@ -35,7 +34,6 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   void dispose() {
     _nameController.dispose();
     _emailController.dispose();
-    _phoneController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     super.dispose();
@@ -53,23 +51,54 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
 
     if (!mounted) return;
 
-    await ref.read(authControllerProvider.notifier).signUp(
-      email: _emailController.text.trim(),
-      password: _passwordController.text,
-      name: _nameController.text.trim(),
-      phone: _phoneController.text.trim(),
-      role: _selectedRole,
-      challenge: _emailChallenge,
-    );
+    final registration = await ref
+        .read(authControllerProvider.notifier)
+        .signUp(
+          email: _emailController.text.trim(),
+          password: _passwordController.text,
+          name: _nameController.text.trim(),
+          role: _selectedRole,
+          challenge: _emailChallenge,
+        );
 
     if (!mounted) return;
 
     final error = ref.read(authControllerProvider).error;
-    if (error == null) {
+    if (error == null && registration != null) {
       // The server already wrote the profile and attached the role claim
-      // during `completeRegistration` — nothing left to do here.
-      AppLogger.info('Registration completed for ${_emailController.text.trim()}');
+      // during `completeRegistration`. Route with the role and phone state
+      // which the server confirmed, rather than waiting for a possibly stale
+      // Firestore snapshot.
+      AppLogger.info(
+        'Registration completed for ${AppHelpers.maskEmail(_emailController.text.trim())}',
+      );
+      if (!registration.phoneVerified) {
+        context.go('/verify-phone');
+      } else if (registration.role == UserRole.owner.name) {
+        context.go('/owner/dashboard');
+      } else {
+        context.go('/student/home');
+      }
+      return;
     }
+
+    // The server may consume or reject the one-time verification challenge.
+    // A failed registration must never leave the screen in a state where a
+    // later attempt silently reuses that challenge. The user has to verify
+    // the address again before another registration can be attempted.
+    _invalidateEmailVerification();
+  }
+
+  Future<void> _continueWithGoogle() async {
+    await ref.read(authControllerProvider.notifier).signInWithGoogle();
+    if (!mounted) return;
+    if (ref.read(authControllerProvider).error == null) {
+      context.go('/role-selection');
+    }
+  }
+
+  void _continueWithPhone() {
+    context.go('/phone-auth');
   }
 
   Future<bool> _verifyEmail() async {
@@ -116,12 +145,11 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   /// to, so changing the address throws the verification away.
   void _invalidateEmailVerification() {
     if (!mounted) return;
-    if (_emailVerified) {
-      setState(() {
-        _emailVerified = false;
-        _emailChallenge = '';
-      });
-    }
+    if (!_emailVerified && _emailChallenge.isEmpty) return;
+    setState(() {
+      _emailVerified = false;
+      _emailChallenge = '';
+    });
   }
 
   @override
@@ -158,7 +186,9 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                         height: 80,
                         decoration: BoxDecoration(
                           color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(AppBorderRadius.xl),
+                          borderRadius: BorderRadius.circular(
+                            AppBorderRadius.xl,
+                          ),
                         ),
                         child: Icon(
                           Icons.home_outlined,
@@ -182,10 +212,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   ),
                 ),
                 const SizedBox(height: AppSpacing.xl),
-                Text(
-                  'I am a',
-                  style: theme.textTheme.labelLarge,
-                ),
+                Text('I am a', style: theme.textTheme.labelLarge),
                 const SizedBox(height: AppSpacing.sm),
                 Row(
                   children: [
@@ -196,7 +223,8 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                         subtitle: 'Looking for a room',
                         icon: Icons.school_outlined,
                         selected: _selectedRole == UserRole.student,
-                        onTap: () => setState(() => _selectedRole = UserRole.student),
+                        onTap: () =>
+                            setState(() => _selectedRole = UserRole.student),
                       ),
                     ),
                     const SizedBox(width: AppSpacing.md),
@@ -207,7 +235,8 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                         subtitle: 'Listing rooms for rent',
                         icon: Icons.apartment_outlined,
                         selected: _selectedRole == UserRole.owner,
-                        onTap: () => setState(() => _selectedRole = UserRole.owner),
+                        onTap: () =>
+                            setState(() => _selectedRole = UserRole.owner),
                       ),
                     ),
                   ],
@@ -218,7 +247,8 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   label: 'Full Name',
                   hint: 'Enter your full name',
                   textInputAction: TextInputAction.next,
-                  validator: (value) => AppValidators.validateRequired(value, 'Name'),
+                  validator: (value) =>
+                      AppValidators.validateRequired(value, 'Name'),
                   prefixIcon: const Icon(Icons.person_outline),
                   textCapitalization: TextCapitalization.words,
                 ),
@@ -239,16 +269,6 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                 ),
                 const SizedBox(height: AppSpacing.md),
                 AppTextField(
-                  controller: _phoneController,
-                  label: 'Phone Number (optional)',
-                  hint: 'Enter your phone number',
-                  keyboardType: TextInputType.phone,
-                  textInputAction: TextInputAction.next,
-                  validator: AppValidators.validatePhone,
-                  prefixIcon: const Icon(Icons.phone_outlined),
-                ),
-                const SizedBox(height: AppSpacing.md),
-                AppTextField(
                   controller: _passwordController,
                   label: 'Password',
                   hint: 'Enter password (min 6 characters)',
@@ -258,9 +278,12 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   prefixIcon: const Icon(Icons.lock_outline),
                   suffixIcon: IconButton(
                     icon: Icon(
-                      _obscurePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                      _obscurePassword
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
                     ),
-                    onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                    onPressed: () =>
+                        setState(() => _obscurePassword = !_obscurePassword),
                   ),
                 ),
                 const SizedBox(height: AppSpacing.md),
@@ -270,13 +293,20 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   hint: 'Confirm your password',
                   obscureText: _obscureConfirmPassword,
                   textInputAction: TextInputAction.done,
-                  validator: (value) => AppValidators.validateConfirmPassword(value, _passwordController.text),
+                  validator: (value) => AppValidators.validateConfirmPassword(
+                    value,
+                    _passwordController.text,
+                  ),
                   prefixIcon: const Icon(Icons.lock_outline),
                   suffixIcon: IconButton(
                     icon: Icon(
-                      _obscureConfirmPassword ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                      _obscureConfirmPassword
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
                     ),
-                    onPressed: () => setState(() => _obscureConfirmPassword = !_obscureConfirmPassword),
+                    onPressed: () => setState(
+                      () => _obscureConfirmPassword = !_obscureConfirmPassword,
+                    ),
                   ),
                   onFieldSubmitted: (_) => _handleRegister(),
                 ),
@@ -286,10 +316,38 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   onPressed: _handleRegister,
                   isLoading: authState.isLoading,
                 ),
+                const SizedBox(height: AppSpacing.lg),
+                Row(
+                  children: [
+                    const Expanded(child: Divider()),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.sm,
+                      ),
+                      child: Text('or', style: theme.textTheme.bodySmall),
+                    ),
+                    const Expanded(child: Divider()),
+                  ],
+                ),
+                const SizedBox(height: AppSpacing.md),
+                AppButton(
+                  label: 'Continue with Google',
+                  type: ButtonType.secondary,
+                  icon: const Icon(Icons.g_mobiledata, size: 24),
+                  onPressed: authState.isLoading ? null : _continueWithGoogle,
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                AppButton(
+                  label: 'Continue with Phone',
+                  type: ButtonType.secondary,
+                  icon: const Icon(Icons.phone_outlined),
+                  onPressed: authState.isLoading ? null : _continueWithPhone,
+                ),
                 const SizedBox(height: AppSpacing.sm),
                 Text(
-                  'We will send a verification code to your email address '
-                  'before creating your account.',
+                  'Phone-only accounts may add a verified email later. A '
+                  'verified phone is required before using student or owner '
+                  'services.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -347,10 +405,14 @@ class _RoleCard extends StatelessWidget {
         duration: AppConstants.animationDuration,
         padding: const EdgeInsets.all(AppSpacing.md),
         decoration: BoxDecoration(
-          color: selected ? theme.colorScheme.primaryContainer : theme.colorScheme.surface,
+          color: selected
+              ? theme.colorScheme.primaryContainer
+              : theme.colorScheme.surface,
           borderRadius: BorderRadius.circular(AppBorderRadius.lg),
           border: Border.all(
-            color: selected ? theme.colorScheme.primary : theme.colorScheme.outlineVariant,
+            color: selected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outlineVariant,
             width: selected ? 2 : 1,
           ),
         ),
@@ -359,13 +421,17 @@ class _RoleCard extends StatelessWidget {
             Icon(
               icon,
               size: 32,
-              color: selected ? theme.colorScheme.primary : theme.colorScheme.onSurfaceVariant,
+              color: selected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurfaceVariant,
             ),
             const SizedBox(height: AppSpacing.sm),
             Text(
               title,
               style: theme.textTheme.titleMedium?.copyWith(
-                color: selected ? theme.colorScheme.primary : theme.colorScheme.onSurface,
+                color: selected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurface,
                 fontWeight: FontWeight.w600,
               ),
             ),

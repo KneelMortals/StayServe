@@ -25,6 +25,11 @@ import {
 } from './roomValidation';
 import { PAGE_SIZE } from './batches';
 import { notify } from './notifications';
+import {
+  readReviewNotificationDependencyRefs,
+  reviewInstanceIdFor,
+  reviewNotificationId,
+} from './reviews';
 
 const db = firestore.getFirestore();
 
@@ -216,6 +221,17 @@ async function deleteRoomReviewsBefore(
     if (page.empty) break;
 
     for (const reviewDoc of page.docs) {
+      // Read the notification dependencies before the destructive
+      // transaction. Legacy copies are found through their review id, while
+      // the deterministic copy and its attribution are added again below
+      // from the exact lifecycle seen in the transaction.
+      const dependencySource = await reviewDoc.ref.get();
+      if (!dependencySource.exists) continue;
+      const dependencyRefs = await readReviewNotificationDependencyRefs(
+        reviewDoc.id,
+        reviewInstanceIdFor(dependencySource),
+      );
+
       await db.runTransaction(async (transaction) => {
         const current = await transaction.get(reviewDoc.ref);
         if (!current.exists) return;
@@ -241,6 +257,46 @@ async function deleteRoomReviewsBefore(
           return;
         }
 
+        const notificationRefs = new Map(
+          dependencyRefs.notificationRefs.map((reference) => [
+            reference.path,
+            reference,
+          ]),
+        );
+        const attributionRefs = new Map(
+          dependencyRefs.attributionRefs.map((reference) => [
+            reference.path,
+            reference,
+          ]),
+        );
+        const reviewInstanceId = reviewInstanceIdFor(current);
+        const ownerId = String(review.ownerId || '').trim();
+        if (ownerId) {
+          const notificationId = reviewNotificationId(
+            reviewDoc.id,
+            reviewInstanceId,
+            ownerId,
+          );
+          notificationRefs.set(
+            db.collection('notifications').doc(notificationId).path,
+            db.collection('notifications').doc(notificationId),
+          );
+          attributionRefs.set(
+            db.collection('notificationAttributions').doc(notificationId).path,
+            db.collection('notificationAttributions').doc(notificationId),
+          );
+        }
+
+        // The visible copies disappear first, followed by the server-only
+        // attribution and finally the review source. All three changes commit
+        // atomically, so a failed cleanup leaves the complete review lifecycle
+        // available for the durable job's next retry.
+        for (const reference of notificationRefs.values()) {
+          transaction.delete(reference);
+        }
+        for (const reference of attributionRefs.values()) {
+          transaction.delete(reference);
+        }
         transaction.delete(reviewDoc.ref);
       });
     }
@@ -1110,13 +1166,20 @@ async function inspectRoomRequestsForDeletion(
 }
 
 /**
- * Re-checks the live authority of a caller inside a deletion transaction.
+ * Re-checks a user-triggered deletion caller's role and account state inside
+ * the marker transaction.
  *
- * A caller may lose the owner or administrator role after the deletion was
- * marked but before its requests and listing are removed. Every destructive
- * step therefore reads the caller's current profile again.
+ * The callable performs the live Firebase Auth check before this function is
+ * reached (`assertLiveOwnerOrAdmin`). This transaction-time check is kept
+ * separate because Firebase Auth cannot be read from a Firestore transaction
+ * callback, and it serializes a concurrent demotion or ban with the start of
+ * the deletion operation.
+ *
+ * It is deliberately not used by resumed cleanup. Once the server-owned
+ * deletion marker and durable job exist, cleanup must be able to finish even
+ * if the original caller was subsequently deleted.
  */
-function assertLiveRoomDeletionCaller(
+function assertRoomDeletionActorAuthority(
   callerSnapshot: firestore.DocumentSnapshot,
   uid: string,
   ownerId: string,
@@ -1141,6 +1204,31 @@ function assertLiveRoomDeletionCaller(
     throw new functions.https.HttpsError(
       'permission-denied',
       'Owner or admin access required',
+    );
+  }
+}
+
+/**
+ * Authorizes a resumed cleanup transaction from the server-owned deletion
+ * marker rather than from the original caller's current account.
+ *
+ * A deleted or demoted caller must not strand a durable cleanup job. The
+ * operation id ties the room marker to the exact deletion which the server
+ * previously authorized.
+ */
+function assertRoomDeletionCleanupAuthorization(
+  roomSnapshot: firestore.DocumentSnapshot,
+  operation: RoomDeletionOperation,
+): void {
+  if (!roomSnapshot.exists) return;
+  const room = roomSnapshot.data() as Record<string, any>;
+  if (
+    room.deletionInProgress !== true ||
+    String(room.deletionOperationId || '') !== operation.deletionOperationId
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'The listing deletion is no longer active. Try again.',
     );
   }
 }
@@ -1281,31 +1369,14 @@ async function cancelOpenRoomRequestsForDeletion(
     for (const requestDoc of requestPage.docs) {
       const requestRef = requestDoc.ref;
       const cancelled = await db.runTransaction(async (transaction) => {
-        const [roomSnapshot, callerSnapshot, requestSnapshot] =
-          await transaction.getAll(
-            roomRef,
-            db.collection('users').doc(operation.requestedBy),
-            requestRef,
-          );
+        const [roomSnapshot, requestSnapshot] = await transaction.getAll(
+          roomRef,
+          requestRef,
+        );
         if (!roomSnapshot.exists || !requestSnapshot.exists) return null;
 
         const room = roomSnapshot.data() as Record<string, any>;
-        if (
-          room.deletionInProgress !== true ||
-          String(room.deletionOperationId || '') !==
-            operation.deletionOperationId
-        ) {
-          throw new functions.https.HttpsError(
-            'failed-precondition',
-            'The listing deletion is no longer active. Try again.',
-          );
-        }
-
-        assertLiveRoomDeletionCaller(
-          callerSnapshot,
-          operation.requestedBy,
-          operation.ownerId,
-        );
+        assertRoomDeletionCleanupAuthorization(roomSnapshot, operation);
 
         const request = requestSnapshot.data() as Record<string, any>;
         const status = String(request.status || '');
@@ -1407,28 +1478,11 @@ async function finalizeRoomDeletion(
     );
 
   await db.runTransaction(async (transaction) => {
-    const [roomSnapshot, callerSnapshot] = await transaction.getAll(
-      roomRef,
-      db.collection('users').doc(operation.requestedBy),
-    );
+    const roomSnapshot = await transaction.get(roomRef);
     if (!roomSnapshot.exists) return;
 
     const room = roomSnapshot.data() as Record<string, any>;
-    if (
-      room.deletionInProgress !== true ||
-      String(room.deletionOperationId || '') !== operation.deletionOperationId
-    ) {
-      throw new functions.https.HttpsError(
-        'failed-precondition',
-        'The listing deletion is no longer active. Try again.',
-      );
-    }
-
-    assertLiveRoomDeletionCaller(
-      callerSnapshot,
-      operation.requestedBy,
-      operation.ownerId,
-    );
+    assertRoomDeletionCleanupAuthorization(roomSnapshot, operation);
 
     const finalDecision = decideRoomDeletion(room.currentOccupancy, []);
     if (!finalDecision.allowed) {
@@ -1678,7 +1732,7 @@ export const deleteRoomListing = callableHttps.onCall(
       const callerProfile = await transaction.get(
         db.collection('users').doc(uid),
       );
-      assertLiveRoomDeletionCaller(callerProfile, uid, ownerId);
+      assertRoomDeletionActorAuthority(callerProfile, uid, ownerId);
 
       const callerIsAdmin = canActAsAdmin({
         exists: callerProfile.exists,

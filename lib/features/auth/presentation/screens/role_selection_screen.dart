@@ -5,12 +5,15 @@ import 'package:go_router/go_router.dart';
 import '../../../../core/index.dart';
 import '../../../../../firebase/auth/auth_service.dart';
 import '../../../../../firebase/otp/otp_service.dart';
+import '../providers/auth_provider.dart';
 
-/// Fallback screen for accounts that are signed in but have no profile yet.
+/// Fallback screen for accounts that are signed in but have not completed
+/// their StayServe role selection.
 ///
-/// Like the normal registration flow it insists on a verified email address
-/// — the profile is written by the server, which re-checks the OTP
-/// verification. The phone number is optional contact information.
+/// Firebase phone accounts and Google accounts already have a verified
+/// contact. An email/password account still proves its address with the
+/// existing StayServe email OTP. The profile and all verification flags are
+/// written by the server.
 class RoleSelectionScreen extends ConsumerStatefulWidget {
   const RoleSelectionScreen({super.key});
 
@@ -21,14 +24,12 @@ class RoleSelectionScreen extends ConsumerStatefulWidget {
 
 class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _phoneController = TextEditingController();
 
   UserRole? _selectedRole;
   bool _isLoading = false;
 
   @override
   void dispose() {
-    _phoneController.dispose();
     super.dispose();
   }
 
@@ -41,13 +42,14 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
     if (user == null) return;
 
     final email = user.email ?? '';
-    final phone = _phoneController.text.trim();
 
     setState(() => _isLoading = true);
     try {
-      // The email address has to be verified as well.
+      // A Firebase-verified Google/email identity already proves the
+      // address. An email/password account still needs StayServe's one-time
+      // email challenge. A phone-only account needs neither.
       var challenge = '';
-      if (email.isNotEmpty) {
+      if (email.isNotEmpty && !user.emailVerified) {
         challenge = await _verifyEmail(email);
         if (challenge.isEmpty || !mounted) return;
       }
@@ -58,20 +60,36 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
       // returns the role which was actually stored; an already claimed role
       // is preserved by the server and may differ from the button which was
       // pressed.
-      final completedRole = await ref
+      final registration = await ref
           .read(otpServiceProvider)
           .completeRegistration(
             name: user.displayName?.trim().isNotEmpty == true
                 ? user.displayName!.trim()
                 : 'User',
-            phone: phone,
             role: _selectedRole!.name,
             challenge: challenge,
           );
+      final completedRole = registration.role;
 
       if (!mounted) return;
 
-      if (completedRole == UserRole.owner.name) {
+      // The Firestore snapshot may still contain the incomplete profile for a
+      // short moment. Remember the server-confirmed role and registration
+      // marker so the router does not bounce the user back here.
+      ref
+          .read(authProfileTransitionProvider.notifier)
+          .state = AuthProfileTransition(
+        uid: user.uid,
+        registrationCompleted: true,
+        phoneVerified: registration.phoneVerified,
+        role: UserRoleX.fromString(completedRole),
+      );
+
+      if (!registration.phoneVerified) {
+        // The account may be registered, but the student/owner service areas
+        // stay closed until Firebase has verified a phone number.
+        context.go('/verify-phone');
+      } else if (completedRole == UserRole.owner.name) {
         context.go('/owner/dashboard');
       } else {
         context.go('/student/home');
@@ -107,6 +125,7 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final user = ref.watch(authRepositoryProvider).currentUser;
 
     return Scaffold(
       body: SafeArea(
@@ -153,19 +172,13 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                   ),
                 ),
                 const SizedBox(height: AppSpacing.xl),
-                AppTextField(
-                  controller: _phoneController,
-                  label: 'Phone Number (optional)',
-                  hint: 'Enter your phone number',
-                  keyboardType: TextInputType.phone,
-                  textInputAction: TextInputAction.done,
-                  validator: AppValidators.validatePhone,
-                  prefixIcon: const Icon(Icons.phone_outlined),
-                ),
-                const SizedBox(height: AppSpacing.md),
                 Text(
-                  'We will send a verification code to your email address '
-                  'before finishing your profile.',
+                  user?.emailVerified == true
+                      ? 'Your email address is verified. Select a role to finish.'
+                      : user?.phoneNumber?.trim().isNotEmpty == true
+                      ? 'Your phone number is verified. Select a role to finish.'
+                      : 'We will send a verification code to your email address '
+                            'before finishing your profile.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),

@@ -50,6 +50,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   bool _isSending = false;
   bool _isChangingBlock = false;
 
+  /// The idempotency keys of administrator messages in this conversation.
+  ///
+  /// Canonical text keeps the same key after a failed request, so a retry is
+  /// recognised by the server as the same message instead of a second one.
+  late final AdminMessageRequestTracker _adminRequestTracker;
+
   /// The recipient of the messages.
   String? _receiverId;
 
@@ -62,6 +68,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   @override
   void initState() {
     super.initState();
+
+    _adminRequestTracker = AdminMessageRequestTracker(
+      () => ref.read(conversationRepositoryProvider).newAdminMessageRequestId(),
+    );
 
     // The recipient that came with the route is used right away.
     _receiverId = widget.peerId;
@@ -102,6 +112,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   void _scrollToBottom() {
     if (!_scrollController.hasClients) return;
+    // A scroll position can be attached before the list has measured its
+    // content. Reading `maxScrollExtent` in that state throws because the
+    // extent is not known yet.
+    if (!_scrollController.position.hasContentDimensions) return;
     _scrollController.animateTo(
       _scrollController.position.maxScrollExtent,
       duration: const Duration(milliseconds: 250),
@@ -109,7 +123,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
   }
 
-  Future<void> _send(String receiverId, bool canSend) async {
+  Future<void> _send(
+    String receiverId,
+    bool canSend, {
+    required bool sendAsAdministrator,
+  }) async {
     final text = _controller.text.trim();
     if (text.isEmpty || _isSending) return;
 
@@ -143,13 +161,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     setState(() => _isSending = true);
     try {
-      await ref
-          .read(conversationRepositoryProvider)
-          .sendMessage(
-            conversationId: widget.conversationId,
-            receiverId: receiverId,
-            content: text,
-          );
+      final repository = ref.read(conversationRepositoryProvider);
+      if (sendAsAdministrator) {
+        // The administrator path is server-owned. It is the only way an
+        // administrator message can receive the verified Admin badge.
+        await repository.sendAdminMessage(
+          userId: receiverId,
+          content: text,
+          requestId: _adminRequestTracker.requestIdFor(text),
+        );
+        // The operation is now resolved. Releasing its key lets the admin
+        // deliberately send the same text again while preserving the key of
+        // a request whose response was lost.
+        _adminRequestTracker.markSucceeded(text);
+      } else {
+        await repository.sendMessage(
+          conversationId: widget.conversationId,
+          receiverId: receiverId,
+          content: text,
+        );
+      }
 
       // The screen may have been closed while the message was on its way.
       // Touching the controller (or the scroll controller) of a screen that
@@ -267,6 +298,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       conversationInteractionDetailsProvider(_interactionKey),
     );
     final details = detailsAsync.valueOrNull;
+    final currentRole = ref.watch(currentUserRoleProvider);
 
     // ---------------------------------------------------------------------
     // Messages that arrive while the chat is open are read right away.
@@ -299,6 +331,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     // The server-resolved peer id and name are authoritative. The route and
     // the stored conversation are only fallbacks while the details load.
+    final isAdminSupport =
+        details?.isAdminSupport == true || conversation?.isAdminSupport == true;
+    final sendAsAdministrator = isAdminSupport && currentRole == UserRole.admin;
     var receiverId = details?.peerId ?? _receiverId;
     final storedPeerName =
         conversation?.getParticipantName(
@@ -342,29 +377,33 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ],
         ),
         actions: [
-          IconButton(
-            tooltip: details?.blockedByMe == true
-                ? 'Unblock $peerName'
-                : details?.blockedMe == true
-                ? '$peerName blocked you'
-                : 'Block $peerName',
-            icon: Icon(
-              details?.blockedByMe == true ? Icons.lock_open : Icons.block,
+          // Administrator support conversations are not personal booking
+          // conversations. The personal block route deliberately refuses
+          // them, so the control is not offered in the first place.
+          if (!isAdminSupport)
+            IconButton(
+              tooltip: details?.blockedByMe == true
+                  ? 'Unblock $peerName'
+                  : details?.blockedMe == true
+                  ? '$peerName blocked you'
+                  : 'Block $peerName',
+              icon: Icon(
+                details?.blockedByMe == true ? Icons.lock_open : Icons.block,
+              ),
+              onPressed:
+                  !interactionReady ||
+                      receiverId == null ||
+                      receiverId.isEmpty ||
+                      _isChangingBlock ||
+                      (details.blockedMe && !details.blockedByMe)
+                  ? null
+                  : () => _toggleBlock(
+                      peerId: receiverId,
+                      peerName: peerName,
+                      blockedByMe: details.blockedByMe,
+                      blockedMe: details.blockedMe,
+                    ),
             ),
-            onPressed:
-                !interactionReady ||
-                    receiverId == null ||
-                    receiverId.isEmpty ||
-                    _isChangingBlock ||
-                    (details.blockedMe && !details.blockedByMe)
-                ? null
-                : () => _toggleBlock(
-                    peerId: receiverId,
-                    peerName: peerName,
-                    blockedByMe: details.blockedByMe,
-                    blockedMe: details.blockedMe,
-                  ),
-          ),
         ],
       ),
       body: Column(
@@ -434,7 +473,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               focusNode: _focusNode,
               isSending: _isSending,
               enabled: canSend,
-              onSend: () => _send(receiverId, canSend),
+              sendAsAdministrator: sendAsAdministrator,
+              onSend: () => _send(
+                receiverId,
+                canSend,
+                sendAsAdministrator: sendAsAdministrator,
+              ),
             ),
         ],
       ),
@@ -546,6 +590,10 @@ class _MessageBubble extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (message.isVerifiedAdminMessage) ...[
+              const _VerifiedAdminBadge(),
+              const SizedBox(height: AppSpacing.xs),
+            ],
             Text(
               message.content,
               style: theme.textTheme.bodyMedium?.copyWith(
@@ -568,11 +616,50 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
+/// The verified badge of a message sent by the platform administrator.
+///
+/// The badge is rendered only when the server-owned marker is complete. A
+/// participant cannot create the marker because the client message schema
+/// does not allow these fields.
+class _VerifiedAdminBadge extends StatelessWidget {
+  const _VerifiedAdminBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.sm,
+        vertical: 2,
+      ),
+      decoration: BoxDecoration(
+        color: Colors.blue,
+        borderRadius: BorderRadius.circular(AppBorderRadius.full),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.verified, size: 14, color: Colors.white),
+          SizedBox(width: 4),
+          Text(
+            'Admin',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _MessageInput extends StatelessWidget {
   final TextEditingController controller;
   final FocusNode focusNode;
   final bool isSending;
   final bool enabled;
+  final bool sendAsAdministrator;
   final VoidCallback onSend;
 
   const _MessageInput({
@@ -580,6 +667,7 @@ class _MessageInput extends StatelessWidget {
     required this.focusNode,
     required this.isSending,
     required this.enabled,
+    required this.sendAsAdministrator,
     required this.onSend,
   });
 
@@ -606,7 +694,9 @@ class _MessageInput extends StatelessWidget {
               maxLength: maxMessageLength,
               decoration: InputDecoration(
                 hintText: enabled
-                    ? 'Type a message...'
+                    ? sendAsAdministrator
+                          ? 'Reply as StayServe Admin…'
+                          : 'Type a message...'
                     : 'Messaging is unavailable',
                 counterText: '',
                 border: OutlineInputBorder(

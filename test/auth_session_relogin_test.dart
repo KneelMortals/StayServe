@@ -1,6 +1,8 @@
 import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -8,6 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:stayserve/core/constants/enums.dart';
 import 'package:stayserve/features/auth/presentation/providers/auth_provider.dart';
 import 'package:stayserve/firebase/auth/auth_service.dart';
+import 'package:stayserve/firebase/messaging/messaging_service.dart';
 import 'package:stayserve/models/user_model.dart';
 
 /// A controllable auth repository used by the session tests.
@@ -67,6 +70,34 @@ class _ControllableAuthRepository implements AuthRepository {
   dynamic noSuchMethod(Invocation invocation) => null;
 }
 
+class _FakeFirebaseMessaging implements FirebaseMessaging {
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw UnimplementedError('Firebase Messaging is not used by this test');
+}
+
+class _FakeFirestore implements FirebaseFirestore {
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw UnimplementedError('Firestore is not used by this test');
+}
+
+class _NoopRegistrar extends PushNotificationRegistrar {
+  _NoopRegistrar()
+    : super(
+        MessagingService(
+          messaging: _FakeFirebaseMessaging(),
+          firestore: _FakeFirestore(),
+        ),
+      );
+
+  @override
+  Future<void> register(String uid) async {}
+
+  @override
+  Future<void> unregister(String uid) async {}
+}
+
 UserModel _profile(String uid, {UserRole role = UserRole.student}) {
   final now = DateTime.utc(2026, 1, 1);
   return UserModel(
@@ -102,6 +133,7 @@ void main() {
           // The token refresh and the FCM registration are not part of this
           // regression. They run behind the same callback in production.
           authSessionUserChangedProvider.overrideWithValue((_) async {}),
+          pushNotificationRegistrarProvider.overrideWithValue(_NoopRegistrar()),
         ],
       );
       addTearDown(() async {
@@ -177,6 +209,7 @@ void main() {
           ),
           userProfileStreamProvider.overrideWithValue((_) => profile.stream),
           authSessionUserChangedProvider.overrideWithValue((_) async {}),
+          pushNotificationRegistrarProvider.overrideWithValue(_NoopRegistrar()),
         ],
       );
       addTearDown(() async {

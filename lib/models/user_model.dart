@@ -8,6 +8,33 @@ class UserModel {
   final String? phone;
   final UserRole role;
   final String? profileImage;
+
+  /// Whether Firebase has verified the email address in [email].
+  ///
+  /// This value is copied from a signed Firebase Auth token by the server.
+  /// A client must never be able to set it directly.
+  final bool emailVerified;
+
+  /// Whether Firebase has verified the phone number in [phone].
+  ///
+  /// Student and owner services require this value. Administrators are
+  /// exempt. The server owns this flag; it is copied from signed Firebase
+  /// Auth claims by `syncAuthProfile`.
+  final bool phoneVerified;
+
+  /// Whether the server has completed this account's registration.
+  final bool registrationCompleted;
+
+  /// Whether this account has already claimed its self-service role.
+  final bool roleClaimed;
+
+  /// The Firebase Auth providers linked to this account.
+  final List<String> authProviders;
+
+  /// When the server first observed a verified email/phone identity.
+  final DateTime? emailVerifiedAt;
+  final DateTime? phoneVerifiedAt;
+
   final String? fcmToken;
   final bool isActive;
   final DateTime createdAt;
@@ -38,6 +65,13 @@ class UserModel {
     this.phone,
     required this.role,
     this.profileImage,
+    this.emailVerified = false,
+    this.phoneVerified = false,
+    this.registrationCompleted = false,
+    this.roleClaimed = false,
+    this.authProviders = const [],
+    this.emailVerifiedAt,
+    this.phoneVerifiedAt,
     this.fcmToken,
     this.isActive = true,
     required this.createdAt,
@@ -68,6 +102,25 @@ class UserModel {
         orElse: () => UserRole.student,
       ),
       profileImage: _asNullableString(json['profileImage']),
+      emailVerified: json['emailVerified'] is bool
+          ? json['emailVerified'] as bool
+          : false,
+      phoneVerified: json['phoneVerified'] is bool
+          ? json['phoneVerified'] as bool
+          : false,
+      registrationCompleted: json['registrationCompleted'] is bool
+          ? json['registrationCompleted'] as bool
+          : false,
+      roleClaimed: json['roleClaimed'] is bool
+          ? json['roleClaimed'] as bool
+          : false,
+      authProviders: _asStringList(json['authProviders']),
+      emailVerifiedAt: json['emailVerifiedAt'] != null
+          ? _toDate(json['emailVerifiedAt'])
+          : null,
+      phoneVerifiedAt: json['phoneVerifiedAt'] != null
+          ? _toDate(json['phoneVerifiedAt'])
+          : null,
       fcmToken: _asNullableString(json['fcmToken']),
       isActive: json['isActive'] is bool ? json['isActive'] as bool : true,
       createdAt: _toDate(json['createdAt']),
@@ -83,8 +136,9 @@ class UserModel {
       deletionScheduledAt: json['deletionScheduledAt'] != null
           ? _toDate(json['deletionScheduledAt'])
           : null,
-      deleteAfter:
-          json['deleteAfter'] != null ? _toDate(json['deleteAfter']) : null,
+      deleteAfter: json['deleteAfter'] != null
+          ? _toDate(json['deleteAfter'])
+          : null,
     );
   }
 
@@ -96,6 +150,17 @@ class UserModel {
       'phone': phone,
       'role': role.name,
       'profileImage': profileImage,
+      'emailVerified': emailVerified,
+      'phoneVerified': phoneVerified,
+      'registrationCompleted': registrationCompleted,
+      'roleClaimed': roleClaimed,
+      'authProviders': authProviders,
+      'emailVerifiedAt': emailVerifiedAt != null
+          ? Timestamp.fromDate(emailVerifiedAt!)
+          : null,
+      'phoneVerifiedAt': phoneVerifiedAt != null
+          ? Timestamp.fromDate(phoneVerifiedAt!)
+          : null,
       'fcmToken': fcmToken,
       'isActive': isActive,
       'createdAt': Timestamp.fromDate(createdAt),
@@ -109,8 +174,9 @@ class UserModel {
       'deletionScheduledAt': deletionScheduledAt != null
           ? Timestamp.fromDate(deletionScheduledAt!)
           : null,
-      'deleteAfter':
-          deleteAfter != null ? Timestamp.fromDate(deleteAfter!) : null,
+      'deleteAfter': deleteAfter != null
+          ? Timestamp.fromDate(deleteAfter!)
+          : null,
     };
   }
 
@@ -121,6 +187,13 @@ class UserModel {
     String? phone,
     UserRole? role,
     String? profileImage,
+    bool? emailVerified,
+    bool? phoneVerified,
+    bool? registrationCompleted,
+    bool? roleClaimed,
+    List<String>? authProviders,
+    DateTime? emailVerifiedAt,
+    DateTime? phoneVerifiedAt,
     String? fcmToken,
     bool? isActive,
     DateTime? createdAt,
@@ -141,6 +214,14 @@ class UserModel {
       phone: phone ?? this.phone,
       role: role ?? this.role,
       profileImage: profileImage ?? this.profileImage,
+      emailVerified: emailVerified ?? this.emailVerified,
+      phoneVerified: phoneVerified ?? this.phoneVerified,
+      registrationCompleted:
+          registrationCompleted ?? this.registrationCompleted,
+      roleClaimed: roleClaimed ?? this.roleClaimed,
+      authProviders: authProviders ?? this.authProviders,
+      emailVerifiedAt: emailVerifiedAt ?? this.emailVerifiedAt,
+      phoneVerifiedAt: phoneVerifiedAt ?? this.phoneVerifiedAt,
       fcmToken: fcmToken ?? this.fcmToken,
       isActive: isActive ?? this.isActive,
       createdAt: createdAt ?? this.createdAt,
@@ -164,8 +245,11 @@ class UserModel {
   /// which threw a `RangeError` for an empty name (a user whose profile has
   /// no name yet) or for a name made only of spaces.
   String get initials {
-    final parts =
-        name.trim().split(RegExp(r'\s+')).where((part) => part.isNotEmpty).toList();
+    final parts = name
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty)
+        .toList();
     if (parts.isEmpty) return '?';
     if (parts.length == 1) return parts.first.substring(0, 1).toUpperCase();
     return '${parts[0].substring(0, 1)}${parts[1].substring(0, 1)}'
@@ -175,6 +259,13 @@ class UserModel {
   bool get isStudent => role == UserRole.student;
   bool get isOwner => role == UserRole.owner;
   bool get isAdmin => role == UserRole.admin;
+
+  /// Whether this account may use the student/owner service areas.
+  ///
+  /// Administrators are exempt from the phone requirement. Every other role
+  /// needs a server-confirmed verified phone before accessing the service.
+  bool get canUseServices =>
+      isActive && registrationCompleted && (isAdmin || phoneVerified);
 
   UserModel copyWithUpdatedAt() => copyWith(updatedAt: DateTime.now());
 }
@@ -240,7 +331,8 @@ class TimestampConverter {
 class TimestampConverterNullable {
   const TimestampConverterNullable();
   DateTime? fromJson(Timestamp? timestamp) => timestamp?.toDate();
-  Timestamp? toJson(DateTime? date) => date != null ? Timestamp.fromDate(date) : null;
+  Timestamp? toJson(DateTime? date) =>
+      date != null ? Timestamp.fromDate(date) : null;
 }
 
 /// Reads a Firestore timestamp (or ISO string) into a [DateTime].

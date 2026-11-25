@@ -29,22 +29,27 @@ function jwt(claims) {
   return `${b64url({ alg: 'none', typ: 'JWT' })}.${b64url(claims)}.`;
 }
 
+const OPAQUE_ADMIN_IDENTITY = 'adminIdentities/support/profile';
+
 const TOKENS = {
-  student: jwt({ sub: 'student1', user_id: 'student1', role: 'student' }),
-  student2: jwt({ sub: 'student2', user_id: 'student2', role: 'student' }),
-  bootstrap: jwt({ sub: 'student-bootstrap', user_id: 'student-bootstrap', role: 'student' }),
-  bootstrapMissingMarker: jwt({ sub: 'student-bootstrap-missing', user_id: 'student-bootstrap-missing', role: 'student' }),
-  bootstrapOldProfile: jwt({ sub: 'student-bootstrap-old', user_id: 'student-bootstrap-old', role: 'student' }),
-  bootstrapInactive: jwt({ sub: 'student-bootstrap-inactive', user_id: 'student-bootstrap-inactive', role: 'student' }),
-  bootstrapRoleClaimed: jwt({ sub: 'student-bootstrap-role-claimed', user_id: 'student-bootstrap-role-claimed', role: 'student' }),
-  owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner' }),
+  student: jwt({ sub: 'student1', user_id: 'student1', role: 'student', phone_number: '+919876500001' }),
+  student2: jwt({ sub: 'student2', user_id: 'student2', role: 'student', phone_number: '+919876500002' }),
+  bootstrap: jwt({ sub: 'student-bootstrap', user_id: 'student-bootstrap', role: 'student', phone_number: '+919876500003' }),
+  bootstrapMissingMarker: jwt({ sub: 'student-bootstrap-missing', user_id: 'student-bootstrap-missing', role: 'student', phone_number: '+919876500004' }),
+  bootstrapOldProfile: jwt({ sub: 'student-bootstrap-old', user_id: 'student-bootstrap-old', role: 'student', phone_number: '+919876500005' }),
+  bootstrapInactive: jwt({ sub: 'student-bootstrap-inactive', user_id: 'student-bootstrap-inactive', role: 'student', phone_number: '+919876500006' }),
+  bootstrapRoleClaimed: jwt({ sub: 'student-bootstrap-role-claimed', user_id: 'student-bootstrap-role-claimed', role: 'student', phone_number: '+919876500007' }),
+  owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner', phone_number: '+919876500008' }),
   admin: jwt({ sub: 'admin1', user_id: 'admin1', role: 'admin', admin: true }),
   // A stale/forged admin claim without a live admin profile must not work.
   fakeAdmin: jwt({ sub: 'fakeAdmin1', user_id: 'fakeAdmin1', role: 'student', admin: true }),
-  stranger: jwt({ sub: 'someoneelse', user_id: 'someoneelse', role: 'student' }),
-  pending: jwt({ sub: 'pending1', user_id: 'pending1', role: 'student' }),
-  inactive: jwt({ sub: 'inactive1', user_id: 'inactive1', role: 'student' }),
-  legacy: jwt({ sub: 'legacy1', user_id: 'legacy1', role: 'student' }),
+  stranger: jwt({ sub: 'someoneelse', user_id: 'someoneelse', role: 'student', phone_number: '+919876500009' }),
+  pending: jwt({ sub: 'pending1', user_id: 'pending1', role: 'student', phone_number: '+919876500010' }),
+  inactive: jwt({ sub: 'inactive1', user_id: 'inactive1', role: 'student', phone_number: '+919876500011' }),
+  unverifiedPhone: jwt({ sub: 'unverifiedPhone1', user_id: 'unverifiedPhone1', role: 'student' }),
+  studentWithoutPhoneToken: jwt({ sub: 'student-without-phone-token', user_id: 'student-without-phone-token', role: 'student' }),
+  studentWithEmptyPhoneToken: jwt({ sub: 'student-with-empty-phone-token', user_id: 'student-with-empty-phone-token', role: 'student', phone_number: '' }),
+  legacy: jwt({ sub: 'legacy1', user_id: 'legacy1', role: 'student', phone_number: '+919876500012' }),
 };
 
 async function call(token, method, requestPath, body) {
@@ -194,17 +199,26 @@ async function seedUser(uid, {
   role = 'student',
   isActive = true,
   registrationCompleted = true,
+  emailVerified = true,
+  phoneVerified = true,
   createdAt = new Date().toISOString(),
   includeMarkers = true,
+  includePhoneVerification = true,
 } = {}) {
   const fields = {
     uid: string(uid),
     name: string(uid === 'admin1' ? 'Admin' : uid),
     email: string(`${uid}@example.com`),
+    emailVerified: bool(emailVerified),
+    phone: string(`+9198765${String(uid).replace(/\D/g, '').padStart(5, '0').slice(-5)}`),
+    authProviders: array([role === 'admin' ? 'admin' : 'password']),
     role: string(role),
     createdAt: timestamp(createdAt),
     updatedAt: timestamp(),
   };
+  if (includePhoneVerification) {
+    fields.phoneVerified = bool(phoneVerified);
+  }
   if (includeMarkers) {
     fields.isActive = bool(isActive);
     fields.registrationCompleted = bool(registrationCompleted);
@@ -272,17 +286,28 @@ async function seed() {
   await seedUser('student1');
   await seedUser('student2');
   await seedUser('owner1', { role: 'owner' });
-  await seedUser('admin1', { role: 'admin' });
+  await seedUser('admin1', { role: 'admin', phoneVerified: false });
   await seedUser('fakeAdmin1');
   await seedUser('someoneelse');
   await seedUser('pending1', { registrationCompleted: false });
   await seedUser('inactive1', { isActive: false });
+  await seedUser('unverifiedPhone1', {
+    emailVerified: false,
+    phoneVerified: false,
+  });
+  // The Firestore cache says the phone was verified, but the current Auth
+  // token has no phone provider. This is the stale-grant case which the rules
+  // must refuse.
+  await seedUser('student-without-phone-token');
+  await seedUser('student-with-empty-phone-token');
 
-  // This is the shape of an old profile which predates both marker fields.
-  // Its creation time is before the migration cutoff, so it is usable only
-  // while legacyMode is true.
+  // This is the shape of an old profile which predates both marker fields and
+  // the server-owned phone cache. Its creation time is before the migration
+  // cutoff, so it is usable only while legacyMode is true. The current token
+  // proves that Firebase still has a linked phone.
   await seedUser('legacy1', {
     includeMarkers: false,
+    includePhoneVerification: false,
     createdAt: new Date(cutoff.getTime() - 60 * 60 * 1000).toISOString(),
   });
 
@@ -485,6 +510,131 @@ async function seed() {
     },
   });
 
+  await call('owner', 'PATCH', '/conversations/conv-admin', {
+    fields: {
+      conversationId: string('conv-admin'),
+      participantIds: array(['admin1', 'student1']),
+      conversationType: string('adminSupport'),
+      adminId: string('admin1'),
+      adminVerified: bool(true),
+      createdByServer: bool(true),
+      createdAt: timestamp(),
+      updatedAt: timestamp(),
+      unreadCount: map({ admin1: integer(0), student1: integer(0) }),
+    },
+  });
+  await call(
+    'owner',
+    'PATCH',
+    '/conversations/conv-admin/messages/msg-legacy-raw-admin',
+    {
+      fields: {
+        messageId: string('msg-legacy-raw-admin'),
+        conversationId: string('conv-admin'),
+        senderId: string('admin1'),
+        receiverId: string('student1'),
+        content: string('Legacy administrator message.'),
+        type: string('text'),
+        createdAt: timestamp(),
+      },
+    },
+  );
+  await call('owner', 'PATCH', '/conversations/conv-admin-owner', {
+    fields: {
+      conversationId: string('conv-admin-owner'),
+      participantIds: array(['admin1', 'owner1']),
+      conversationType: string('adminSupport'),
+      adminId: string('admin1'),
+      adminVerified: bool(true),
+      createdByServer: bool(true),
+      createdAt: timestamp(),
+      updatedAt: timestamp(),
+      unreadCount: map({ admin1: integer(0), owner1: integer(0) }),
+    },
+  });
+
+  const opaqueAdminIdentity = OPAQUE_ADMIN_IDENTITY;
+  await call('owner', 'PATCH', '/conversations/conv-admin-opaque', {
+    fields: {
+      conversationId: string('conv-admin-opaque'),
+      participantIds: array([opaqueAdminIdentity, 'student1']),
+      conversationType: string('adminSupport'),
+      adminId: string(opaqueAdminIdentity),
+      adminVerified: bool(true),
+      createdByServer: bool(true),
+      createdAt: timestamp(),
+      updatedAt: timestamp(),
+      unreadCount: map({ student1: integer(0) }),
+    },
+  });
+  await call(
+    'owner',
+    'PATCH',
+    '/conversations/conv-admin-opaque/messages/msg-admin-opaque',
+    {
+      fields: {
+        messageId: string('msg-admin-opaque'),
+        conversationId: string('conv-admin-opaque'),
+        senderId: string(opaqueAdminIdentity),
+        receiverId: string('student1'),
+        content: string('Please update your room details.'),
+        type: string('text'),
+        createdAt: timestamp(),
+      },
+    },
+  );
+  await call(
+    'owner',
+    'PATCH',
+    '/adminSupportConversationOperations/conv-admin-opaque',
+    {
+      fields: {
+        operationId: string('conv-admin-opaque'),
+        conversationId: string('conv-admin-opaque'),
+        adminUid: string('admin1'),
+        adminIdentity: string(opaqueAdminIdentity),
+        targetUid: string('student1'),
+        sourceType: string('adminSupportConversation'),
+        createdAt: timestamp(),
+      },
+    },
+  );
+
+  await call(
+    'owner',
+    'PATCH',
+    '/conversations/conv-admin-opaque-owner',
+    {
+      fields: {
+        conversationId: string('conv-admin-opaque-owner'),
+        participantIds: array([opaqueAdminIdentity, 'owner1']),
+        conversationType: string('adminSupport'),
+        adminId: string(opaqueAdminIdentity),
+        adminVerified: bool(true),
+        createdByServer: bool(true),
+        createdAt: timestamp(),
+        updatedAt: timestamp(),
+        unreadCount: map({ owner1: integer(0) }),
+      },
+    },
+  );
+  await call(
+    'owner',
+    'PATCH',
+    '/adminSupportConversationOperations/conv-admin-opaque-owner',
+    {
+      fields: {
+        operationId: string('conv-admin-opaque-owner'),
+        conversationId: string('conv-admin-opaque-owner'),
+        adminUid: string('admin1'),
+        adminIdentity: string(opaqueAdminIdentity),
+        targetUid: string('owner1'),
+        sourceType: string('adminSupportConversation'),
+        createdAt: timestamp(),
+      },
+    },
+  );
+
   await call('owner', 'PATCH', '/settings/platform', {
     fields: { commissionPercentage: double(30), updatedAt: timestamp() },
   });
@@ -652,6 +802,45 @@ async function main() {
     true,
   );
   check(
+    'a client cannot bootstrap a profile with a forged phone verification',
+    await create(TOKENS.bootstrap, 'users', 'student-bootstrap-verified-phone', {
+      uid: string('student-bootstrap-verified-phone'),
+      name: string('Student'),
+      role: string('student'),
+      isActive: bool(true),
+      registrationCompleted: bool(false),
+      phone: string('+919876543210'),
+      phoneVerified: bool(true),
+    }),
+    false,
+  );
+  check(
+    'a client cannot bootstrap a profile with a forged email verification',
+    await create(TOKENS.bootstrap, 'users', 'student-bootstrap-verified-email', {
+      uid: string('student-bootstrap-verified-email'),
+      name: string('Student'),
+      role: string('student'),
+      isActive: bool(true),
+      registrationCompleted: bool(false),
+      email: string('student@example.com'),
+      emailVerified: bool(true),
+    }),
+    false,
+  );
+  check(
+    'a client cannot bootstrap a forged legacy email-proof marker',
+    await create(TOKENS.bootstrap, 'users', 'student-bootstrap-legacy-proof', {
+      uid: string('student-bootstrap-legacy-proof'),
+      name: string('Student'),
+      role: string('student'),
+      isActive: bool(true),
+      registrationCompleted: bool(false),
+      legacyEmailProofSource: string('stayServeOtp'),
+      legacyEmailProofEmail: string('student@example.com'),
+    }),
+    false,
+  );
+  check(
     'a client cannot mark its own role as already claimed',
     await create(TOKENS.bootstrapRoleClaimed, 'users', 'student-bootstrap-role-claimed', {
       uid: string('student-bootstrap-role-claimed'),
@@ -691,6 +880,26 @@ async function main() {
     false,
   );
   check(
+    'a student without a verified phone cannot use protected room reads',
+    await call(TOKENS.unverifiedPhone, 'GET', '/rooms/room1'),
+    false,
+  );
+  check(
+    'a stale cached phone grant without a phone token cannot use protected room reads',
+    await call(TOKENS.studentWithoutPhoneToken, 'GET', '/rooms/room1'),
+    false,
+  );
+  check(
+    'an empty phone token cannot use protected room reads',
+    await call(TOKENS.studentWithEmptyPhoneToken, 'GET', '/rooms/room1'),
+    false,
+  );
+  check(
+    'an administrator without a verified phone can still use protected room reads',
+    await call(TOKENS.admin, 'GET', '/rooms/room1'),
+    true,
+  );
+  check(
     'student cannot create a profile with isActive=false',
     await create(TOKENS.bootstrapInactive, 'users', 'student-bootstrap-inactive', {
       uid: string('student-bootstrap'),
@@ -709,9 +918,28 @@ async function main() {
     true,
   );
   check(
-    'student can change their own phone',
+    'student cannot change their own phone',
     await update(TOKENS.student, 'users', 'student1', { phone: string('+919999999999') }),
-    true,
+    false,
+  );
+  check(
+    'student cannot forge their own phone verification',
+    await update(TOKENS.unverifiedPhone, 'users', 'unverifiedPhone1', {
+      phoneVerified: bool(true),
+    }),
+    false,
+  );
+  check(
+    'student cannot forge their own email verification',
+    await update(TOKENS.unverifiedPhone, 'users', 'unverifiedPhone1', {
+      emailVerified: bool(true),
+    }),
+    false,
+  );
+  check(
+    'student cannot forge their own Auth provider list',
+    await update(TOKENS.student, 'users', 'student1', { authProviders: array(['phone']) }),
+    false,
   );
   check(
     'student can save a room',
@@ -754,6 +982,56 @@ async function main() {
   await call('owner', 'PATCH', '/users/student1?updateMask.fieldPaths=isActive', {
     fields: { isActive: bool(true) },
   });
+
+  check(
+    'a client cannot read a moderation audit record',
+    await call(TOKENS.admin, 'GET', '/reviewDeletionAudit/REV-TEST-1'),
+    false,
+  );
+  check(
+    'a client cannot write a moderation audit record',
+    await create(TOKENS.admin, 'reviewDeletionAudit', 'REV-TEST-1', {
+      reviewId: string('REV-TEST-1'),
+      deletedByAdminId: string('admin1'),
+      deletedAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a client cannot read a review-deletion idempotency pointer',
+    await call(TOKENS.admin, 'GET', '/reviewDeletionState/REV-TEST-1'),
+    false,
+  );
+  check(
+    'a client cannot write a review-deletion idempotency pointer',
+    await create(TOKENS.admin, 'reviewDeletionState', 'REV-TEST-1', {
+      reviewId: string('REV-TEST-1'),
+      auditEventId: string('server-only-event'),
+      deletedByAdminId: string('admin1'),
+      deletedAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a client cannot read a durable verified-email linking operation',
+    await call(TOKENS.student, 'GET', '/emailLinkOperations/LINK-TEST-1'),
+    false,
+  );
+  check(
+    'a client cannot write a durable verified-email linking operation',
+    await create(TOKENS.student, 'emailLinkOperations', 'LINK-TEST-1', {
+      uid: string('student1'),
+      email: string('student@example.com'),
+      challengeHash: string('server-only-hash'),
+      expiresAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'an administrator cannot bypass the server-only email linking operation rule',
+    await call(TOKENS.admin, 'GET', '/emailLinkOperations/LINK-TEST-1'),
+    false,
+  );
 
   console.log('\n--- live admin role, not a token claim, controls admin access ---');
   check(
@@ -1614,6 +1892,195 @@ async function main() {
     true,
   );
   check(
+    'an ordinary booking conversation message remains allowed',
+    await create(TOKENS.student, 'conversations/conv1/messages', 'msg-ordinary-booking', {
+      messageId: string('msg-ordinary-booking'),
+      conversationId: string('conv1'),
+      senderId: string('student1'),
+      receiverId: string('owner1'),
+      content: string('Ordinary booking reply'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+
+  console.log('\n--- administrator support messages are callable-only ---');
+  check(
+    'a support target can read an opaque support conversation',
+    await call(TOKENS.student, 'GET', '/conversations/conv-admin-opaque'),
+    true,
+  );
+  check(
+    'a support target can read the opaque support messages',
+    await call(
+      TOKENS.student,
+      'GET',
+      '/conversations/conv-admin-opaque/messages/msg-admin-opaque',
+    ),
+    true,
+  );
+  check(
+    'the mapped administrator can read an opaque support conversation',
+    await call(TOKENS.admin, 'GET', '/conversations/conv-admin-opaque'),
+    true,
+  );
+  check(
+    'the mapped administrator can read the opaque support messages',
+    await call(
+      TOKENS.admin,
+      'GET',
+      '/conversations/conv-admin-opaque/messages/msg-admin-opaque',
+    ),
+    true,
+  );
+  check(
+    'a tenant cannot directly read a legacy raw-uid support conversation',
+    await call(TOKENS.student, 'GET', '/conversations/conv-admin'),
+    false,
+  );
+  check(
+    'a tenant cannot directly read a legacy raw-uid support message',
+    await call(
+      TOKENS.student,
+      'GET',
+      '/conversations/conv-admin/messages/msg-legacy-raw-admin',
+    ),
+    false,
+  );
+  check(
+    'the mapped administrator cannot directly read a legacy raw-uid support conversation',
+    await call(TOKENS.admin, 'GET', '/conversations/conv-admin'),
+    false,
+  );
+  check(
+    'an unmapped administrator cannot read an opaque support conversation',
+    await call(TOKENS.fakeAdmin, 'GET', '/conversations/conv-admin-opaque'),
+    false,
+  );
+  check(
+    'an ordinary user cannot read an opaque support conversation',
+    await call(TOKENS.stranger, 'GET', '/conversations/conv-admin-opaque'),
+    false,
+  );
+  check(
+    'the mapped administrator cannot read the server-only support operation',
+    await call(
+      TOKENS.admin,
+      'GET',
+      '/adminSupportConversationOperations/conv-admin-opaque',
+    ),
+    false,
+  );
+  check(
+    'a support target can reply to the opaque administrator identity',
+    await create(
+      TOKENS.student,
+      'conversations/conv-admin-opaque/messages',
+      'msg-opaque-support-reply',
+      {
+        messageId: string('msg-opaque-support-reply'),
+        conversationId: string('conv-admin-opaque'),
+        senderId: string('student1'),
+        receiverId: string(OPAQUE_ADMIN_IDENTITY),
+        content: string('Student support reply'),
+        type: string('text'),
+        createdAt: timestamp(),
+      },
+    ),
+    true,
+  );
+  check(
+    'the mapped administrator can read a tenant support reply',
+    await call(
+      TOKENS.admin,
+      'GET',
+      '/conversations/conv-admin-opaque/messages/msg-opaque-support-reply',
+    ),
+    true,
+  );
+  const mappedAdminMessageList = await call(
+    TOKENS.admin,
+    'GET',
+    '/conversations/conv-admin-opaque/messages?pageSize=100',
+  );
+  checkCondition(
+    'the mapped administrator can list the opaque support messages',
+    Array.isArray(mappedAdminMessageList.body?.documents),
+  );
+  checkCondition(
+    'the mapped administrator message list includes the tenant reply',
+    (mappedAdminMessageList.body?.documents || []).some((document) =>
+      String(document.name || '').endsWith('/msg-opaque-support-reply'),
+    ),
+  );
+  check(
+    'the mapped administrator cannot write directly to the opaque support conversation',
+    await create(
+      TOKENS.admin,
+      'conversations/conv-admin-opaque/messages',
+      'msg-opaque-admin-direct',
+      {
+        messageId: string('msg-opaque-admin-direct'),
+        conversationId: string('conv-admin-opaque'),
+        senderId: string('admin1'),
+        receiverId: string('student1'),
+        content: string('Direct opaque administrator write'),
+        type: string('text'),
+        createdAt: timestamp(),
+      },
+    ),
+    false,
+  );
+  check(
+    'an administrator cannot write directly to an adminSupport conversation',
+    await create(TOKENS.admin, 'conversations/conv-admin/messages', 'msg-admin-direct', {
+      messageId: string('msg-admin-direct'),
+      conversationId: string('conv-admin'),
+      senderId: string('admin1'),
+      receiverId: string('student1'),
+      content: string('Direct administrator write'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a legacy support target cannot reply while the raw uid remains',
+    await create(TOKENS.student, 'conversations/conv-admin/messages', 'msg-support-student-reply', {
+      messageId: string('msg-support-student-reply'),
+      conversationId: string('conv-admin'),
+      senderId: string('student1'),
+      receiverId: string('admin1'),
+      content: string('Student support reply'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'an owner support target can reply directly with the ordinary message schema',
+    await create(TOKENS.owner, 'conversations/conv-admin-opaque-owner/messages', 'msg-support-owner-reply', {
+      messageId: string('msg-support-owner-reply'),
+      conversationId: string('conv-admin-opaque-owner'),
+      senderId: string('owner1'),
+      receiverId: string(OPAQUE_ADMIN_IDENTITY),
+      content: string('Owner support reply'),
+      type: string('text'),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+  check(
+    'a support target can update the support conversation bookkeeping',
+    await update(TOKENS.student, 'conversations', 'conv-admin-opaque', {
+      lastMessage: string('Student support reply'),
+      lastMessageAt: timestamp(),
+      updatedAt: timestamp(),
+    }),
+    true,
+  );
+  check(
     'a participant cannot send a message while the conversation is being deleted',
     await create(TOKENS.student, 'conversations/conv-deleting/messages', 'msg-late', {
       messageId: string('msg-late'),
@@ -1669,6 +2136,132 @@ async function main() {
       content: string('Wrong path'),
       type: string('text'),
       createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a user cannot forge the verified Admin sender type',
+    await create(TOKENS.student, 'conversations/conv-admin/messages', 'msg-fake-admin', {
+      messageId: string('msg-fake-admin'),
+      conversationId: string('conv-admin'),
+      senderId: string('student1'),
+      receiverId: string('admin1'),
+      content: string('I am the administrator'),
+      type: string('text'),
+      senderType: string('admin'),
+      adminVerified: bool(true),
+      adminId: string('admin1'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a user cannot forge the Admin verification marker without the sender type',
+    await create(TOKENS.student, 'conversations/conv-admin/messages', 'msg-fake-admin-marker', {
+      messageId: string('msg-fake-admin-marker'),
+      conversationId: string('conv-admin'),
+      senderId: string('student1'),
+      receiverId: string('admin1'),
+      content: string('Still an administrator'),
+      type: string('text'),
+      adminVerified: bool(true),
+      adminId: string('admin1'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a user cannot forge only the Admin sender type',
+    await create(TOKENS.student, 'conversations/conv-admin/messages', 'msg-forged-sender-type', {
+      messageId: string('msg-forged-sender-type'),
+      conversationId: string('conv-admin'),
+      senderId: string('student1'),
+      receiverId: string('admin1'),
+      content: string('Forged sender type'),
+      type: string('text'),
+      senderType: string('admin'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a user cannot forge only the Admin verification marker',
+    await create(TOKENS.student, 'conversations/conv-admin/messages', 'msg-forged-admin-verified', {
+      messageId: string('msg-forged-admin-verified'),
+      conversationId: string('conv-admin'),
+      senderId: string('student1'),
+      receiverId: string('admin1'),
+      content: string('Forged verification marker'),
+      type: string('text'),
+      adminVerified: bool(true),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a user cannot forge only the Admin id marker',
+    await create(TOKENS.student, 'conversations/conv-admin/messages', 'msg-forged-admin-id', {
+      messageId: string('msg-forged-admin-id'),
+      conversationId: string('conv-admin'),
+      senderId: string('student1'),
+      receiverId: string('admin1'),
+      content: string('Forged admin id'),
+      type: string('text'),
+      adminId: string('admin1'),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a user cannot create a support conversation with forged Admin markers',
+    await create(TOKENS.student, 'conversations', 'conv-fake-admin', {
+      conversationId: string('conv-fake-admin'),
+      participantIds: array(['student1', 'admin1']),
+      conversationType: string('adminSupport'),
+      adminId: string('admin1'),
+      adminVerified: bool(true),
+      createdByServer: bool(true),
+      createdAt: timestamp(),
+      updatedAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a client administrator cannot create an adminSupport conversation',
+    await create(TOKENS.admin, 'conversations', 'conv-fake-admin-client', {
+      conversationId: string('conv-fake-admin-client'),
+      participantIds: array(['admin1', 'student1']),
+      conversationType: string('adminSupport'),
+      createdAt: timestamp(),
+      updatedAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot change an adminSupport conversation type',
+    await update(TOKENS.student, 'conversations', 'conv-admin', {
+      conversationType: string('booking'),
+    }),
+    false,
+  );
+  check(
+    'an administrator client cannot change the adminSupport admin id',
+    await update(TOKENS.admin, 'conversations', 'conv-admin', {
+      adminId: string('student1'),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot change the adminSupport verification marker',
+    await update(TOKENS.student, 'conversations', 'conv-admin', {
+      adminVerified: bool(false),
+    }),
+    false,
+  );
+  check(
+    'a participant cannot change the adminSupport server-created marker',
+    await update(TOKENS.student, 'conversations', 'conv-admin', {
+      createdByServer: bool(false),
     }),
     false,
   );
@@ -1932,6 +2525,34 @@ async function main() {
       studentId: string('student1'),
       rating: integer(5),
     }),
+    false,
+  );
+  check(
+    'a tenant cannot list the room-review collection directly',
+    await call(TOKENS.student, 'GET', '/roomReviews'),
+    false,
+  );
+  check(
+    'a tenant cannot read one room-review record directly',
+    await readAllowed(TOKENS.student, '/roomReviews/REV-TEST-1'),
+    false,
+  );
+  check(
+    'even an administrator cannot bypass the server review boundary',
+    await call(TOKENS.admin, 'GET', '/roomReviews'),
+    false,
+  );
+  check(
+    'a client cannot read server-only notification attribution',
+    await readAllowed(TOKENS.student, '/notificationAttributions/attribution-1'),
+    false,
+  );
+  check(
+    'a client cannot read administrator notification delivery state',
+    await readAllowed(
+      TOKENS.student,
+      '/adminMessageNotificationOperations/operation-1',
+    ),
     false,
   );
   check(

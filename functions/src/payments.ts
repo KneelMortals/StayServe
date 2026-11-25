@@ -32,6 +32,7 @@ import {
 import {
   assertActiveAccount,
   assertLiveAdmin,
+  assertLiveVerifiedPhone,
   canActAsAdmin,
 } from './accounts';
 import {
@@ -52,6 +53,44 @@ import {
 } from './interactions';
 
 const db = firestore.getFirestore();
+
+/** The normalized role stored in a user profile. */
+function participantRole(snapshot: firestore.DocumentSnapshot): string {
+  if (!snapshot.exists) return '';
+  return String(snapshot.get('role') || '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Verifies the live phone of a student or owner participant.
+ *
+ * Administrators do not participate as tenants and remain exempt from the
+ * phone requirement. An invalid role is left to the transaction-time
+ * role/registration/activity checks, which fail closed.
+ */
+async function assertLiveParticipantPhone(
+  uid: string,
+  role: string,
+): Promise<void> {
+  if (role === 'student' || role === 'owner') {
+    await assertLiveVerifiedPhone(uid);
+  }
+}
+
+/**
+ * Ensures that the participant still has the role which was checked against
+ * live Firebase Auth before the transaction started.
+ */
+function assertParticipantRoleUnchanged(
+  snapshot: firestore.DocumentSnapshot,
+  expectedRole: string,
+  message: string,
+): void {
+  if (participantRole(snapshot) !== expectedRole) {
+    throw new functions.https.HttpsError('failed-precondition', message);
+  }
+}
 
 /**
  * Platform-fee payments.
@@ -253,6 +292,39 @@ export const createUpiPayment = callableHttps.onCall(async (data, context) => {
 
   const requestRef = db.collection('joinRequests').doc(requestId);
 
+  // The caller has already been checked against live Firebase Auth by
+  // `assertActiveAccount`. The other booking party still needs its own live
+  // phone check. Firebase Auth cannot be called from the transaction
+  // callback, so the peer is read and verified before the transaction; the
+  // transaction below re-reads both party profiles and refuses any changed
+  // party identity or role.
+  let expectedStudentId = '';
+  let expectedOwnerId = '';
+  let expectedPeerId = '';
+  let expectedPeerRole = '';
+  const preliminaryRequest = await requestRef.get();
+  if (preliminaryRequest.exists) {
+    const preliminaryData = preliminaryRequest.data() as Record<string, any>;
+    expectedStudentId = String(preliminaryData.studentId || '').trim();
+    expectedOwnerId = String(preliminaryData.ownerId || '').trim();
+    if (expectedStudentId === callerUid) {
+      expectedPeerId = expectedOwnerId;
+    } else if (expectedOwnerId === callerUid) {
+      expectedPeerId = expectedStudentId;
+    }
+    if (expectedPeerId) {
+      const preliminaryPeer = await db
+        .collection('users')
+        .doc(expectedPeerId)
+        .get();
+      expectedPeerRole = participantRole(preliminaryPeer);
+      await assertLiveParticipantPhone(
+        expectedPeerId,
+        expectedPeerRole,
+      );
+    }
+  }
+
   // The request, both live party profiles and the room are read from one
   // transaction snapshot. A role change, an account-deletion fence or a
   // listing-status change therefore cannot race with the creation of a
@@ -286,12 +358,26 @@ export const createUpiPayment = callableHttps.onCall(async (data, context) => {
         'This booking request belongs to somebody else',
       );
     }
+    if (
+      studentId !== expectedStudentId ||
+      ownerId !== expectedOwnerId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The parties on this booking changed. Please try again.',
+      );
+    }
 
     const studentSnapshot = await transaction.get(
       db.collection('users').doc(studentId),
     );
     const ownerSnapshot = await transaction.get(
       db.collection('users').doc(ownerId),
+    );
+    assertParticipantRoleUnchanged(
+      isStudent ? ownerSnapshot : studentSnapshot,
+      expectedPeerRole,
+      'The other party on this booking changed. Please try again.',
     );
 
     if (
@@ -507,6 +593,37 @@ export const submitPayment = callableHttps.onCall(async (data, context) => {
   const ref = db.collection('joinRequests').doc(requestId);
   const paymentRef = db.collection('payments').doc(requestId);
 
+  // The caller has already been checked against live Firebase Auth by
+  // `assertActiveAccount`. Verify the other booking party's phone before the
+  // transaction, then re-check the party identities and roles inside the
+  // transaction which records the payment.
+  let expectedStudentId = '';
+  let expectedOwnerId = '';
+  let expectedPeerId = '';
+  let expectedPeerRole = '';
+  const preliminaryRequest = await ref.get();
+  if (preliminaryRequest.exists) {
+    const preliminaryData = preliminaryRequest.data() as Record<string, any>;
+    expectedStudentId = String(preliminaryData.studentId || '').trim();
+    expectedOwnerId = String(preliminaryData.ownerId || '').trim();
+    if (expectedStudentId === callerUid) {
+      expectedPeerId = expectedOwnerId;
+    } else if (expectedOwnerId === callerUid) {
+      expectedPeerId = expectedStudentId;
+    }
+    if (expectedPeerId) {
+      const preliminaryPeer = await db
+        .collection('users')
+        .doc(expectedPeerId)
+        .get();
+      expectedPeerRole = participantRole(preliminaryPeer);
+      await assertLiveParticipantPhone(
+        expectedPeerId,
+        expectedPeerRole,
+      );
+    }
+  }
+
   // ---------------------------------------------------------------------
   // Everything happens in **one** transaction, so the payment record and the
   // request can never drift apart.
@@ -545,10 +662,31 @@ export const submitPayment = callableHttps.onCall(async (data, context) => {
         'This request does not identify a room.',
       );
     }
+    if (
+      studentId !== expectedStudentId ||
+      ownerId !== expectedOwnerId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The parties on this booking changed. Please try again.',
+      );
+    }
 
     const tenantSnapshot = await transaction.get(
       db.collection('users').doc(studentId),
     );
+    const ownerSnapshot = await transaction.get(
+      db.collection('users').doc(ownerId),
+    );
+    const callerIsStudent = studentId === callerUid;
+    const callerIsOwner = ownerId === callerUid;
+    if (callerIsStudent || callerIsOwner) {
+      assertParticipantRoleUnchanged(
+        callerIsStudent ? ownerSnapshot : tenantSnapshot,
+        expectedPeerRole,
+        'The other party on this booking changed. Please try again.',
+      );
+    }
     if (
       !canBookAsStudent({
         exists: tenantSnapshot.exists,
@@ -563,9 +701,6 @@ export const submitPayment = callableHttps.onCall(async (data, context) => {
       );
     }
 
-    const ownerSnapshot = await transaction.get(
-      db.collection('users').doc(ownerId),
-    );
     if (
       !canActAsRoomOwner({
         exists: ownerSnapshot.exists,
@@ -874,6 +1009,43 @@ export const verifyPayment = callableHttps.onCall(async (data, context) => {
   const invoiceRef = db.collection('commissionInvoices').doc(`INV-${requestId}`);
   const status = approve ? 'verified' : 'rejected';
 
+  // Approval activates a real tenancy, so both student and owner parties
+  // must have live verified Firebase phones. The administrator actor remains
+  // exempt. Read and verify both participants before the transaction, then
+  // re-check their identities and roles in the transaction which activates
+  // the booking.
+  let expectedStudentId = '';
+  let expectedOwnerId = '';
+  let expectedStudentRole = '';
+  let expectedOwnerRole = '';
+  if (approve) {
+    const preliminaryRequest = await requestRef.get();
+    if (preliminaryRequest.exists) {
+      const preliminaryData = preliminaryRequest.data() as Record<string, any>;
+      const preliminaryStatus = String(preliminaryData.status || '');
+      if (!isActiveBookingStatus(preliminaryStatus)) {
+        expectedStudentId = String(preliminaryData.studentId || '').trim();
+        expectedOwnerId = String(preliminaryData.ownerId || '').trim();
+        if (expectedStudentId && expectedOwnerId) {
+          const [preliminaryStudent, preliminaryOwner] = await Promise.all([
+            db.collection('users').doc(expectedStudentId).get(),
+            db.collection('users').doc(expectedOwnerId).get(),
+          ]);
+          expectedStudentRole = participantRole(preliminaryStudent);
+          expectedOwnerRole = participantRole(preliminaryOwner);
+          await assertLiveParticipantPhone(
+            expectedStudentId,
+            expectedStudentRole,
+          );
+          await assertLiveParticipantPhone(
+            expectedOwnerId,
+            expectedOwnerRole,
+          );
+        }
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------
   // The decision happens inside a **transaction**.
   //
@@ -950,6 +1122,17 @@ export const verifyPayment = callableHttps.onCall(async (data, context) => {
     const studentId = String(request.studentId || '');
     const ownerId = String(request.ownerId || '');
     const roomId = String(request.roomId || '');
+
+    if (
+      approve &&
+      !wasAlreadyActive &&
+      (studentId !== expectedStudentId || ownerId !== expectedOwnerId)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The parties on this booking changed. Please try again.',
+      );
+    }
 
     const roomRef = roomId
       ? db.collection('rooms').doc(roomId)
@@ -1050,6 +1233,11 @@ export const verifyPayment = callableHttps.onCall(async (data, context) => {
         const tenantSnapshot = await transaction.get(
           db.collection('users').doc(studentId),
         );
+        assertParticipantRoleUnchanged(
+          tenantSnapshot,
+          expectedStudentRole,
+          'The student on this booking changed. Please try again.',
+        );
         if (
           !canBookAsStudent({
             exists: tenantSnapshot.exists,
@@ -1069,6 +1257,11 @@ export const verifyPayment = callableHttps.onCall(async (data, context) => {
         // new tenancy committed under their listing.
         const ownerSnapshot = await transaction.get(
           db.collection('users').doc(ownerId),
+        );
+        assertParticipantRoleUnchanged(
+          ownerSnapshot,
+          expectedOwnerRole,
+          'The room owner on this booking changed. Please try again.',
         );
         if (
           !canActAsRoomOwner({

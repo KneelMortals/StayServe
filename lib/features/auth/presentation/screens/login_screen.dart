@@ -32,19 +32,33 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     }
 
     AppLogger.info(
-      'Signing in as ${_emailController.text.trim()}',
+      'Signing in as ${AppHelpers.maskEmail(_emailController.text.trim())}',
     );
 
-    await ref.read(authControllerProvider.notifier).signIn(
-      email: _emailController.text.trim(),
-      password: _passwordController.text,
-    );
+    await ref
+        .read(authControllerProvider.notifier)
+        .signIn(
+          email: _emailController.text.trim(),
+          password: _passwordController.text,
+        );
 
     final state = ref.read(authControllerProvider);
     AppLogger.info(
       'The sign-in finished: hasError=${state.hasError}'
       '${state.hasError ? " (${readableAuthError(state.error!)})" : ""}',
     );
+  }
+
+  Future<void> _handleGoogleSignIn() async {
+    await ref.read(authControllerProvider.notifier).signInWithGoogle();
+    if (!mounted) return;
+    if (ref.read(authControllerProvider).error == null) {
+      context.go('/role-selection');
+    }
+  }
+
+  void _handlePhoneSignIn() {
+    context.go('/phone-auth');
   }
 
   @override
@@ -86,7 +100,9 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                         height: 80,
                         decoration: BoxDecoration(
                           color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(AppBorderRadius.xl),
+                          borderRadius: BorderRadius.circular(
+                            AppBorderRadius.xl,
+                          ),
                         ),
                         child: Icon(
                           Icons.home_outlined,
@@ -126,13 +142,17 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                   hint: 'Enter your password',
                   obscureText: _obscurePassword,
                   textInputAction: TextInputAction.done,
-                  validator: (value) => AppValidators.validateRequired(value, 'Password'),
+                  validator: (value) =>
+                      AppValidators.validateRequired(value, 'Password'),
                   prefixIcon: const Icon(Icons.lock_outline),
                   suffixIcon: IconButton(
                     icon: Icon(
-                      _obscurePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                      _obscurePassword
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
                     ),
-                    onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                    onPressed: () =>
+                        setState(() => _obscurePassword = !_obscurePassword),
                   ),
                   onFieldSubmitted: (_) => _handleLogin(),
                 ),
@@ -149,6 +169,33 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                   label: 'Sign In',
                   onPressed: _handleLogin,
                   isLoading: authState.isLoading,
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                Row(
+                  children: [
+                    const Expanded(child: Divider()),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.sm,
+                      ),
+                      child: Text('or', style: theme.textTheme.bodySmall),
+                    ),
+                    const Expanded(child: Divider()),
+                  ],
+                ),
+                const SizedBox(height: AppSpacing.md),
+                AppButton(
+                  label: 'Continue with Google',
+                  type: ButtonType.secondary,
+                  icon: const Icon(Icons.g_mobiledata, size: 24),
+                  onPressed: authState.isLoading ? null : _handleGoogleSignIn,
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                AppButton(
+                  label: 'Sign in with Phone',
+                  type: ButtonType.secondary,
+                  icon: const Icon(Icons.phone_outlined),
+                  onPressed: authState.isLoading ? null : _handlePhoneSignIn,
                 ),
                 const SizedBox(height: AppSpacing.xl),
                 // A `Wrap` and not a `Row`: on a narrow phone (400 px) the

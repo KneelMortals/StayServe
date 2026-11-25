@@ -19,14 +19,33 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
+    // Firebase exposes `phone_number` in the ID token only while a verified
+    // phone provider is attached to the account. The signed token fact is the
+    // Storage gate: the Firestore `phoneVerified` value is only a cache and
+    // must never grant access by itself. Using the token here also keeps a
+    // legitimate legacy tenant usable while the server backfills that cache.
+    function hasVerifiedPhoneToken() {
+      return request.auth != null &&
+        request.auth.token.get('phone_number', null) != null &&
+        request.auth.token.get('phone_number', '') != '';
+    }
+
     // A live account has completed its registration and is active.
+    // Students and owners must also have a Firebase-verified phone before
+    // they may use owner/student services. Administrators are exempt because
+    // they operate the platform rather than rent or list a room.
     function isLiveRegisteredAccount() {
       return request.auth != null &&
         firestore.exists(/databases/(default)/documents/users/$(request.auth.uid)) &&
         firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
           .data.get('registrationCompleted', false) == true &&
         firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
-          .data.get('isActive', false) == true;
+          .data.get('isActive', false) == true &&
+        (
+          firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
+            .data.get('role', '') == 'admin' ||
+          hasVerifiedPhoneToken()
+        );
     }
 
     function isLiveOwner() {

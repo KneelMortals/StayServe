@@ -34,6 +34,8 @@ import {
 } from './roleClaims';
 import { notify } from './notifications';
 import { areNotificationsEnabled } from './platform';
+import { ensureUserProfile } from './profileBootstrap';
+import { processRegistrationRollbackOperations } from './authProfile';
 
 const db = firestore.getFirestore();
 const auth = authSdk.getAuth();
@@ -313,6 +315,14 @@ async function cancelRoleAffectedRequests(
 // OTP verification (email + mobile).
 export { sendOtp, verifyOtp, registerUserRole, completeRegistration } from './otp';
 
+// Firebase-verified contact synchronisation. The phone and email facts in
+// the Firestore profile are copied only from the live Firebase Auth record.
+export {
+  syncAuthProfile,
+  linkVerifiedEmail,
+  rollbackIncompleteRegistration,
+} from './authProfile';
+
 // Platform-fee payments (server-authoritative payee, amount and verification).
 export { createUpiPayment, submitPayment, verifyPayment } from './payments';
 
@@ -342,6 +352,10 @@ export {
   unblockUser,
 } from './interactions';
 
+// Administrator support messaging. The sender identity and the verified
+// badge are written only by the server.
+export { sendAdminMessage } from './adminMessaging';
+
 // Notification content and deletion are server-owned. Clients may only
 // update the read bookkeeping of their own notification.
 export { deleteNotification } from './notifications';
@@ -364,7 +378,12 @@ export {
 // A student may only review a room whose request the owner has accepted —
 // the check is made on the server, so a modified client cannot review a
 // room it was never accepted for.
-export { submitRoomReview, deleteRoomReview } from './reviews';
+export {
+  getRoomReviews,
+  submitRoomReview,
+  deleteRoomReview,
+  deleteAnyRoomReview,
+} from './reviews';
 
 // The visit details of a room.
 //
@@ -1276,49 +1295,10 @@ export const deleteUserCompletely = callableHttps.onCall(async (data, context) =
 // ============================================
 export const onUserCreate = functions.auth.user().onCreate(async (user) => {
   try {
-    const userRef = db.collection('users').doc(user.uid);
-
-    // ---------------------------------------------------------------
-    // The profile is seeded with `create()`, **not** with
-    // `set({...}, {merge: true})`.
-    //
-    // The old code first read the document and only then wrote it, which
-    // left a window in which the client — which writes the role the user
-    // actually picked during the sign-up — could create the profile
-    // first. The seed then merged over it and replaced `role: 'owner'`
-    // with `role: 'student'`.
-    //
-    // The result was an account that had the "owner" claim but a
-    // "student" profile, so the app opened the student home for an owner.
-    //
-    // `create()` is atomic: it fails with ALREADY_EXISTS when the document
-    // is already there, so the seed can never overwrite a profile that
-    // somebody else has written.
-    // ---------------------------------------------------------------
-    try {
-      await userRef.create({
-        uid: user.uid,
-        name: user.displayName || 'User',
-        email: user.email || '',
-        phone: user.phoneNumber || null,
-        role: 'student',
-        // The trigger's default role is not a user-selected role yet. The
-        // first successful registration call may replace it exactly once.
-        roleClaimed: false,
-        isActive: true,
-        // The account is not usable until the server has verified the
-        // registration challenge and written the final role.
-        registrationCompleted: false,
-        createdAt: firestore.FieldValue.serverTimestamp(),
-        updatedAt: firestore.FieldValue.serverTimestamp(),
-        savedRooms: [],
-      });
-    } catch (error) {
-      if (!isAlreadyExists(error)) {
-        throw error;
-      }
-      // Somebody else (the client) created the profile first — keep it.
-    }
+    // The bootstrap is atomic and repairs the malformed partial profile
+    // which an older FCM client could create when it won the race with this
+    // trigger. A retry of the trigger leaves the complete profile untouched.
+    const result = await ensureUserProfile(user);
 
     // ---------------------------------------------------------------
     // Custom claims are deliberately **not** written by this trigger.
@@ -1334,7 +1314,7 @@ export const onUserCreate = functions.auth.user().onCreate(async (user) => {
     // the account is blocked by the live `registrationCompleted` check, so
     // no default claim is needed.
     // ---------------------------------------------------------------
-    console.log(`User profile created for ${user.uid}`);
+    console.log(`User profile ${result} for ${user.uid}`);
   } catch (error) {
     console.error('Error in onUserCreate:', error);
     // Let the background trigger retry. Swallowing this error would leave an
@@ -1343,23 +1323,6 @@ export const onUserCreate = functions.auth.user().onCreate(async (user) => {
     throw error;
   }
 });
-
-/**
- * Whether the error means "the document already exists".
- *
- * The gRPC status code for `ALREADY_EXISTS` is 6. Depending on the version
- * of the Firebase Admin SDK the error carries that number, or the string
- * `already-exists`, so both are accepted.
- */
-function isAlreadyExists(error: unknown): boolean {
-  const code = (error as { code?: number | string })?.code;
-  return (
-    code === 6 ||
-    code === 'already-exists' ||
-    code === 'ALREADY_EXISTS' ||
-    code === 'already_exists'
-  );
-}
 
 // ============================================
 // TRIGGER: On User Delete - Cleanup
@@ -1389,6 +1352,25 @@ export const onUserDelete = functions.auth.user().onDelete(async (user) => {
     throw error;
   }
 });
+
+/**
+ * Finishes incomplete-registration rollbacks whose Auth deletion was
+ * transiently unavailable.
+ *
+ * The client writes a durable rollback marker before it attempts the Auth
+ * deletion. If that external call fails, the marker remains
+ * `rollbackRequested`; this worker retries it without requiring the client
+ * to stay online or to prove the rollback again.
+ */
+export const retryIncompleteRegistrationRollbacks = functions.pubsub
+  .schedule('every 5 minutes')
+  .onRun(async () => {
+    const summary = await processRegistrationRollbackOperations();
+    console.log(
+      `Registration rollback retry: ${JSON.stringify(summary)}`,
+    );
+    return summary;
+  });
 
 // ============================================
 // ADMIN: Run a maintenance task on demand

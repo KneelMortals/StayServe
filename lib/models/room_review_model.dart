@@ -10,6 +10,14 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 /// button is shown at the right moment.
 class RoomReviewModel {
   final String reviewId;
+
+  /// The immutable lifecycle of this review.
+  ///
+  /// The document id is reused when a review is edited. This separate id
+  /// changes after moderation and recreation, so delayed edits/deletes can be
+  /// rejected instead of affecting the wrong lifecycle.
+  final String reviewInstanceId;
+
   final String roomId;
   final String studentId;
   final String ownerId;
@@ -34,6 +42,7 @@ class RoomReviewModel {
 
   const RoomReviewModel({
     required this.reviewId,
+    required this.reviewInstanceId,
     required this.roomId,
     required this.studentId,
     required this.ownerId,
@@ -48,6 +57,7 @@ class RoomReviewModel {
   factory RoomReviewModel.fromJson(String reviewId, Map<String, dynamic> json) {
     return RoomReviewModel(
       reviewId: json['reviewId'] as String? ?? reviewId,
+      reviewInstanceId: json['reviewInstanceId'] as String? ?? '',
       roomId: json['roomId'] as String? ?? '',
       studentId: json['studentId'] as String? ?? '',
       ownerId: json['ownerId'] as String? ?? '',
@@ -67,6 +77,7 @@ class RoomReviewModel {
   Map<String, dynamic> toJson() {
     return {
       'reviewId': reviewId,
+      'reviewInstanceId': reviewInstanceId,
       'roomId': roomId,
       'studentId': studentId,
       'ownerId': ownerId,
@@ -89,6 +100,7 @@ class RoomReviewModel {
         other is RoomReviewModel &&
             runtimeType == other.runtimeType &&
             reviewId == other.reviewId &&
+            reviewInstanceId == other.reviewInstanceId &&
             roomId == other.roomId &&
             studentId == other.studentId &&
             ownerId == other.ownerId &&
@@ -102,20 +114,22 @@ class RoomReviewModel {
 
   @override
   int get hashCode => Object.hash(
-        reviewId,
-        roomId,
-        studentId,
-        ownerId,
-        joinRequestId,
-        rating,
-        comment,
-        studentName,
-        createdAt,
-        updatedAt,
-      );
+    reviewId,
+    reviewInstanceId,
+    roomId,
+    studentId,
+    ownerId,
+    joinRequestId,
+    rating,
+    comment,
+    studentName,
+    createdAt,
+    updatedAt,
+  );
 
   @override
-  String toString() => 'RoomReviewModel(reviewId: $reviewId, roomId: $roomId, '
+  String toString() =>
+      'RoomReviewModel(reviewId: $reviewId, roomId: $roomId, '
       'studentId: $studentId, rating: $rating)';
 }
 
@@ -159,8 +173,7 @@ class ReviewSummary {
   }
 
   /// The label of the average — e.g. "4.5".
-  String get averageLabel =>
-      count == 0 ? '—' : average.toStringAsFixed(1);
+  String get averageLabel => count == 0 ? '—' : average.toStringAsFixed(1);
 }
 
 /// Reads the rating of a review.
@@ -180,6 +193,9 @@ int _readRating(dynamic value) {
 DateTime _toDate(dynamic value) {
   if (value is Timestamp) return value.toDate();
   if (value is DateTime) return value;
+  if (value is num && value.isFinite) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
   if (value is String) {
     final parsed = DateTime.tryParse(value);
     if (parsed != null) return parsed;

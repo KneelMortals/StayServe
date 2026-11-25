@@ -1,0 +1,54 @@
+{
+  "project_info": {
+    "project_number": "96035616668",
+    "project_id": "myfirstapp-fa30f52b",
+    "storage_bucket": "myfirstapp-fa30f52b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:96035616668:android:cfc3cf3dab21aa9488fa59",
+        "android_client_info": {
+          "package_name": "com.stayserve.stayserve"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "96035616668-rm2d2f86fj1pgmsqjbr6onss5bshfcos.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.stayserve.stayserve",
+            "certificate_hash": "9c527124d069e9a5c8a4121568513af3fa3c8d09"
+          }
+        },
+        {
+          "client_id": "96035616668-qj160l9h366qr26nn2s60kfl15ess6gv.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "96035616668-qj160l9h366qr26nn2s60kfl15ess6gv.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "96035616668-vlen8u59amj2i9m44h9cqq05snrta7pq.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.stayserve.stayserve"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

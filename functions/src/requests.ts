@@ -28,7 +28,11 @@ import {
   isValidMonthlyRent,
   roomBookingRejectionMessage,
 } from './roomValidation';
-import { assertActiveAccount } from './accounts';
+import {
+  assertActiveAccount,
+  assertLiveVerifiedPhone,
+  canActAsAdmin,
+} from './accounts';
 import {
   assertPairIsNotBlocked,
   profileDisplayName,
@@ -41,8 +45,50 @@ import {
   notify as pushNotification,
   pushToDevice,
 } from './notifications';
+import {
+  ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+  ADMIN_SUPPORT_IDENTITY,
+} from './adminSupport';
 
 const db = firestore.getFirestore();
+
+/** The normalized role stored in a user profile. */
+function participantRole(snapshot: firestore.DocumentSnapshot): string {
+  if (!snapshot.exists) return '';
+  return String(snapshot.get('role') || '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Verifies the live phone of a student or owner participant.
+ *
+ * Administrators do not participate as tenants and remain exempt from the
+ * phone requirement. An invalid role is left to the transaction-time
+ * role/registration/activity checks, which fail closed.
+ */
+async function assertLiveParticipantPhone(
+  uid: string,
+  role: string,
+): Promise<void> {
+  if (role === 'student' || role === 'owner') {
+    await assertLiveVerifiedPhone(uid);
+  }
+}
+
+/**
+ * Ensures that the participant still has the role which was checked against
+ * live Firebase Auth before the transaction started.
+ */
+function assertParticipantRoleUnchanged(
+  snapshot: firestore.DocumentSnapshot,
+  expectedRole: string,
+  message: string,
+): void {
+  if (participantRole(snapshot) !== expectedRole) {
+    throw new functions.https.HttpsError('failed-precondition', message);
+  }
+}
 
 /**
  * Booking requests (join requests).
@@ -133,6 +179,10 @@ export const createJoinRequest = callableHttps.onCall(async (data, context) => {
   }
 
   const uid = context.auth.uid;
+  // The live Auth phone is authoritative. This check also repairs a legacy
+  // profile which predates the server-owned `phoneVerified` cache before the
+  // transaction below evaluates the student's role.
+  await assertActiveAccount(uid);
   const roomId = String(data?.roomId || '').trim();
   if (!roomId) {
     throw new functions.https.HttpsError('invalid-argument', 'Missing room');
@@ -170,6 +220,41 @@ export const createJoinRequest = callableHttps.onCall(async (data, context) => {
       'You already live in this room',
     );
   }
+
+  // The room owner is a participant in the new booking and therefore needs
+  // a live verified Firebase phone. Firebase Auth cannot be read from a
+  // Firestore transaction callback, so this preflight check is completed
+  // before the transaction. The transaction below re-reads both the listing
+  // and the owner profile and refuses a participant whose identity or role
+  // changed after this check.
+  const roomForOwner = await roomRef.get();
+  if (!roomForOwner.exists) {
+    throw new functions.https.HttpsError(
+      'not-found',
+      'That room no longer exists',
+    );
+  }
+  const expectedOwnerId = String(
+    roomForOwner.get('ownerId') || '',
+  ).trim();
+  if (!expectedOwnerId) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This listing has no owner and cannot be booked',
+    );
+  }
+  if (expectedOwnerId === uid) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'You cannot request to join your own room',
+    );
+  }
+  const expectedOwnerSnapshot = await db
+    .collection('users')
+    .doc(expectedOwnerId)
+    .get();
+  const expectedOwnerRole = participantRole(expectedOwnerSnapshot);
+  await assertLiveParticipantPhone(expectedOwnerId, expectedOwnerRole);
 
   // ---------------------------------------------------------------------
   // The id of the request.
@@ -257,12 +342,23 @@ export const createJoinRequest = callableHttps.onCall(async (data, context) => {
         'You cannot request to join your own room',
       );
     }
+    if (ownerId !== expectedOwnerId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The owner of this listing changed. Please try again.',
+      );
+    }
 
     // The owner profile is read in the same transaction as the request. A
     // demoted, banned or deleting owner therefore cannot gain a new request
     // after their live authority was removed.
     const ownerSnapshot = await transaction.get(
       db.collection('users').doc(ownerId),
+    );
+    assertParticipantRoleUnchanged(
+      ownerSnapshot,
+      expectedOwnerRole,
+      'The owner of this listing changed. Please try again.',
     );
     if (
       !canActAsRoomOwner({
@@ -481,6 +577,31 @@ export const respondToJoinRequest = callableHttps.onCall(async (data, context) =
 
   const ref = db.collection('joinRequests').doc(requestId);
 
+  // Approval advances the request with a student as the other participant.
+  // Read that participant before the transaction and verify the student's
+  // live Firebase phone. The transaction still re-reads the request and the
+  // student profile and verifies the role, registration and active state.
+  let expectedStudentId = '';
+  let expectedStudentRole = '';
+  const preliminaryRequest = await ref.get();
+  if (preliminaryRequest.exists) {
+    const preliminaryData = preliminaryRequest.data() as Record<string, any>;
+    if (approve && preliminaryData.ownerId === uid) {
+      expectedStudentId = String(preliminaryData.studentId || '').trim();
+      if (expectedStudentId) {
+        const preliminaryStudent = await db
+          .collection('users')
+          .doc(expectedStudentId)
+          .get();
+        expectedStudentRole = participantRole(preliminaryStudent);
+        await assertLiveParticipantPhone(
+          expectedStudentId,
+          expectedStudentRole,
+        );
+      }
+    }
+  }
+
   // The request is read inside the transaction, so the state that is
   // checked is the state the write is based on.
   const request = await db.runTransaction(async (transaction) => {
@@ -535,6 +656,13 @@ export const respondToJoinRequest = callableHttps.onCall(async (data, context) =
           'This request does not have a valid student tenant.',
         );
       }
+      const studentId = String(request.studentId || '').trim();
+      if (studentId !== expectedStudentId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The student on this request changed. Please try again.',
+        );
+      }
       const blockState = await readPairBlockStateInTransaction(
         transaction,
         String(request.studentId || '').trim(),
@@ -580,6 +708,11 @@ export const respondToJoinRequest = callableHttps.onCall(async (data, context) =
 
       const tenantSnapshot = await transaction.get(
         db.collection('users').doc(studentId),
+      );
+      assertParticipantRoleUnchanged(
+        tenantSnapshot,
+        expectedStudentRole,
+        'The student on this request changed. Please try again.',
       );
       if (
         !canBookAsStudent({
@@ -710,6 +843,30 @@ export const confirmJoinAsStudent = callableHttps.onCall(async (data, context) =
 
   const ref = db.collection('joinRequests').doc(requestId);
 
+  // The owner is the other participant in this confirmation. Verify the
+  // owner's live Firebase phone before the transaction, then re-check the
+  // owner identity, role, registration and active state in the transaction.
+  let expectedOwnerId = '';
+  let expectedOwnerRole = '';
+  const preliminaryRequest = await ref.get();
+  if (preliminaryRequest.exists) {
+    const preliminaryData = preliminaryRequest.data() as Record<string, any>;
+    if (preliminaryData.studentId === uid) {
+      expectedOwnerId = String(preliminaryData.ownerId || '').trim();
+      if (expectedOwnerId) {
+        const preliminaryOwner = await db
+          .collection('users')
+          .doc(expectedOwnerId)
+          .get();
+        expectedOwnerRole = participantRole(preliminaryOwner);
+        await assertLiveParticipantPhone(
+          expectedOwnerId,
+          expectedOwnerRole,
+        );
+      }
+    }
+  }
+
   const request = await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(ref);
     if (!snapshot.exists) {
@@ -767,12 +924,23 @@ export const confirmJoinAsStudent = callableHttps.onCall(async (data, context) =
         'This request does not identify a complete booking.',
       );
     }
+    if (ownerId !== expectedOwnerId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The room owner on this request changed. Please try again.',
+      );
+    }
 
     // Both the owner profile and the listing are checked in the same
     // transaction as the confirmation. A deleted owner, a demoted owner or
     // an unavailable room cannot become payable through a stale request.
     const ownerSnapshot = await transaction.get(
       db.collection('users').doc(ownerId),
+    );
+    assertParticipantRoleUnchanged(
+      ownerSnapshot,
+      expectedOwnerRole,
+      'The room owner on this request changed. Please try again.',
     );
     if (
       !canActAsRoomOwner({
@@ -1085,12 +1253,161 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
 
   await assertActiveAccount(uid);
 
-  const participants = [uid, otherUserId].sort();
-  const conversationId = participants.join('_');
-  const conversationRef = db.collection('conversations').doc(conversationId);
   const requestRef = requestId
     ? db.collection('joinRequests').doc(requestId)
     : null;
+
+  // Resolve the caller/peer relationship before checking the peer's live
+  // phone. `otherUserId` is client supplied, so probing Firebase Auth first
+  // would let a tenant use this callable as an oracle for an arbitrary
+  // account's phone-verification state.
+  let expectedPeerRole = '';
+  let expectedRoomId = requestedRoomId;
+  let expectedRoomOwnerId = '';
+  let requestCallerIsStudent = false;
+  if (requestRef) {
+    const preliminaryRequest = await requestRef.get();
+    if (!preliminaryRequest.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That booking request no longer exists',
+      );
+    }
+    const preliminaryData =
+      preliminaryRequest.data() as Record<string, any>;
+    const studentId = String(preliminaryData.studentId || '').trim();
+    const ownerId = String(preliminaryData.ownerId || '').trim();
+    const requestRoomId = String(preliminaryData.roomId || '').trim();
+    const callerIsStudent = studentId === uid;
+    const callerIsOwner = ownerId === uid;
+    requestCallerIsStudent = callerIsStudent;
+    if (!callerIsStudent && !callerIsOwner) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'This booking request belongs to somebody else',
+      );
+    }
+    const relationshipPeerId = callerIsStudent ? ownerId : studentId;
+    if (!relationshipPeerId || relationshipPeerId !== otherUserId) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'The conversation participant does not match this booking request',
+      );
+    }
+    if (!requestRoomId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This booking request does not identify a room',
+      );
+    }
+    if (requestedRoomId && requestedRoomId !== requestRoomId) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'The room does not match this booking request',
+      );
+    }
+    expectedRoomId = requestRoomId;
+    expectedRoomOwnerId = ownerId;
+  } else {
+    expectedRoomOwnerId = otherUserId;
+  }
+
+  const preliminaryRoom = await db
+    .collection('rooms')
+    .doc(expectedRoomId)
+    .get();
+  if (!preliminaryRoom.exists) {
+    throw new functions.https.HttpsError(
+      'not-found',
+      'That room no longer exists',
+    );
+  }
+  const preliminaryRoomOwnerId = String(
+    preliminaryRoom.get('ownerId') || '',
+  ).trim();
+  if (!preliminaryRoomOwnerId) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This listing has no owner',
+    );
+  }
+  if (preliminaryRoomOwnerId !== expectedRoomOwnerId) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The room owner does not match this conversation participant.',
+    );
+  }
+
+  const [preliminaryCaller, preliminaryPeer] = await Promise.all([
+    db.collection('users').doc(uid).get(),
+    db.collection('users').doc(otherUserId).get(),
+  ]);
+  const callerIsStudent = canBookAsStudent({
+    exists: preliminaryCaller.exists,
+    registrationCompleted: preliminaryCaller.get('registrationCompleted'),
+    isActive: preliminaryCaller.get('isActive'),
+    role: preliminaryCaller.get('role'),
+  });
+  const callerIsOwner = canActAsRoomOwner({
+    exists: preliminaryCaller.exists,
+    registrationCompleted: preliminaryCaller.get('registrationCompleted'),
+    isActive: preliminaryCaller.get('isActive'),
+    role: preliminaryCaller.get('role'),
+  });
+  const peerIsStudent = canBookAsStudent({
+    exists: preliminaryPeer.exists,
+    registrationCompleted: preliminaryPeer.get('registrationCompleted'),
+    isActive: preliminaryPeer.get('isActive'),
+    role: preliminaryPeer.get('role'),
+  });
+  const peerIsOwner = canActAsRoomOwner({
+    exists: preliminaryPeer.exists,
+    registrationCompleted: preliminaryPeer.get('registrationCompleted'),
+    isActive: preliminaryPeer.get('isActive'),
+    role: preliminaryPeer.get('role'),
+  });
+  if (!callerIsStudent && !callerIsOwner) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'This account cannot start a conversation.',
+    );
+  }
+  if (requestRef) {
+    if (
+      (requestCallerIsStudent && !callerIsStudent) ||
+      (!requestCallerIsStudent && !callerIsOwner)
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'This account cannot open this booking conversation.',
+      );
+    }
+    if (
+      (requestCallerIsStudent && !peerIsOwner) ||
+      (!requestCallerIsStudent && !peerIsStudent)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The other participant is no longer available for this conversation.',
+      );
+    }
+  } else if (!callerIsStudent || !peerIsOwner) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'A room conversation may only be opened with the owner of that room.',
+    );
+  }
+
+  // The peer is now proven to be the other party in this exact booking or
+  // room interaction. Only then is its live Firebase phone checked. The
+  // transaction below re-reads the peer and refuses any changed identity or
+  // role.
+  expectedPeerRole = participantRole(preliminaryPeer);
+  await assertLiveParticipantPhone(otherUserId, expectedPeerRole);
+
+  const participants = [uid, otherUserId].sort();
+  const conversationId = participants.join('_');
+  const conversationRef = db.collection('conversations').doc(conversationId);
   let result: Record<string, any> = {};
 
   await db.runTransaction(async (transaction) => {
@@ -1151,6 +1468,11 @@ export const openConversation = callableHttps.onCall(async (data, context) => {
     );
     const peerSnapshot = await transaction.get(
       db.collection('users').doc(otherUserId),
+    );
+    assertParticipantRoleUnchanged(
+      peerSnapshot,
+      expectedPeerRole,
+      'The other participant is no longer available for this conversation.',
     );
 
     if (!roomSnapshot.exists) {
@@ -1420,6 +1742,7 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
   }
 
   const uid = context.auth.uid;
+  await assertActiveAccount(uid);
   const recipientId = String(data?.userId || '').trim();
   const type = String(data?.type || '').trim();
   const payload = (data?.data && typeof data.data === 'object'
@@ -1454,6 +1777,128 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
     throw new functions.https.HttpsError('invalid-argument', 'Invalid chat message');
   }
 
+  // Prove the caller/recipient relationship before looking up the recipient's
+  // live phone. Both ids are client supplied; checking Firebase Auth first
+  // would expose an arbitrary account's phone-verification state.
+  const preliminaryConversation = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .get();
+  if (!preliminaryConversation.exists) {
+    throw new functions.https.HttpsError('not-found', 'Unknown conversation');
+  }
+  const preliminaryParticipants = Array.from(
+    new Set(
+      ((preliminaryConversation.get('participantIds') || []) as string[]).filter(
+        (participantId) =>
+          typeof participantId === 'string' && participantId.trim().length > 0,
+      ),
+    ),
+  );
+  const preliminaryOtherParticipant =
+    preliminaryParticipants.length === 2
+      ? preliminaryParticipants.find((participantId) => participantId !== uid)
+      : undefined;
+  if (
+    preliminaryParticipants.length !== 2 ||
+    !preliminaryParticipants.includes(uid) ||
+    preliminaryOtherParticipant !== recipientId
+  ) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'You can only notify the other participant of a conversation',
+    );
+  }
+
+  const preliminaryMessage = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .collection('messages')
+    .doc(messageId)
+    .get();
+  if (!preliminaryMessage.exists) {
+    throw new functions.https.HttpsError(
+      'not-found',
+      'That chat message no longer exists',
+    );
+  }
+  const preliminaryMessageData =
+    preliminaryMessage.data() as Record<string, any>;
+  if (
+    String(preliminaryMessageData.senderId || '') !== uid ||
+    String(preliminaryMessageData.receiverId || '') !== recipientId ||
+    String(preliminaryMessageData.conversationId || '') !== conversationId
+  ) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'You can only notify somebody about a message which you sent to them.',
+    );
+  }
+
+  // An opaque administrator support identity is only a routing label. Resolve
+  // it through the server-only conversation operation so the notification is
+  // delivered to the real administrator instead of the synthetic profile.
+  const preliminarySupportOperation = await db
+    .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+    .doc(conversationId)
+    .get();
+  let notificationRecipientId = recipientId;
+  if (
+    preliminaryConversation.exists &&
+    preliminaryConversation.get('conversationType') === 'adminSupport'
+  ) {
+    const conversationAdminId = String(
+      preliminaryConversation.get('adminId') || '',
+    ).trim();
+    const operation = preliminarySupportOperation.exists
+      ? (preliminarySupportOperation.data() as Record<string, any>)
+      : null;
+    if (conversationAdminId === ADMIN_SUPPORT_IDENTITY) {
+      if (
+        !operation ||
+        String(operation.conversationId || '').trim() !== conversationId ||
+        String(operation.adminIdentity || '').trim() !== conversationAdminId ||
+        String(operation.targetUid || '').trim() !== uid ||
+        recipientId !== conversationAdminId
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'You can only notify the other participant of a conversation',
+        );
+      }
+      notificationRecipientId = String(operation.adminUid || '').trim();
+    } else if (
+      !conversationAdminId ||
+      recipientId !== conversationAdminId ||
+      (operation && String(operation.adminUid || '').trim() !== conversationAdminId)
+    ) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'You can only notify the other participant of a conversation',
+      );
+    }
+    if (!notificationRecipientId) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The administrator for this conversation is no longer available.',
+      );
+    }
+  }
+
+  // A student or owner recipient is a participant in the conversation and
+  // therefore needs a live verified Firebase phone. Administrators remain
+  // exempt. The transaction below re-reads the recipient and checks the same
+  // role, registration and active state before writing the notification.
+  const preliminaryRecipient = await db
+    .collection('users')
+    .doc(notificationRecipientId)
+    .get();
+  const expectedRecipientRole = participantRole(preliminaryRecipient);
+  await assertLiveParticipantPhone(
+    notificationRecipientId,
+    expectedRecipientRole,
+  );
+
   // The deterministic id makes the notification idempotent. One sent
   // message can therefore create at most one notification, no matter how
   // often the client retries the callable.
@@ -1471,11 +1916,16 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
     const actorSnapshot = await transaction.get(
       db.collection('users').doc(uid),
     );
-    if (
-      !actorSnapshot.exists ||
-      actorSnapshot.get('registrationCompleted') !== true ||
-      actorSnapshot.get('isActive') !== true
-    ) {
+    const actorState = {
+      exists: actorSnapshot.exists,
+      registrationCompleted: actorSnapshot.get('registrationCompleted'),
+      isActive: actorSnapshot.get('isActive'),
+      role: actorSnapshot.get('role'),
+    };
+    const actorIsAdmin = canActAsAdmin(actorState);
+    const actorIsTenant =
+      canBookAsStudent(actorState) || canActAsRoomOwner(actorState);
+    if (!actorIsAdmin && !actorIsTenant) {
       throw new functions.https.HttpsError(
         'permission-denied',
         'This account is not allowed to send notifications.',
@@ -1483,7 +1933,7 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
     }
 
     const recipientSnapshot = await transaction.get(
-      db.collection('users').doc(recipientId),
+      db.collection('users').doc(notificationRecipientId),
     );
     if (!notificationRecipientAllows(recipientSnapshot, type)) {
       throw new functions.https.HttpsError(
@@ -1491,10 +1941,33 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
         'The recipient is no longer available for notifications.',
       );
     }
-
-    const conversationSnapshot = await transaction.get(
-      db.collection('conversations').doc(conversationId),
+    assertParticipantRoleUnchanged(
+      recipientSnapshot,
+      expectedRecipientRole,
+      'The recipient is no longer available for notifications.',
     );
+    if (
+      (expectedRecipientRole === 'student' ||
+        expectedRecipientRole === 'owner') &&
+      recipientSnapshot.get('registrationCompleted') !== true
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The recipient is no longer available for notifications.',
+      );
+    }
+
+    const [conversationSnapshot, supportOperationSnapshot] =
+      await Promise.all([
+        transaction.get(
+          db.collection('conversations').doc(conversationId),
+        ),
+        transaction.get(
+          db
+            .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+            .doc(conversationId),
+        ),
+      ]);
     if (!conversationSnapshot.exists) {
       throw new functions.https.HttpsError('not-found', 'Unknown conversation');
     }
@@ -1503,6 +1976,52 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
         'failed-precondition',
         'This conversation is being closed.',
       );
+    }
+
+    if (conversationSnapshot.get('conversationType') === 'adminSupport') {
+      const conversationAdminId = String(
+        conversationSnapshot.get('adminId') || '',
+      ).trim();
+      const operation = supportOperationSnapshot.exists
+        ? (supportOperationSnapshot.data() as Record<string, any>)
+        : null;
+      if (conversationAdminId === ADMIN_SUPPORT_IDENTITY) {
+        if (
+          !operation ||
+          String(operation.conversationId || '').trim() !== conversationId ||
+          String(operation.adminIdentity || '').trim() !== conversationAdminId ||
+          String(operation.targetUid || '').trim() !== uid ||
+          String(operation.adminUid || '').trim() !== notificationRecipientId
+        ) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'You can only notify the other participant of a conversation',
+          );
+        }
+      } else if (
+        !conversationAdminId ||
+        recipientId !== conversationAdminId ||
+        (operation &&
+          String(operation.adminUid || '').trim() !== conversationAdminId)
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'You can only notify the other participant of a conversation',
+        );
+      }
+      if (
+        !canActAsAdmin({
+          exists: recipientSnapshot.exists,
+          registrationCompleted: recipientSnapshot.get('registrationCompleted'),
+          isActive: recipientSnapshot.get('isActive'),
+          role: recipientSnapshot.get('role'),
+        })
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'The administrator for this conversation is no longer available.',
+        );
+      }
     }
 
     const participants = (conversationSnapshot.get('participantIds') ||
@@ -1584,11 +2103,22 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
     // The notification text is derived from the stored message. The client
     // cannot replace it with arbitrary text or use the callable as a general
     // notification sender.
+    //
+    // A support reply is the one exception: its text is private to the
+    // support conversation. Copying it into the administrator's in-app or
+    // push notification would expose it on a lock screen and outside the
+    // conversation. The administrator receives a generic prompt and opens
+    // the conversation to read the reply.
+    const isAdminSupportConversation =
+      conversationSnapshot.get('conversationType') === 'adminSupport';
     const messageType = String(message.type || 'text').trim().toLowerCase();
     const storedContent = String(message.content || '').trim();
     let title = 'New message';
     let body = storedContent;
-    if (messageType === 'image') {
+    if (isAdminSupportConversation) {
+      title = 'New support reply';
+      body = 'You have a new support reply.';
+    } else if (messageType === 'image') {
       title = 'New photo';
       if (!body) body = 'A photo was sent.';
     } else if (messageType === 'contactshare') {
@@ -1599,7 +2129,7 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
     if (body.length > 1000) body = `${body.substring(0, 999)}…`;
 
     transaction.set(notificationRef, {
-      userId: recipientId,
+      userId: notificationRecipientId,
       title,
       body,
       type,
@@ -1615,7 +2145,7 @@ export const notifyUser = callableHttps.onCall(async (data, context) => {
   // when the one deterministic in-app notification was really created.
   if (notification.created) {
     await pushToDevice(
-      recipientId,
+      notificationRecipientId,
       notification.title,
       notification.body,
       { conversationId, messageId, type },

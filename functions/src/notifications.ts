@@ -2,6 +2,7 @@ import * as firestore from 'firebase-admin/firestore';
 import * as messaging from 'firebase-admin/messaging';
 import * as functions from 'firebase-functions/v1';
 import { callableHttps } from './appCheck';
+import { assertActiveAccount, canActAsAdmin } from './accounts';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
@@ -146,26 +147,54 @@ export async function pushToDevice(
   title: string,
   body: string,
   data: Record<string, string> = {},
-): Promise<void> {
+  options: {
+    /**
+     * The account which produced the notification.
+     *
+     * When this is set, the author has to be a live administrator at the
+     * moment of the push as well. This closes the delayed-notification
+     * window in which an administrator is demoted or deleted after the
+     * message transaction but before FCM is called.
+     */
+    sourceAuthorUid?: string;
+  } = {},
+): Promise<boolean> {
   try {
     const snapshot = await db.collection('users').doc(userId).get();
-    if (!snapshot.exists) return;
+    if (!snapshot.exists) return false;
 
     // Do not push a notification which was queued before the recipient's
     // account was deleted. The in-app write has the same fence, but FCM is a
     // separate system and needs the same live-profile check here.
     const deletionState = String(snapshot.get('deletionState') || '').trim();
     if (deletionState === 'deleting' || snapshot.get('deletionFencedAt')) {
-      return;
+      return false;
     }
     const type = String(data['type'] || 'general');
-    if (type !== 'account' && snapshot.get('isActive') !== true) return;
+    if (type !== 'account' && snapshot.get('isActive') !== true) return false;
+
+    if (options.sourceAuthorUid) {
+      const authorSnapshot = await db
+        .collection('users')
+        .doc(options.sourceAuthorUid)
+        .get();
+      if (
+        !canActAsAdmin({
+          exists: authorSnapshot.exists,
+          registrationCompleted: authorSnapshot.get('registrationCompleted'),
+          isActive: authorSnapshot.get('isActive'),
+          role: authorSnapshot.get('role'),
+        })
+      ) {
+        return false;
+      }
+    }
 
     const token = snapshot.get('fcmToken');
     if (typeof token !== 'string' || token.trim().length === 0) {
       // The app has not registered a device yet (or it is an old install).
       // The in-app notification is still there, so this is not an error.
-      return;
+      return false;
     }
 
     await messaging.getMessaging().send({
@@ -188,11 +217,13 @@ export async function pushToDevice(
         },
       },
     });
+    return true;
   } catch (error) {
     // A token that Firebase no longer knows about is normal — it happens
     // every time an app is uninstalled. The in-app notification still
     // reached the user, so this is only logged.
     console.error('Failed to push notification:', error);
+    return false;
   }
 }
 
@@ -232,6 +263,7 @@ export const deleteNotification = callableHttps.onCall(
     }
 
     const uid = context.auth.uid;
+    await assertActiveAccount(uid);
     const notificationId = String(data?.notificationId || '').trim();
     if (!notificationId) {
       throw new functions.https.HttpsError(

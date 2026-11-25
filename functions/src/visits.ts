@@ -129,6 +129,7 @@ export const getRoomVisitDetails = callableHttps.onCall(async (data, context) =>
         registrationCompleted: studentSnapshot.get('registrationCompleted'),
         isActive: studentSnapshot.get('isActive'),
         role: studentSnapshot.get('role'),
+        phoneVerified: studentSnapshot.get('phoneVerified'),
       })
     ) {
       throw new functions.https.HttpsError(

@@ -120,6 +120,8 @@ class _ConversationTile extends ConsumerWidget {
     final roomTitle = details?.roomTitle.isNotEmpty == true
         ? details!.roomTitle
         : conversation.roomTitle;
+    final isAdminPeer =
+        conversation.isAdminSupport && conversation.adminId == peerId;
 
     return Card(
       margin: const EdgeInsets.only(bottom: AppSpacing.sm),
@@ -157,13 +159,37 @@ class _ConversationTile extends ConsumerWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      name,
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: unread ? FontWeight.w700 : FontWeight.w500,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            name,
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: unread
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (isAdminPeer) ...[
+                          const SizedBox(width: AppSpacing.xs),
+                          const Icon(
+                            Icons.verified,
+                            size: 16,
+                            color: Colors.blue,
+                          ),
+                          const SizedBox(width: 3),
+                          Text(
+                            'Admin',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: Colors.blue,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                     if (roomTitle.isNotEmpty) ...[
                       const SizedBox(height: 2),

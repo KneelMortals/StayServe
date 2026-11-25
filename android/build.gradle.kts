@@ -1,3 +1,4 @@
+import com.android.build.api.dsl.LibraryExtension
 import org.gradle.api.tasks.compile.JavaCompile
 
 allprojects {
@@ -19,6 +20,34 @@ subprojects {
 }
 subprojects {
     project.evaluationDependsOn(":app")
+}
+
+// ---------------------------------------------------------------------------
+// Keep the third-party geolocator lint failure contained to that dependency.
+// ---------------------------------------------------------------------------
+//
+// `geolocator_android` 5.2.1 calls NotificationManagerCompat.notify()
+// without first checking the Android 13+ POST_NOTIFICATIONS permission.
+// Its own Android lint task therefore fails the root `./gradlew lint`
+// command even though StayServe only uses the plugin for a one-shot current
+// location and never starts its background-location notification service.
+//
+// The upstream source lives in the pub cache and cannot be patched from this
+// repository. This module-scoped lint configuration suppresses exactly the
+// upstream permission detector in that dependency. It does not alter lint
+// for the StayServe app or any other dependency, so app-local permission
+// mistakes still fail the build.
+// ---------------------------------------------------------------------------
+subprojects {
+    if (name == "geolocator_android") {
+        plugins.withId("com.android.library") {
+            extensions.configure<LibraryExtension> {
+                lint {
+                    disable += "MissingPermission"
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,9 @@ class ConversationInteractionDetails {
   /// Whether the current user may send a new message.
   final bool canSend;
 
+  /// Whether this is a server-created administrator support conversation.
+  final bool isAdminSupport;
+
   const ConversationInteractionDetails({
     required this.conversationId,
     required this.peerId,
@@ -33,6 +36,7 @@ class ConversationInteractionDetails {
     this.blockedByMe = false,
     this.blockedMe = false,
     this.canSend = true,
+    this.isAdminSupport = false,
   });
 
   bool get isBlocked => !canSend;
@@ -57,6 +61,7 @@ class ConversationInteractionDetails {
       blockedByMe: blockedByMe,
       blockedMe: blockedMe,
       canSend: _requiredBool(json['canSend'], 'canSend'),
+      isAdminSupport: json['isAdminSupport'] == true,
     );
   }
 }

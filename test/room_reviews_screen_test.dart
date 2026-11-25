@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:stayserve/core/constants/enums.dart';
+import 'package:stayserve/features/auth/presentation/providers/auth_provider.dart';
 import 'package:stayserve/features/reviews/presentation/providers/review_providers.dart';
 import 'package:stayserve/features/reviews/presentation/screens/room_reviews_screen.dart';
 import 'package:stayserve/features/students/presentation/providers/student_providers.dart';
@@ -37,14 +38,14 @@ void main() {
   Widget screen({
     required List<JoinRequestModel> requests,
     List<RoomReviewModel> reviews = const [],
+    UserRole role = UserRole.student,
   }) {
     return ProviderScope(
       overrides: [
+        currentUserRoleProvider.overrideWithValue(role),
         myJoinRequestsProvider.overrideWith((ref) => Stream.value(requests)),
-        roomReviewsProvider(
-          'RM-1',
-        ).overrideWith((ref) => Stream.value(reviews)),
-        myRoomReviewProvider('RM-1').overrideWith((ref) => Stream.value(null)),
+        roomReviewsProvider('RM-1').overrideWith((ref) async => reviews),
+        myRoomReviewProvider('RM-1').overrideWith((ref) => null),
       ],
       child: const MaterialApp(
         home: RoomReviewsScreen(roomId: 'RM-1', roomTitle: 'Test room'),
@@ -88,6 +89,34 @@ void main() {
     expect(find.text('Publish review'), findsOneWidget);
   });
 
+  testWidgets('an owner never sees the student review form', (tester) async {
+    await tester.pumpWidget(
+      screen(
+        requests: [request(status: JoinRequestStatus.ownerConfirmed)],
+        role: UserRole.owner,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Write a review'), findsNothing);
+    expect(find.text('Publish review'), findsNothing);
+  });
+
+  testWidgets('an administrator never sees the student review form', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      screen(
+        requests: [request(status: JoinRequestStatus.ownerConfirmed)],
+        role: UserRole.admin,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Write a review'), findsNothing);
+    expect(find.text('Publish review'), findsNothing);
+  });
+
   testWidgets('the confirmation of the student shows the review form too', (
     tester,
   ) async {
@@ -122,6 +151,7 @@ void main() {
         reviews: [
           RoomReviewModel(
             reviewId: 'REV-1',
+            reviewInstanceId: 'review-instance-1',
             roomId: 'RM-1',
             studentId: 'student-2',
             ownerId: 'owner-1',

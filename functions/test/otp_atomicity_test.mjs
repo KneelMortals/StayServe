@@ -284,7 +284,29 @@ const firestoreMock = {
 };
 
 const revokeCalls = [];
+// Registration reads the live Firebase Auth record. The focused test double
+// supplies the same unverified email which the synthetic token carries so the
+// legacy one-time-email challenge remains the proof of registration.
+const authUserEmails = new Map([
+  ['first-user', 'one-time-challenge@example.com'],
+  ['second-user', 'one-time-challenge@example.com'],
+  ['failed-registration', 'atomic-profile@example.com'],
+  ['claim-retry-user', 'atomic-claim-retry@example.com'],
+  ['role-claim-user', 'role-claim@example.com'],
+  ['atomic-role-user', 'atomic-role-claim@example.com'],
+  ['claim-convergence-user', 'claim-convergence@example.com'],
+]);
 const authClient = {
+  getUser: async (uid) => {
+    const email = authUserEmails.get(uid) || '';
+    return {
+      uid,
+      email,
+      emailVerified: false,
+      phoneNumber: null,
+      providerData: email ? [{ providerId: 'password' }] : [],
+    };
+  },
   setCustomUserClaims: async (uid, claims) => {
     if (failNextClaim) {
       failNextClaim = false;
@@ -418,6 +440,78 @@ section('parallel OTP guesses cannot bypass the attempt limit');
   );
 }
 
+section('a consumed verification challenge can be renewed only with the active OTP');
+
+{
+  db.reset();
+  const identifier = 'renewal-proof@example.com';
+  const otpPath = `otpCodes/${otpDocumentId('email', identifier)}`;
+  const salt = 'renewal-salt';
+  const oldChallenge = 'old-consumed-challenge';
+  db.seed(otpPath, {
+    channel: 'email',
+    identifierHash: sha256(identifier),
+    codeHash: sha256(`654321:${salt}`),
+    salt,
+    attempts: 1,
+    verified: true,
+    verifiedByUid: 'renewal-user',
+    verifiedAt: new FakeTimestamp(Date.now() - 60 * 1000),
+    expiresAt: new FakeTimestamp(Date.now() + 5 * 60 * 1000),
+    challengeHash: sha256(oldChallenge),
+    challengeIssuedAt: new FakeTimestamp(Date.now() - 60 * 1000),
+    challengeExpiresAt: new FakeTimestamp(Date.now() + 5 * 60 * 1000),
+    challengeUsed: true,
+  });
+
+  const wrong = await Promise.allSettled([
+    otp.verifyOtp.run(
+      { channel: 'email', identifier, otp: '111111' },
+      {
+        auth: { uid: 'renewal-user', token: {} },
+        rawRequest: { ip: '127.0.0.1' },
+      },
+    ),
+  ]);
+  check(
+    'a consumed verification cannot be renewed without the active OTP',
+    errorCode(wrong[0]),
+    'invalid-argument',
+  );
+  check(
+    'the failed renewal counts one OTP attempt',
+    db.docs.get(otpPath)?.attempts,
+    2,
+  );
+  check(
+    'the failed renewal keeps the consumed challenge',
+    db.docs.get(otpPath)?.challengeHash,
+    sha256(oldChallenge),
+  );
+
+  const correct = await Promise.allSettled([
+    otp.verifyOtp.run(
+      { channel: 'email', identifier, otp: '654321' },
+      {
+        auth: { uid: 'renewal-user', token: {} },
+        rawRequest: { ip: '127.0.0.1' },
+      },
+    ),
+  ]);
+  const renewed = correct[0].status === 'fulfilled' ? correct[0].value : null;
+  check('the active OTP renews the bound challenge', renewed?.alreadyVerified, true);
+  check(
+    'the renewed challenge is different from the consumed challenge',
+    renewed?.challenge && renewed.challenge !== oldChallenge,
+    true,
+  );
+  check(
+    'the renewed challenge is stored for the next registration attempt',
+    db.docs.get(otpPath)?.challengeHash,
+    sha256(renewed?.challenge || ''),
+  );
+}
+
 section('a registration challenge is consumed by only one account');
 
 {
@@ -432,7 +526,7 @@ section('a registration challenge is consumed by only one account');
     identifierHash: sha256(identifier),
     attempts: 1,
     verified: true,
-    verifiedByUid: 'verified-user',
+    verifiedByUid: null,
     challengeHash: sha256(challenge),
     challengeIssuedAt: new FakeTimestamp(Date.now()),
     challengeExpiresAt: new FakeTimestamp(Date.now() + 10 * 60 * 1000),
@@ -489,6 +583,22 @@ section('a registration challenge is consumed by only one account');
     db.docs.get(otpPath)?.verifiedByUid,
     registeredUid,
   );
+  const registeredProfile = db.docs.get(`users/${registeredUid}`);
+  check(
+    'the legacy email proof does not impersonate Firebase Auth verification',
+    registeredProfile?.emailVerified,
+    false,
+  );
+  check(
+    'the legacy email proof is retained under its separate source marker',
+    registeredProfile?.legacyEmailProofSource,
+    'stayServeOtp',
+  );
+  check(
+    'the legacy proof marker names the address which it proved',
+    registeredProfile?.legacyEmailProofEmail,
+    identifier,
+  );
   check(
     'custom claims are written for exactly one account',
     authCalls.length,
@@ -511,7 +621,7 @@ section('a failed profile write does not consume the OTP challenge');
     identifierHash: sha256(identifier),
     attempts: 1,
     verified: true,
-    verifiedByUid: 'verified-user',
+    verifiedByUid: null,
     challengeHash: sha256(challenge),
     challengeIssuedAt: new FakeTimestamp(Date.now()),
     challengeExpiresAt: new FakeTimestamp(Date.now() + 10 * 60 * 1000),
@@ -558,7 +668,7 @@ section('an Auth claim failure can be retried without a fresh OTP');
     identifierHash: sha256(identifier),
     attempts: 1,
     verified: true,
-    verifiedByUid: 'verified-user',
+    verifiedByUid: null,
     challengeHash: sha256(challenge),
     challengeIssuedAt: new FakeTimestamp(Date.now()),
     challengeExpiresAt: new FakeTimestamp(Date.now() + 10 * 60 * 1000),

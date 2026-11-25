@@ -80,6 +80,19 @@ service cloud.firestore {
             .data.get('legacyCutoff', null);
     }
 
+    // The Firebase Auth ID token carries `phone_number` only while a phone
+    // provider is attached to the account. Requiring that token fact prevents
+    // a stale Firestore `phoneVerified` cache from granting service access
+    // after the provider was unlinked and the device refreshed its session.
+    // A legacy marker-less profile may use the token fact while the explicit
+    // migration window is open; every current profile must also have the
+    // server-owned cache flag.
+    function hasVerifiedPhoneToken() {
+      return request.auth != null &&
+        request.auth.token.get('phone_number', null) != null &&
+        request.auth.token.get('phone_number', '') != '';
+    }
+
     // A live account is one whose registration has completed and which is
     // active.  The only exception is the explicitly controlled migration
     // path above.  Once legacyMode is false this helper is completely
@@ -103,6 +116,29 @@ service cloud.firestore {
                 .data.get('isActive', null) == null
             )
           )
+        ) &&
+        (
+          // Administrators operate the platform and are not tenants. Their
+          // existing accounts therefore do not need a phone migration.
+          get(/databases/$(database)/documents/users/$(request.auth.uid))
+            .data.get('role', '') == 'admin' ||
+          // Students and owners may use the services only after Firebase has
+          // verified a phone number for the account. The token proves that a
+          // phone provider is present; the profile flag is the server-owned
+          // cache used by the rules. A marker-less legacy profile is allowed
+          // during the controlled migration even before that cache is filled.
+          (
+            hasVerifiedPhoneToken() &&
+            (
+              get(/databases/$(database)/documents/users/$(request.auth.uid))
+                .data.get('phoneVerified', false) == true ||
+              (
+                get(/databases/$(database)/documents/users/$(request.auth.uid))
+                  .data.get('phoneVerified', null) == null &&
+                legacyProfileIsEligible()
+              )
+            )
+          )
         );
     }
 
@@ -124,6 +160,14 @@ service cloud.firestore {
 
     function isLiveOwnerProfile(profile) {
       return profile.get('role', '') == 'owner' &&
+        hasVerifiedPhoneToken() &&
+        (
+          profile.get('phoneVerified', false) == true ||
+          (
+            profile.get('phoneVerified', null) == null &&
+            legacyProfileIsEligibleWithProfile(profile)
+          )
+        ) &&
         (
           (
             profile.get('registrationCompleted', false) == true &&
@@ -197,7 +241,6 @@ service cloud.firestore {
     function changesOnlyAllowedSelfFields() {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
         'name',
-        'phone',
         'profileImage',
         'fcmToken',
         'savedRooms',
@@ -219,6 +262,18 @@ service cloud.firestore {
         request.resource.data.get('roleClaimed', false) == false &&
         request.resource.data.get('isActive', true) == true &&
         request.resource.data.get('registrationCompleted', false) == false &&
+        !request.resource.data.keys().hasAny([
+          'email',
+          'phone',
+          'emailVerified',
+          'phoneVerified',
+          'authProviders',
+          'legacyEmailProofSource',
+          'legacyEmailProofEmail',
+          'emailVerifiedAt',
+          'phoneVerifiedAt',
+          'lastAuthSyncAt',
+        ]) &&
         (
           request.resource.data.get('registrationCompleted', null) != null ||
           !legacyMigrationEnabled() ||
@@ -642,9 +697,12 @@ service cloud.firestore {
     // Reviews of a room
     // ======================================================================
     match /roomReviews/{reviewId} {
-      allow get, list: if isLiveRegisteredAccount();
+      // Room reviews are read through the server-owned `getRoomReviews`
+      // callable. A direct collection read would let every live tenant
+      // enumerate reviews across rooms and read the reviewer's uid/name.
+      allow read: if false;
       // Reviews are written and removed by the server functions.
-      allow create, update, delete: if false;
+      allow write: if false;
     }
 
     // ======================================================================
@@ -681,6 +739,45 @@ service cloud.firestore {
           'cancelledAt',
           'updatedAt',
         ]);
+    }
+
+    // Moderation audit records are written only by the server when an
+    // administrator removes a review. Clients cannot inspect or alter them.
+    match /reviewDeletionAudit/{auditId} {
+      allow read, write: if false;
+    }
+
+    // The latest deletion pointer is trusted server state for idempotent
+    // retries. It is not moderation history and must remain invisible to
+    // clients.
+    match /reviewDeletionState/{stateId} {
+      allow read, write: if false;
+    }
+
+    // Server-only notification attribution and administrator-message
+    // delivery state. They contain participant uids and must never be
+    // readable by a notification recipient.
+    match /notificationAttributions/{attributionId} {
+      allow read, write: if false;
+    }
+
+    match /adminMessageNotificationOperations/{operationId} {
+      allow read, write: if false;
+    }
+
+    // Durable state for a verified-email linking operation and its per-account
+    // lock. They contain the uid, address and a hash of the one-time proof so
+    // a partial Auth/Firestore write can be retried safely and concurrent
+    // different-address links are serialised. Only trusted server code may
+    // access them.
+    match /emailLinkOperations/{operationId} {
+      allow read, write: if false;
+    }
+
+    // A rollback marker for an incomplete registration is server-only. It
+    // makes the rollback and the registration transaction mutually exclusive.
+    match /registrationRollbackOperations/{operationId} {
+      allow read, write: if false;
     }
 
     // ======================================================================
@@ -757,14 +854,66 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // The real administrator uid is kept in a server-only operation so the
+    // tenant-readable conversation can use an opaque support identity. The
+    // mapped administrator may still read their own support channel.
+    function isMappedAdminSupportAdmin(conversationId) {
+      let conversation = get(/databases/$(database)/documents/conversations/$(conversationId));
+      let operation = get(/databases/$(database)/documents/adminSupportConversationOperations/$(conversationId));
+      return request.auth != null &&
+        isAdmin() &&
+        conversation.data.get('conversationType', '') == 'adminSupport' &&
+        operation.data.get('conversationId', '') == conversationId &&
+        operation.data.get('adminUid', '') == request.auth.uid &&
+        operation.data.get('adminIdentity', '') == conversation.data.get('adminId', '') &&
+        operation.data.get('targetUid', '') in conversation.data.get('participantIds', []);
+    }
+
+    // Legacy support conversations used to contain the administrator's raw
+    // uid in the parent and message fields. They are refused directly until
+    // the server has migrated them to the opaque identity.
+    function isOpaqueAdminSupportConversation(conversationId) {
+      let conversation = get(/databases/$(database)/documents/conversations/$(conversationId));
+      return !exists(/databases/$(database)/documents/conversations/$(conversationId)) ||
+        conversation.data.get('conversationType', '') != 'adminSupport' ||
+        conversation.data.get('adminId', '') == 'adminIdentities/support/profile';
+    }
+
+    function isAdminSupportPrivacyMigrationInProgress(conversationId) {
+      let conversation = get(/databases/$(database)/documents/conversations/$(conversationId));
+      return exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+        conversation.data.get('privacyMigrationInProgress', false) == true;
+    }
+
     match /conversations/{conversationId} {
       allow get: if isLiveRegisteredAccount() &&
+        isOpaqueAdminSupportConversation(conversationId) &&
+        !isAdminSupportPrivacyMigrationInProgress(conversationId) &&
         (
           resource == null ||
-          request.auth.uid in resource.data.get('participantIds', [])
+          request.auth.uid in resource.data.get('participantIds', []) ||
+          isMappedAdminSupportAdmin(conversationId)
         );
       allow list: if isLiveRegisteredAccount() &&
-        request.auth.uid in resource.data.get('participantIds', []);
+        isOpaqueAdminSupportConversation(conversationId) &&
+        !isAdminSupportPrivacyMigrationInProgress(conversationId) &&
+        (
+          request.auth.uid in resource.data.get('participantIds', []) ||
+          isMappedAdminSupportAdmin(conversationId)
+        );
+
+      // The support-channel markers are server-owned. They identify the
+      // trusted route which created the conversation and must never be
+      // editable by either participant.
+      function serverOwnedConversationMetadataIsUnchanged() {
+        return !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'conversationType',
+          'adminId',
+          'adminVerified',
+          'createdByServer',
+        ]);
+      }
+
       // Conversation creation is server-owned. The `openConversation`
       // callable verifies a live student-owner pair: a student may contact
       // the owner of the supplied room, and either booking participant may
@@ -772,12 +921,15 @@ service cloud.firestore {
       // therefore not create a conversation with an arbitrary uid.
       allow create: if false;
 
-      // The participant list, conversation id, creation time and listing
-      // context are immutable: a participant may not add a third party,
-      // re-point the conversation or overwrite the server-owned names and
-      // room title. Only the bookkeeping fields the Flutter client maintains
-      // (last message, unread counts and timestamps) may change.
+      // The participant list, conversation id, support-channel markers,
+      // creation time and listing context are immutable: a participant may
+      // not add a third party, re-point the conversation, change the trusted
+      // admin identity or overwrite the server-owned names and room title.
+      // Only the bookkeeping fields the Flutter client maintains (last
+      // message, unread counts and timestamps) may change.
       allow update: if isLiveRegisteredAccount() &&
+        isOpaqueAdminSupportConversation(conversationId) &&
+        !isAdminSupportPrivacyMigrationInProgress(conversationId) &&
         resource.data.get('deletionInProgress', false) != true &&
         request.auth.uid in resource.data.get('participantIds', []) &&
         resource.data.get('participantIds', []) ==
@@ -795,6 +947,7 @@ service cloud.firestore {
           resource.data.get('conversationId', '') &&
         request.resource.data.get('createdAt', null) ==
           resource.data.get('createdAt', null) &&
+        serverOwnedConversationMetadataIsUnchanged() &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'lastMessage',
           'lastMessageAt',
@@ -816,14 +969,36 @@ service cloud.firestore {
     match /conversations/{conversationId}/messages/{messageId} {
       allow read: if isLiveRegisteredAccount() &&
         exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
-        request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId))
-          .data.get('participantIds', []);
+        isOpaqueAdminSupportConversation(conversationId) &&
+        !isAdminSupportPrivacyMigrationInProgress(conversationId) &&
+        (
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId))
+            .data.get('participantIds', []) ||
+          isMappedAdminSupportAdmin(conversationId)
+        );
+
+      // In an administrator-support conversation, the administrator may not
+      // write a message directly from a client. The trusted sendAdminMessage
+      // callable uses the Admin SDK, which bypasses Firestore rules and adds
+      // the server-owned admin sender markers.
+      function isAdminSupportAdmin() {
+        let conversation = get(/databases/$(database)/documents/conversations/$(conversationId));
+        return request.auth != null &&
+          conversation.data.get('conversationType', '') == 'adminSupport' &&
+          request.auth.uid == conversation.data.get('adminId', '');
+      }
+
       // A sender may create only a message for the other participant in the
       // containing conversation.  The payload's conversation id must match
       // the document path, and no fields outside the Flutter message model
-      // may be introduced.
+      // may be introduced. The student/owner support target can still use
+      // this ordinary client schema to reply.
       allow create: if isLiveRegisteredAccount() &&
         exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+        isOpaqueAdminSupportConversation(conversationId) &&
+        !isAdminSupportAdmin() &&
+        !isMappedAdminSupportAdmin(conversationId) &&
+        !isAdminSupportPrivacyMigrationInProgress(conversationId) &&
         get(/databases/$(database)/documents/conversations/$(conversationId))
           .data.get('deletionInProgress', false) != true &&
         request.resource.data.keys().hasOnly([

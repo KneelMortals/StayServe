@@ -58,6 +58,7 @@ void main() {
     final now = DateTime(2026, 11, 13);
     return RoomReviewModel(
       reviewId: reviewId,
+      reviewInstanceId: 'review-instance-1',
       roomId: roomId,
       studentId: studentId,
       ownerId: 'owner-1',

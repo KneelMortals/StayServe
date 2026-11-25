@@ -4,18 +4,62 @@ import * as firestore from 'firebase-admin/firestore';
 import { callableHttps } from './appCheck';
 import {
   assertActiveAccount,
+  assertLiveVerifiedPhone,
   canActAsAdmin,
 } from './accounts';
 import {
   canActAsRoomOwner,
   canBookAsStudent,
 } from './bookingAccess';
+import {
+  ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+  ADMIN_SUPPORT_IDENTITY,
+  scrubAdministratorMessageIdentities,
+} from './adminSupport';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
 
 const db = firestore.getFirestore();
+
+/** The normalized role stored in a user profile. */
+function participantRole(snapshot: firestore.DocumentSnapshot): string {
+  if (!snapshot.exists) return '';
+  return String(snapshot.get('role') || '')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Verifies the live phone of a student or owner interaction participant.
+ *
+ * Administrators do not participate as tenants and remain exempt from the
+ * phone requirement. An invalid role is left to the transaction-time
+ * role/registration/activity checks, which fail closed.
+ */
+async function assertLiveParticipantPhone(
+  uid: string,
+  role: string,
+): Promise<void> {
+  if (role === 'student' || role === 'owner') {
+    await assertLiveVerifiedPhone(uid);
+  }
+}
+
+/**
+ * Ensures that the participant still has the role which was checked against
+ * live Firebase Auth before the transaction started.
+ */
+function assertParticipantRoleUnchanged(
+  snapshot: firestore.DocumentSnapshot,
+  expectedRole: string,
+  message: string,
+): void {
+  if (participantRole(snapshot) !== expectedRole) {
+    throw new functions.https.HttpsError('failed-precondition', message);
+  }
+}
 
 /**
  * A personal block between two StayServe accounts.
@@ -197,6 +241,326 @@ function participantIdsFromConversation(
   );
 }
 
+/**
+ * Whether the server-only operation exactly describes an opaque support
+ * conversation.
+ *
+ * The operation is the only place where the real administrator uid is kept.
+ * It authorizes that administrator to read the channel without exposing the
+ * uid in a tenant-readable conversation document.
+ */
+function adminSupportOperationMatches(
+  conversationId: string,
+  conversation: Record<string, any>,
+  participantIds: string[],
+  operationSnapshot: firestore.DocumentSnapshot | undefined,
+): boolean {
+  if (!operationSnapshot?.exists) return false;
+  const operation = operationSnapshot.data() as Record<string, any>;
+  const conversationAdminId = String(conversation.adminId || '').trim();
+  const operationAdminUid = String(operation.adminUid || '').trim();
+  const targetUid = String(operation.targetUid || '').trim();
+  return (
+    conversationAdminId === ADMIN_SUPPORT_IDENTITY &&
+    String(operation.conversationId || '').trim() === conversationId &&
+    String(operation.adminIdentity || '').trim() === conversationAdminId &&
+    operationAdminUid.length > 0 &&
+    targetUid.length > 0 &&
+    participantIds.includes(conversationAdminId) &&
+    participantIds.includes(targetUid)
+  );
+}
+
+/**
+ * Migrates a legacy support conversation before it is returned to a client.
+ *
+ * Legacy conversations stored the administrator's raw uid in the parent and
+ * in message sender/receiver fields. The direct Firestore rules refuse those
+ * records. This server-only migration creates the durable party mapping,
+ * fences message writes, scrubs the old messages and then publishes the
+ * opaque identity in one final parent update.
+ */
+async function migrateLegacyAdminSupportConversation(
+  conversationRef: firestore.DocumentReference,
+  conversationId: string,
+): Promise<void> {
+  const initialSnapshot = await conversationRef.get();
+  if (!initialSnapshot.exists) return;
+  const initialData = initialSnapshot.data() as Record<string, any>;
+  if (initialData.conversationType !== 'adminSupport') return;
+
+  const operationRef = db
+    .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+    .doc(conversationId);
+  const rawAdminId = String(initialData.adminId || '').trim();
+  const privacyMigrationInProgress =
+    initialData.privacyMigrationInProgress === true;
+
+  if (rawAdminId === ADMIN_SUPPORT_IDENTITY) {
+    if (!privacyMigrationInProgress) return;
+    const operationSnapshot = await operationRef.get();
+    if (!operationSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    const operation = operationSnapshot.data() as Record<string, any>;
+    const adminUid = String(operation.adminUid || '').trim();
+    if (!adminUid) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    await scrubAdministratorMessageIdentities({
+      db,
+      conversationRef,
+      adminUid,
+      adminIdentity: ADMIN_SUPPORT_IDENTITY,
+    });
+    await db.runTransaction(async (transaction) => {
+      const current = await transaction.get(conversationRef);
+      if (!current.exists) return;
+      if (
+        current.get('conversationType') !== 'adminSupport' ||
+        String(current.get('adminId') || '').trim() !== ADMIN_SUPPORT_IDENTITY
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This administrator conversation is malformed.',
+        );
+      }
+      transaction.update(conversationRef, {
+        privacyMigrationInProgress: firestore.FieldValue.delete(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
+      });
+    });
+    return;
+  }
+
+  const participants = participantIdsFromConversation(
+    initialData.participantIds,
+  );
+  if (
+    participants.length !== 2 ||
+    !rawAdminId ||
+    !participants.includes(rawAdminId)
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This administrator conversation is malformed.',
+    );
+  }
+  const targetUid =
+    participants.find((participantId) => participantId !== rawAdminId) || '';
+  if (!targetUid) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This administrator conversation does not identify a recipient.',
+    );
+  }
+
+  const initialOperationSnapshot = await operationRef.get();
+  if (initialOperationSnapshot.exists) {
+    const operation = initialOperationSnapshot.data() as Record<string, any>;
+    if (
+      String(operation.adminUid || '').trim() !== rawAdminId ||
+      String(operation.targetUid || '').trim() !== targetUid ||
+      String(operation.conversationId || '').trim() !== conversationId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+  }
+
+  const [adminSnapshot, targetSnapshot] = await Promise.all([
+    db.collection('users').doc(rawAdminId).get(),
+    db.collection('users').doc(targetUid).get(),
+  ]);
+  if (
+    !canActAsAdmin({
+      exists: adminSnapshot.exists,
+      registrationCompleted: adminSnapshot.get('registrationCompleted'),
+      isActive: adminSnapshot.get('isActive'),
+      role: adminSnapshot.get('role'),
+    })
+  ) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The administrator for this conversation is no longer available.',
+    );
+  }
+  if (!isLiveInteractionAccount(targetSnapshot)) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'The recipient is no longer available for this conversation.',
+    );
+  }
+
+  // Fence the legacy parent before any message is changed. Direct reads stay
+  // denied while the parent still contains the raw uid, and the marker also
+  // prevents a late target reply from reintroducing that uid.
+  await db.runTransaction(async (transaction) => {
+    const [current, operation] = await Promise.all([
+      transaction.get(conversationRef),
+      transaction.get(operationRef),
+    ]);
+    if (!current.exists) return;
+    const currentData = current.data() as Record<string, any>;
+    const currentAdminId = String(currentData.adminId || '').trim();
+    const currentParticipants = participantIdsFromConversation(
+      currentData.participantIds,
+    );
+    if (
+      currentData.conversationType !== 'adminSupport' ||
+      (currentAdminId !== rawAdminId &&
+        currentAdminId !== ADMIN_SUPPORT_IDENTITY)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    if (
+      currentAdminId === rawAdminId &&
+      (currentParticipants.length !== 2 ||
+        !currentParticipants.includes(rawAdminId) ||
+        !currentParticipants.includes(targetUid))
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    if (operation.exists) {
+      const operationData = operation.data() as Record<string, any>;
+      if (
+        String(operationData.adminUid || '').trim() !== rawAdminId ||
+        String(operationData.targetUid || '').trim() !== targetUid ||
+        String(operationData.conversationId || '').trim() !== conversationId
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This administrator conversation is malformed.',
+        );
+      }
+    } else {
+      transaction.set(operationRef, {
+        operationId: conversationId,
+        conversationId,
+        adminUid: rawAdminId,
+        adminIdentity: ADMIN_SUPPORT_IDENTITY,
+        targetUid,
+        sourceType: 'adminSupportConversation',
+        createdAt: firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
+      });
+    }
+    transaction.update(conversationRef, {
+      privacyMigrationInProgress: true,
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  await scrubAdministratorMessageIdentities({
+    db,
+    conversationRef,
+    adminUid: rawAdminId,
+    adminIdentity: ADMIN_SUPPORT_IDENTITY,
+  });
+
+  await db.runTransaction(async (transaction) => {
+    const [current, operation] = await Promise.all([
+      transaction.get(conversationRef),
+      transaction.get(operationRef),
+    ]);
+    if (!current.exists) return;
+    const currentData = current.data() as Record<string, any>;
+    const currentAdminId = String(currentData.adminId || '').trim();
+    if (currentData.conversationType !== 'adminSupport') {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    if (
+      currentAdminId !== rawAdminId &&
+      currentAdminId !== ADMIN_SUPPORT_IDENTITY
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    if (!operation.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+    const operationData = operation.data() as Record<string, any>;
+    if (
+      String(operationData.adminUid || '').trim() !== rawAdminId ||
+      String(operationData.targetUid || '').trim() !== targetUid ||
+      String(operationData.conversationId || '').trim() !== conversationId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+
+    const storedNames =
+      currentData.participantNames &&
+      typeof currentData.participantNames === 'object' &&
+      !Array.isArray(currentData.participantNames)
+        ? (currentData.participantNames as Record<string, unknown>)
+        : {};
+    const targetName =
+      safeDisplayText(storedNames[targetUid], 80) || targetUid;
+    const safeParticipantNames: Record<string, string> = {
+      [ADMIN_SUPPORT_IDENTITY]: 'StayServe Admin',
+      [targetUid]: targetName,
+    };
+
+    const safeUnreadCount: Record<string, number> = {};
+    const storedUnread =
+      currentData.unreadCount &&
+      typeof currentData.unreadCount === 'object' &&
+      !Array.isArray(currentData.unreadCount)
+        ? (currentData.unreadCount as Record<string, unknown>)
+        : {};
+    for (const [participantId, value] of Object.entries(storedUnread)) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        continue;
+      }
+      const safeParticipantId =
+        participantId === rawAdminId ? ADMIN_SUPPORT_IDENTITY : participantId;
+      safeUnreadCount[safeParticipantId] =
+        (safeUnreadCount[safeParticipantId] || 0) + Math.floor(value);
+    }
+
+    const updates: Record<string, any> = {
+      participantIds: [ADMIN_SUPPORT_IDENTITY, targetUid].sort(),
+      participantNames: safeParticipantNames,
+      conversationType: 'adminSupport',
+      adminId: ADMIN_SUPPORT_IDENTITY,
+      adminVerified: true,
+      createdByServer: true,
+      unreadCount: safeUnreadCount,
+      privacyMigrationInProgress: firestore.FieldValue.delete(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+    };
+    if (String(currentData.deletionRequestedBy || '') === rawAdminId) {
+      updates.deletionRequestedBy = ADMIN_SUPPORT_IDENTITY;
+    }
+    transaction.update(conversationRef, updates);
+  });
+}
+
 /** Whether the pair has a real student-owner booking relationship. */
 async function hasBookingRelationshipInTransaction(
   transaction: firestore.Transaction,
@@ -218,6 +582,28 @@ async function hasBookingRelationshipInTransaction(
         .where('ownerId', '==', userId)
         .limit(1),
     ),
+  ]);
+  return !studentSide.empty || !ownerSide.empty;
+}
+
+/** Whether a pair has a booking relationship outside a transaction. */
+async function hasBookingRelationship(
+  userId: string,
+  otherUserId: string,
+): Promise<boolean> {
+  const [studentSide, ownerSide] = await Promise.all([
+    db
+      .collection('joinRequests')
+      .where('studentId', '==', userId)
+      .where('ownerId', '==', otherUserId)
+      .limit(1)
+      .get(),
+    db
+      .collection('joinRequests')
+      .where('studentId', '==', otherUserId)
+      .where('ownerId', '==', userId)
+      .limit(1)
+      .get(),
   ]);
   return !studentSide.empty || !ownerSide.empty;
 }
@@ -265,6 +651,13 @@ async function hasInteractionRelationshipInTransaction(
       participants.includes(userId) &&
       participants.includes(otherUserId);
     if (!participantsMatch) return false;
+
+    // Administrator support conversations are not student-owner
+    // interactions. They are moderated support channels and do not create a
+    // personal booking block.
+    if (conversation.get('conversationType') === 'adminSupport') {
+      return false;
+    }
 
     // New conversations carry an explicit server-verification marker. A
     // legacy conversation is accepted only when a real booking proves the
@@ -314,8 +707,111 @@ export const getConversationInteractionDetails = callableHttps.onCall(
     const conversationRef = db
       .collection('conversations')
       .doc(conversationId);
+
+    // Legacy support records are never returned with their raw administrator
+    // uid. Migrate them through the server-only mapping before resolving the
+    // caller or peer.
+    await migrateLegacyAdminSupportConversation(
+      conversationRef,
+      conversationId,
+    );
+
+    // Resolve and verify the peer before the transaction. The peer is a
+    // student/owner in an ordinary interaction and may be an exempt
+    // administrator in a support conversation. The transaction re-reads the
+    // conversation and peer profile and refuses a changed peer or role.
+    const preliminaryConversation = await conversationRef.get();
+    if (!preliminaryConversation.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'This conversation no longer exists',
+      );
+    }
+    const preliminaryData = preliminaryConversation.data() as Record<string, any>;
+    const preliminaryParticipants = participantIdsFromConversation(
+      preliminaryData.participantIds,
+    );
+    const preliminaryIsSupport =
+      preliminaryData.conversationType === 'adminSupport';
+    const preliminaryOperationSnapshot = preliminaryIsSupport
+      ? await db
+          .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+          .doc(conversationId)
+          .get()
+      : undefined;
+    const preliminaryUsesOpaqueAdmin =
+      String(preliminaryData.adminId || '').trim() === ADMIN_SUPPORT_IDENTITY;
+    if (
+      preliminaryParticipants.length !== 2 ||
+      (preliminaryUsesOpaqueAdmin &&
+        !adminSupportOperationMatches(
+          conversationId,
+          preliminaryData,
+          preliminaryParticipants,
+          preliminaryOperationSnapshot,
+        ))
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This administrator conversation is malformed.',
+      );
+    }
+
+    const preliminaryCallerIsParticipant =
+      preliminaryParticipants.includes(uid);
+    let expectedPeerId = '';
+    if (preliminaryCallerIsParticipant) {
+      expectedPeerId =
+        preliminaryParticipants.find((participantId) => participantId !== uid) ||
+        '';
+    } else if (
+      preliminaryIsSupport &&
+      preliminaryOperationSnapshot?.exists &&
+      String(
+        (preliminaryOperationSnapshot.data() as Record<string, any>).adminUid ||
+          '',
+      ).trim() === uid
+    ) {
+      // The real administrator is deliberately absent from the tenant-readable
+      // participant list. The server-only operation proves that this account
+      // owns the opaque support identity for this exact channel.
+      expectedPeerId = String(
+        (preliminaryOperationSnapshot.data() as Record<string, any>).targetUid ||
+          '',
+      ).trim();
+    }
+
+    if (!expectedPeerId || !preliminaryParticipants.includes(expectedPeerId)) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'This conversation belongs to somebody else',
+      );
+    }
+    let expectedPeerRole = '';
+    if (preliminaryIsSupport && expectedPeerId === ADMIN_SUPPORT_IDENTITY) {
+      // The tenant's peer is the real administrator, whose role is checked
+      // from the live administrator profile inside the transaction. The
+      // opaque identity itself does not need a readable synthetic profile.
+      expectedPeerRole = 'admin';
+    } else {
+      const preliminaryPeer = await db
+        .collection('users')
+        .doc(expectedPeerId)
+        .get();
+      expectedPeerRole = participantRole(preliminaryPeer);
+    }
+    await assertLiveParticipantPhone(expectedPeerId, expectedPeerRole);
+
     const details = await db.runTransaction(async (transaction) => {
-      const conversationSnapshot = await transaction.get(conversationRef);
+      const [conversationSnapshot, supportOperationSnapshot] =
+        await Promise.all([
+          transaction.get(conversationRef),
+          transaction.get(
+            db
+              .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+              .doc(conversationId),
+          ),
+        ]);
       if (!conversationSnapshot.exists) {
         throw new functions.https.HttpsError(
           'not-found',
@@ -328,14 +824,144 @@ export const getConversationInteractionDetails = callableHttps.onCall(
       const participantIds = participantIdsFromConversation(
         conversation.participantIds,
       );
-      if (participantIds.length !== 2 || !participantIds.includes(uid)) {
+      const isSupportConversation =
+        conversation.conversationType === 'adminSupport';
+      const usesOpaqueAdmin =
+        String(conversation.adminId || '').trim() === ADMIN_SUPPORT_IDENTITY;
+      const supportOperationMatches = adminSupportOperationMatches(
+        conversationId,
+        conversation,
+        participantIds,
+        supportOperationSnapshot,
+      );
+      const callerIsParticipant = participantIds.includes(uid);
+      const callerIsMappedAdmin =
+        isSupportConversation &&
+        supportOperationMatches &&
+        String(
+          (supportOperationSnapshot?.data() as Record<string, any> | undefined)
+            ?.adminUid || '',
+        ).trim() === uid;
+
+      if (
+        participantIds.length !== 2 ||
+        (usesOpaqueAdmin && !supportOperationMatches)
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This administrator conversation is malformed.',
+        );
+      }
+      if (!callerIsParticipant && !callerIsMappedAdmin) {
         throw new functions.https.HttpsError(
           'permission-denied',
           'This conversation belongs to somebody else',
         );
       }
 
-      const peerId = participantIds.find((id) => id !== uid) || '';
+      const peerId = callerIsParticipant
+        ? participantIds.find((id) => id !== uid) || ''
+        : String(
+            (supportOperationSnapshot?.data() as Record<string, any> | undefined)
+              ?.targetUid || '',
+          ).trim();
+      if (peerId !== expectedPeerId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The other participant is no longer available for this conversation.',
+        );
+      }
+
+      // Administrator support conversations are a separate, server-owned
+      // route. They have exactly one live administrator and one live
+      // student/owner; they are not tied to a room or a booking request.
+      if (conversation.conversationType === 'adminSupport') {
+        const adminId = String(conversation.adminId || '').trim();
+        if (
+          !adminId ||
+          conversation.adminVerified !== true ||
+          !participantIds.includes(adminId)
+        ) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'This administrator conversation is malformed.',
+          );
+        }
+
+        const targetId = participantIds.find((id) => id !== adminId) || '';
+        if (!targetId) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'This administrator conversation does not identify a recipient.',
+          );
+        }
+
+        const operation = supportOperationSnapshot?.exists
+          ? (supportOperationSnapshot.data() as Record<string, any>)
+          : null;
+        const operationAdminUid = String(operation?.adminUid || '').trim();
+        if (!supportOperationMatches || !operationAdminUid) {
+          throw new functions.https.HttpsError(
+            'failed-precondition',
+            'This administrator conversation is malformed.',
+          );
+        }
+        const actualAdminUid = operationAdminUid;
+
+        const [adminSnapshot, targetSnapshot] = await Promise.all([
+          transaction.get(db.collection('users').doc(actualAdminUid)),
+          transaction.get(db.collection('users').doc(targetId)),
+        ]);
+        const callerIsAdmin = uid === actualAdminUid;
+        assertParticipantRoleUnchanged(
+          callerIsAdmin ? targetSnapshot : adminSnapshot,
+          expectedPeerRole,
+          'The other participant is no longer available for this conversation.',
+        );
+        if (
+          !canActAsAdmin({
+            exists: adminSnapshot.exists,
+            registrationCompleted: adminSnapshot.get('registrationCompleted'),
+            isActive: adminSnapshot.get('isActive'),
+            role: adminSnapshot.get('role'),
+          })
+        ) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'The administrator for this conversation is no longer available.',
+          );
+        }
+        if (!isLiveInteractionAccount(targetSnapshot)) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'The recipient is no longer available for this conversation.',
+          );
+        }
+
+        const targetName =
+          profileDisplayName(targetSnapshot) ||
+          safeDisplayText(targetSnapshot.get('email'), 80).split('@')[0] ||
+          targetId;
+        return {
+          success: true,
+          conversationId,
+          peerId: callerIsAdmin ? targetId : adminId,
+          peerName: callerIsAdmin ? targetName : 'StayServe Admin',
+          peerRole: callerIsAdmin
+            ? String(targetSnapshot.get('role') || '').trim().toLowerCase()
+            : 'admin',
+          roomId: '',
+          roomTitle: 'StayServe Support',
+          requestId: null,
+          blockedByMe: false,
+          blockedMe: false,
+          blockedByCaller: false,
+          callerBlockedByPeer: false,
+          canSend: true,
+          isAdminSupport: true,
+        };
+      }
+
       const contextId = requestedRequestId || requestedRoomId;
       const contextSnapshot = contextId
         ? await transaction.get(
@@ -390,6 +1016,11 @@ export const getConversationInteractionDetails = callableHttps.onCall(
           readPairBlockStateInTransaction(transaction, uid, peerId),
         ]);
 
+      assertParticipantRoleUnchanged(
+        peerSnapshot,
+        expectedPeerRole,
+        'The other participant is no longer available for this conversation.',
+      );
       const peerRole = String(peerSnapshot.get('role') || '')
         .trim()
         .toLowerCase();
@@ -594,6 +1225,7 @@ export const getConversationInteractionDetails = callableHttps.onCall(
         blockedByCaller: blockState.firstBlockedSecond,
         callerBlockedByPeer: blockState.secondBlockedFirst,
         canSend: !pairIsEffectivelyBlocked(blockState),
+        isAdminSupport: false,
       };
     });
 
@@ -630,6 +1262,41 @@ export const getBookingInteractionDetails = callableHttps.onCall(
     await assertActiveAccount(uid);
 
     const requestRef = db.collection('joinRequests').doc(requestId);
+
+    // A participant viewing a booking interacts with the other party, so the
+    // peer's live Firebase phone is verified before the transaction. An
+    // administrator is only reviewing the record and remains exempt. The
+    // transaction re-reads the request and profiles and verifies that the
+    // participant identities and roles did not change.
+    const preliminaryRequest = await requestRef.get();
+    if (!preliminaryRequest.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'This booking request no longer exists',
+      );
+    }
+    const preliminaryData = preliminaryRequest.data() as Record<string, any>;
+    const expectedStudentId = String(preliminaryData.studentId || '').trim();
+    const expectedOwnerId = String(preliminaryData.ownerId || '').trim();
+    let expectedPeerId = '';
+    let expectedPeerRole = '';
+    if (uid === expectedStudentId) {
+      expectedPeerId = expectedOwnerId;
+    } else if (uid === expectedOwnerId) {
+      expectedPeerId = expectedStudentId;
+    }
+    if (expectedPeerId) {
+      const preliminaryPeer = await db
+        .collection('users')
+        .doc(expectedPeerId)
+        .get();
+      expectedPeerRole = participantRole(preliminaryPeer);
+      await assertLiveParticipantPhone(
+        expectedPeerId,
+        expectedPeerRole,
+      );
+    }
+
     return db.runTransaction(async (transaction) => {
       const requestSnapshot = await transaction.get(requestRef);
       if (!requestSnapshot.exists) {
@@ -646,6 +1313,12 @@ export const getBookingInteractionDetails = callableHttps.onCall(
         throw new functions.https.HttpsError(
           'failed-precondition',
           'This booking request does not identify two different participants',
+        );
+      }
+      if (studentId !== expectedStudentId || ownerId !== expectedOwnerId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The participants on this booking request changed. Please try again.',
         );
       }
 
@@ -680,6 +1353,11 @@ export const getBookingInteractionDetails = callableHttps.onCall(
         );
       }
       if (callerIsParticipant && !callerIsAdmin) {
+        assertParticipantRoleUnchanged(
+          uid === studentId ? ownerSnapshot : studentSnapshot,
+          expectedPeerRole,
+          'The other participant is no longer available for this booking request.',
+        );
         if (uid === studentId && !isLiveStudentAccount(callerSnapshot)) {
           throw new functions.https.HttpsError(
             'permission-denied',
@@ -789,6 +1467,7 @@ export const getRoomContactDetails = callableHttps.onCall(
     }
 
     const uid = context.auth.uid;
+    await assertActiveAccount(uid);
     const roomId = String(data?.roomId || '').trim();
     if (!roomId) {
       throw new functions.https.HttpsError(
@@ -796,6 +1475,43 @@ export const getRoomContactDetails = callableHttps.onCall(
         'Missing room',
       );
     }
+
+    // Resolve and verify the room owner before the transaction. The owner is
+    // the other party in this student-to-owner interaction and therefore needs
+    // a live verified Firebase phone. The transaction re-reads the listing
+    // and owner profile and refuses a changed owner or role.
+    const roomRef = db.collection('rooms').doc(roomId);
+    const preliminaryRoom = await roomRef.get();
+    if (!preliminaryRoom.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That room no longer exists',
+      );
+    }
+    const expectedOwnerId = String(
+      preliminaryRoom.get('ownerId') || '',
+    ).trim();
+    if (!expectedOwnerId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This listing has no owner',
+      );
+    }
+    if (expectedOwnerId === uid) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You cannot contact the owner of your own listing.',
+      );
+    }
+    const preliminaryOwner = await db
+      .collection('users')
+      .doc(expectedOwnerId)
+      .get();
+    const expectedOwnerRole = participantRole(preliminaryOwner);
+    await assertLiveParticipantPhone(
+      expectedOwnerId,
+      expectedOwnerRole,
+    );
 
     // The caller, listing, owner and block state are read in one transaction.
     // The student's live role is therefore checked against the same snapshot
@@ -836,9 +1552,20 @@ export const getRoomContactDetails = callableHttps.onCall(
           'You cannot contact the owner of your own listing.',
         );
       }
+      if (ownerId !== expectedOwnerId) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The owner of this listing changed. Please try again.',
+        );
+      }
 
       const ownerSnapshot = await transaction.get(
         db.collection('users').doc(ownerId),
+      );
+      assertParticipantRoleUnchanged(
+        ownerSnapshot,
+        expectedOwnerRole,
+        'This room owner is no longer available for contact.',
       );
       if (!isLiveOwnerAccount(ownerSnapshot)) {
         throw new functions.https.HttpsError(
@@ -882,6 +1609,7 @@ export const blockUser = callableHttps.onCall(async (data, context) => {
   }
 
   const uid = context.auth.uid;
+  await assertActiveAccount(uid);
   const otherUserId = String(data?.otherUserId || '').trim();
   if (!otherUserId) {
     throw new functions.https.HttpsError(
@@ -905,6 +1633,125 @@ export const blockUser = callableHttps.onCall(async (data, context) => {
     );
   }
 
+  // Prove the caller/peer relationship before checking the peer's live
+  // phone. `otherUserId` is client supplied, so an Auth lookup first would
+  // let a tenant use this callable as a phone-presence oracle.
+  let expectedPeerRole = '';
+  let expectedPeerIsStudent = false;
+  if (requestId) {
+    const preliminaryRequest = await db
+      .collection('joinRequests')
+      .doc(requestId)
+      .get();
+    if (!preliminaryRequest.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+    const preliminaryData =
+      preliminaryRequest.data() as Record<string, any>;
+    const studentId = String(preliminaryData.studentId || '').trim();
+    const ownerId = String(preliminaryData.ownerId || '').trim();
+    if (
+      !studentId ||
+      !ownerId ||
+      studentId === ownerId ||
+      (studentId !== uid && ownerId !== uid)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+    if (otherUserId !== studentId && otherUserId !== ownerId) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+    expectedPeerIsStudent = otherUserId === studentId;
+  } else {
+    const preliminaryConversation = await db
+      .collection('conversations')
+      .doc(conversationId)
+      .get();
+    if (!preliminaryConversation.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+    if (preliminaryConversation.get('deletionInProgress') === true) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+    const preliminaryParticipants = participantIdsFromConversation(
+      preliminaryConversation.get('participantIds'),
+    );
+    if (
+      preliminaryParticipants.length !== 2 ||
+      !preliminaryParticipants.includes(uid) ||
+      !preliminaryParticipants.includes(otherUserId)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+    if (preliminaryConversation.get('conversationType') === 'adminSupport') {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'Administrator support conversations cannot be blocked.',
+      );
+    }
+    if (
+      preliminaryConversation.get('createdByServer') !== true &&
+      !(await hasBookingRelationship(uid, otherUserId))
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'You can only block somebody you have contacted or booked with.',
+      );
+    }
+  }
+
+  const [preliminaryCaller, preliminaryPeer] = await Promise.all([
+    db.collection('users').doc(uid).get(),
+    db.collection('users').doc(otherUserId).get(),
+  ]);
+  if (!isLiveInteractionAccount(preliminaryCaller)) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Only a live student or owner account can block somebody.',
+    );
+  }
+  if (!isLiveInteractionAccount(preliminaryPeer)) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This user account is no longer available for interactions.',
+    );
+  }
+  if (
+    requestId &&
+    (expectedPeerIsStudent
+      ? !isLiveStudentAccount(preliminaryPeer)
+      : !isLiveOwnerAccount(preliminaryPeer))
+  ) {
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      'This user account is no longer available for interactions.',
+    );
+  }
+
+  // The peer is now proven to be the other party in this exact booking or
+  // conversation. Only then is its live Firebase phone checked. The
+  // transaction below re-reads both profiles and the relationship.
+  expectedPeerRole = participantRole(preliminaryPeer);
+  await assertLiveParticipantPhone(otherUserId, expectedPeerRole);
+
   const result = await db.runTransaction(async (transaction) => {
     const callerSnapshot = await transaction.get(
       db.collection('users').doc(uid),
@@ -924,6 +1771,11 @@ export const blockUser = callableHttps.onCall(async (data, context) => {
         'This user account no longer exists',
       );
     }
+    assertParticipantRoleUnchanged(
+      otherSnapshot,
+      expectedPeerRole,
+      'This user account is no longer available for interactions.',
+    );
     // The deletion flow fences the target profile before it removes the
     // blocks and conversations. Reading that fence in this transaction
     // closes the race in which a peer created a new incoming block after
@@ -1016,6 +1868,7 @@ export const unblockUser = callableHttps.onCall(async (data, context) => {
   }
 
   const uid = context.auth.uid;
+  await assertActiveAccount(uid);
   const otherUserId = String(data?.otherUserId || '').trim();
   if (!otherUserId || otherUserId === uid) {
     throw new functions.https.HttpsError(

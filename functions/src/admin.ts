@@ -24,6 +24,18 @@ import {
   pushToDevice,
 } from './notifications';
 import { isValidCurrentOccupancy } from './roomValidation';
+import {
+  ADMIN_MESSAGE_NOTIFICATION_OPERATIONS,
+  ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+  adminMessageNotificationId,
+  adminSupportIdentityFor,
+} from './adminMessaging';
+import {
+  NOTIFICATION_ATTRIBUTIONS,
+  reviewInstanceIdFor,
+  reviewNotificationId,
+} from './reviews';
+import { REGISTRATION_ROLLBACK_OPERATIONS } from './otp';
 
 const db = firestore.getFirestore();
 const auth = authSdk.getAuth();
@@ -263,6 +275,249 @@ async function deleteOwnerRoomsAndPrivateLocations(uid: string): Promise<void> {
  * id makes sure that a later replacement of the same conversation is not
  * deleted by an older cleanup step.
  */
+/**
+ * Removes every notification dependent on one chat message.
+ *
+ * The recipient-visible copy is removed first. The server-only attribution
+ * and delivery records are removed next, and only then may the caller delete
+ * the message source. If a server-only delete fails, the message remains and
+ * a retry can still discover the operation which belongs to it.
+ */
+async function deleteNotificationDependentsForMessage(
+  messageId: string,
+): Promise<void> {
+  if (!messageId) return;
+
+  // Legacy notifications identify their source in the recipient-readable
+  // data map. Remove those copies first, then discover every deterministic or
+  // server-attributed copy which belongs to the same message.
+  await deleteNotificationsWithDataValue('messageId', messageId);
+
+  const deterministicNotificationId = adminMessageNotificationId(messageId);
+  const attributionSnapshot = await db
+    .collection(NOTIFICATION_ATTRIBUTIONS)
+    .where('notificationId', '==', deterministicNotificationId)
+    .get();
+  const sourceAttributionSnapshot = await db
+    .collection(NOTIFICATION_ATTRIBUTIONS)
+    .where('sourceMessageId', '==', messageId)
+    .get();
+  const operationSnapshot = await db
+    .collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS)
+    .where('messageId', '==', messageId)
+    .get();
+
+  const attributionRecords = [
+    ...attributionSnapshot.docs,
+    ...sourceAttributionSnapshot.docs,
+  ];
+  const operationRecords = operationSnapshot.docs;
+  const notificationIds = new Set<string>([deterministicNotificationId]);
+  for (const record of [...attributionRecords, ...operationRecords]) {
+    const notificationId = String(record.get('notificationId') || '').trim();
+    if (notificationId) notificationIds.add(notificationId);
+  }
+
+  // Every recipient-visible copy is gone before its server-only attribution
+  // or delivery record. A failure here leaves the source message in place,
+  // so the next retry can discover the remaining dependency again.
+  for (const notificationId of notificationIds) {
+    await db.collection('notifications').doc(notificationId).delete();
+  }
+
+  const serverOnlyRecords = new Map<string, firestore.DocumentReference>();
+  for (const record of attributionRecords) {
+    serverOnlyRecords.set(record.ref.path, record.ref);
+  }
+  for (const record of operationRecords) {
+    serverOnlyRecords.set(record.ref.path, record.ref);
+  }
+  serverOnlyRecords.set(
+    db
+      .collection(NOTIFICATION_ATTRIBUTIONS)
+      .doc(deterministicNotificationId)
+      .path,
+    db.collection(NOTIFICATION_ATTRIBUTIONS).doc(deterministicNotificationId),
+  );
+  serverOnlyRecords.set(
+    db.collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS).doc(messageId).path,
+    db.collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS).doc(messageId),
+  );
+
+  await Promise.all(
+    Array.from(serverOnlyRecords.values()).map((record) => record.delete()),
+  );
+}
+
+/**
+ * Removes conversation-level notification dependents.
+ *
+ * These records cover notifications which point at the conversation without
+ * carrying one exact message id. They are deleted before the conversation
+ * parent, and the durable conversation attribution is deleted atomically
+ * with that parent in the final cleanup transaction.
+ */
+async function deleteConversationNotificationDependents(
+  conversationId: string,
+): Promise<void> {
+  if (!conversationId) return;
+
+  await deleteNotificationsWithDataValue('conversationId', conversationId);
+
+  const attributionSnapshot = await db
+    .collection(NOTIFICATION_ATTRIBUTIONS)
+    .where('sourceConversationId', '==', conversationId)
+    .get();
+  const operationSnapshot = await db
+    .collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS)
+    .where('conversationId', '==', conversationId)
+    .get();
+
+  const notificationIds = new Set<string>();
+  for (const record of [...attributionSnapshot.docs, ...operationSnapshot.docs]) {
+    const notificationId = String(record.get('notificationId') || '').trim();
+    if (notificationId) notificationIds.add(notificationId);
+  }
+  for (const notificationId of notificationIds) {
+    await db.collection('notifications').doc(notificationId).delete();
+  }
+
+  await Promise.all([
+    ...attributionSnapshot.docs.map((document) => document.ref.delete()),
+    ...operationSnapshot.docs.map((document) => document.ref.delete()),
+  ]);
+}
+
+/** Deletes one conversation and all of its notification dependents. */
+async function deleteConversationForUser(
+  uid: string,
+  conversationRef: firestore.DocumentReference,
+): Promise<void> {
+  const conversationId = conversationRef.id;
+  const conversationOperationRef = db
+    .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+    .doc(conversationId);
+  const operationId = crypto.randomUUID();
+
+  const marked = await db.runTransaction(async (transaction) => {
+    const [current, conversationOperation] = await Promise.all([
+      transaction.get(conversationRef),
+      transaction.get(conversationOperationRef),
+    ]);
+
+    if (!current.exists) {
+      // A parent and its server-only attribution are normally deleted in one
+      // transaction. This branch repairs a legacy/partially-created orphan.
+      if (
+        conversationOperation.exists &&
+        (String(conversationOperation.get('adminUid') || '') === uid ||
+          String(conversationOperation.get('targetUid') || '') === uid)
+      ) {
+        transaction.delete(conversationOperationRef);
+      }
+      return false;
+    }
+
+    const participants = current.get('participantIds');
+    const participantMatches =
+      Array.isArray(participants) &&
+      participants.some((participant) => String(participant) === uid);
+    const serverAttributionMatches =
+      conversationOperation.exists &&
+      (String(conversationOperation.get('adminUid') || '') === uid ||
+        String(conversationOperation.get('targetUid') || '') === uid) &&
+      String(conversationOperation.get('conversationId') || '') ===
+        conversationId;
+    if (!participantMatches && !serverAttributionMatches) return false;
+
+    const isAdminSupport =
+      String(current.get('conversationType') || '') === 'adminSupport' ||
+      String(conversationOperation.get('sourceType') || '') ===
+        'adminSupportConversation';
+
+    transaction.update(conversationRef, {
+      deletionInProgress: true,
+      // A support conversation is readable by its tenant. Never write the
+      // real administrator uid into that recipient-visible marker; the raw
+      // party mapping remains in the server-only conversation operation.
+      deletionRequestedBy: isAdminSupport
+        ? adminSupportIdentityFor(uid)
+        : uid,
+      deletionOperationId: operationId,
+      deletionRequestedAt: firestore.FieldValue.serverTimestamp(),
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+    });
+    return true;
+  });
+  if (!marked) return;
+
+  // The marker is committed before this scan. Every message which was
+  // committed before the marker is visible to the scan; every later message
+  // is rejected by the Firestore rules.
+  const messages = await conversationRef
+    .collection('messages')
+    .orderBy('__name__')
+    .get();
+  for (const message of messages.docs) {
+    await deleteNotificationDependentsForMessage(message.id);
+  }
+  await deleteWhere(() =>
+    conversationRef.collection('messages').orderBy('__name__'),
+  );
+  await deleteWhere(() =>
+    conversationRef.collection('contexts').orderBy('__name__'),
+  );
+
+  // Catch a malformed or legacy notification which identifies only the
+  // conversation. It must be gone before the parent source is removed.
+  await deleteConversationNotificationDependents(conversationId);
+
+  await db.runTransaction(async (transaction) => {
+    const [current, conversationOperation] = await Promise.all([
+      transaction.get(conversationRef),
+      transaction.get(conversationOperationRef),
+    ]);
+    if (!current.exists) {
+      if (
+        conversationOperation.exists &&
+        (String(conversationOperation.get('adminUid') || '') === uid ||
+          String(conversationOperation.get('targetUid') || '') === uid)
+      ) {
+        transaction.delete(conversationOperationRef);
+      }
+      return;
+    }
+    if (current.get('deletionOperationId') !== operationId) return;
+
+    transaction.delete(conversationRef);
+    if (
+      conversationOperation.exists &&
+      String(conversationOperation.get('conversationId') || '') ===
+        conversationId
+    ) {
+      // The conversation and its server-only attribution disappear together.
+      // A retry therefore cannot lose the only mapping to an opaque admin
+      // conversation before the parent is gone.
+      transaction.delete(conversationOperationRef);
+    }
+  });
+}
+
+/**
+ * Deletes every conversation of one account without leaving orphaned
+ * messages or notification dependencies behind.
+ *
+ * Firestore does not cascade-delete a subcollection. The cleanup therefore
+ * marks each conversation as `deletionInProgress` **before** it scans the
+ * messages. The Firestore rules reject every new message while that marker
+ * is present, so a live conversation partner cannot insert a message between
+ * the message scan and the removal of the parent document.
+ *
+ * The parent is removed only after its messages, recipient notifications and
+ * server-only attribution/delivery records are gone, and the operation id
+ * makes sure that a later replacement of the same conversation is not
+ * deleted by an older cleanup step.
+ */
 export async function deleteUserConversations(uid: string): Promise<void> {
   const conversationsQuery = () =>
     db
@@ -281,51 +536,38 @@ export async function deleteUserConversations(uid: string): Promise<void> {
     if (snapshot.empty) break;
 
     for (const conversation of snapshot.docs) {
-      const operationId = crypto.randomUUID();
-
-      const marked = await db.runTransaction(async (transaction) => {
-        const current = await transaction.get(conversation.ref);
-        if (!current.exists) return false;
-
-        const participants = current.get('participantIds');
-        if (
-          !Array.isArray(participants) ||
-          !participants.some((participant) => String(participant) === uid)
-        ) {
-          return false;
-        }
-
-        transaction.update(conversation.ref, {
-          deletionInProgress: true,
-          deletionRequestedBy: uid,
-          deletionOperationId: operationId,
-          deletionRequestedAt: firestore.FieldValue.serverTimestamp(),
-          updatedAt: firestore.FieldValue.serverTimestamp(),
-        });
-        return true;
-      });
-      if (!marked) continue;
-
-      // The marker is committed before this scan. Every message which was
-      // committed before the marker is visible to the scan; every later
-      // message is rejected by the Firestore rules.
-      await deleteWhere(() =>
-        conversation.ref.collection('messages').orderBy('__name__'),
-      );
-      await deleteWhere(() =>
-        conversation.ref.collection('contexts').orderBy('__name__'),
-      );
-
-      await db.runTransaction(async (transaction) => {
-        const current = await transaction.get(conversation.ref);
-        if (!current.exists) return;
-        if (current.get('deletionOperationId') !== operationId) return;
-        transaction.delete(conversation.ref);
-      });
+      await deleteConversationForUser(uid, conversation.ref);
     }
 
     conversationCursor = snapshot.docs[snapshot.docs.length - 1];
     if (snapshot.size < 200) break;
+  }
+
+  // New administrator conversations expose only an opaque administrator tick
+  // to the tenant. Their raw party uids therefore live in this server-only
+  // collection, which is also how an administrator's own conversations are
+  // discovered during account cleanup.
+  const supportConversationIds = new Set<string>();
+  for (const field of ['adminUid', 'targetUid'] as const) {
+    await scanCollectionPages(
+      () =>
+        db
+          .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+          .where(field, '==', uid)
+          .orderBy(firestore.FieldPath.documentId()),
+      (operation) => {
+        const conversationId = String(
+          operation.get('conversationId') || '',
+        ).trim();
+        if (conversationId) supportConversationIds.add(conversationId);
+      },
+    );
+  }
+  for (const conversationId of supportConversationIds) {
+    await deleteConversationForUser(
+      uid,
+      db.collection('conversations').doc(conversationId),
+    );
   }
 }
 
@@ -500,6 +742,154 @@ async function deletePersonalBlocks(uid: string): Promise<void> {
 }
 
 /**
+ * Removes legacy notification copies which point at one source record.
+ *
+ * Older notifications did not have a server-only attribution record. Their
+ * `data` map still identifies the exact chat message or review, so account
+ * cleanup and moderation can still remove the old copies.
+ */
+async function deleteNotificationsWithDataValue(
+  field: string,
+  value: string,
+): Promise<void> {
+  if (!field || !value) return;
+  const snapshot = await db
+    .collection('notifications')
+    .where(`data.${field}`, '==', value)
+    .get();
+  await Promise.all(snapshot.docs.map((document) => document.ref.delete()));
+}
+
+/**
+ * Removes every notification dependent on one review source.
+ *
+ * The deterministic in-app copy and the legacy copies are removed before the
+ * server-only attribution. The attribution is removed last so a failed
+ * notification delete cannot make the remaining copy impossible to discover
+ * on a retry.
+ */
+async function deleteReviewNotificationDependents(options: {
+  reviewId: string;
+  reviewInstanceId: string;
+  ownerId: string;
+}): Promise<void> {
+  if (!options.reviewId) return;
+
+  await deleteNotificationsWithDataValue('reviewId', options.reviewId);
+
+  const notificationId = options.ownerId
+    ? reviewNotificationId(
+        options.reviewId,
+        options.reviewInstanceId,
+        options.ownerId,
+      )
+    : '';
+  const attributionSnapshot = await db
+    .collection(NOTIFICATION_ATTRIBUTIONS)
+    .where('sourceReviewId', '==', options.reviewId)
+    .get();
+  const lifecycleAttributionSnapshot = options.reviewInstanceId
+    ? await db
+        .collection(NOTIFICATION_ATTRIBUTIONS)
+        .where('sourceId', '==', options.reviewInstanceId)
+        .get()
+    : { docs: [] as firestore.QueryDocumentSnapshot[] };
+
+  const notificationIds = new Set<string>();
+  if (notificationId) notificationIds.add(notificationId);
+  for (const record of [
+    ...attributionSnapshot.docs,
+    ...lifecycleAttributionSnapshot.docs,
+  ]) {
+    const attributedNotificationId = String(
+      record.get('notificationId') || '',
+    ).trim();
+    if (attributedNotificationId) {
+      notificationIds.add(attributedNotificationId);
+    }
+  }
+
+  // Remove every recipient-visible copy before any server-only attribution.
+  // The source review is deleted by the caller only after this helper has
+  // completed successfully.
+  for (const id of notificationIds) {
+    await db.collection('notifications').doc(id).delete();
+  }
+
+  const attributionRecords = new Map<
+    string,
+    firestore.DocumentReference
+  >();
+  for (const record of [
+    ...attributionSnapshot.docs,
+    ...lifecycleAttributionSnapshot.docs,
+  ]) {
+    attributionRecords.set(record.ref.path, record.ref);
+  }
+  if (notificationId) {
+    const deterministicRef = db
+      .collection(NOTIFICATION_ATTRIBUTIONS)
+      .doc(notificationId);
+    attributionRecords.set(deterministicRef.path, deterministicRef);
+  }
+
+  await Promise.all(
+    Array.from(attributionRecords.values()).map((record) => record.delete()),
+  );
+}
+
+/**
+ * Removes notification copies which are attributable to one account.
+ *
+ * A notification is normally addressed to only one person, but its server
+ * source can involve another participant (for example an administrator who
+ * sent a support message, or a student who wrote a review). The source uids
+ * live in server-only attribution/delivery records so they are never exposed
+ * to the notification recipient.
+ *
+ * Deleting the account therefore has to remove both the recipient's copy and
+ * every copy whose source is the deleted participant.
+ */
+export async function deleteAttributedNotificationsForUser(
+  uid: string,
+): Promise<void> {
+  if (!uid) return;
+
+  const notificationIds = new Set<string>();
+  const serverOnlyRecords: firestore.DocumentReference[] = [];
+  const serverOnlyCollections = [
+    NOTIFICATION_ATTRIBUTIONS,
+    ADMIN_MESSAGE_NOTIFICATION_OPERATIONS,
+  ];
+
+  for (const collectionName of serverOnlyCollections) {
+    for (const field of ['sourceAuthorUid', 'sourceRecipientUid'] as const) {
+      const snapshot = await db
+        .collection(collectionName)
+        .where(field, '==', uid)
+        .get();
+      for (const record of snapshot.docs) {
+        const notificationId = String(record.get('notificationId') || '').trim();
+        if (notificationId) notificationIds.add(notificationId);
+        serverOnlyRecords.push(record.ref);
+      }
+    }
+  }
+
+  // Remove the recipient-visible copy first. The server-only mapping is
+  // still present at this point, so a transient notification-delete failure
+  // can be retried without leaving an untraceable notification behind.
+  for (const notificationId of notificationIds) {
+    await db.collection('notifications').doc(notificationId).delete();
+  }
+
+  // Only after every notification copy is gone may the attribution/delivery
+  // records be removed. The order is idempotent and preserves the retry
+  // mapping if the first phase fails.
+  await Promise.all(serverOnlyRecords.map((record) => record.delete()));
+}
+
+/**
  * Deletes everything that belongs to a user.
  *
  * The Firestore data is deleted **before** the Auth account — the other way
@@ -605,6 +995,51 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // memory as a whole.
   // ---------------------------------------------------------------------
 
+  // Remove recipient copies and their server-only attribution/delivery
+  // records before any of their source records. The notification delete is
+  // deliberately first inside the attributed-notification helper so a failed
+  // copy removal keeps the attribution available for the next retry.
+  await deleteWhere(() =>
+    db
+      .collection('notifications')
+      .where('userId', '==', uid)
+      .orderBy('__name__'),
+  );
+  await deleteAttributedNotificationsForUser(uid);
+
+  // Conversations are sources too. Their messages and notification
+  // dependencies are removed while the raw participant mapping is still
+  // available, before listings, requests and other source records disappear.
+  await deleteUserConversations(uid);
+
+  // A review notification is a dependent of the review source. Remove every
+  // deterministic and legacy copy, plus the server-only attribution, before
+  // deleting the review itself. A retry can safely repeat each step.
+  const reviewsToDelete = new Map<
+    string,
+    firestore.QueryDocumentSnapshot
+  >();
+  for (const field of ['studentId', 'ownerId'] as const) {
+    const reviews = await db
+      .collection('roomReviews')
+      .where(field, '==', uid)
+      .get();
+    for (const review of reviews.docs) {
+      if (!reviewsToDelete.has(review.id)) {
+        reviewsToDelete.set(review.id, review);
+      }
+    }
+  }
+  for (const review of reviewsToDelete.values()) {
+    const data = review.data() as Record<string, any>;
+    await deleteReviewNotificationDependents({
+      reviewId: review.id,
+      reviewInstanceId: reviewInstanceIdFor(review),
+      ownerId: String(data.ownerId || '').trim(),
+    });
+    await review.ref.delete();
+  }
+
   // The listings and their deterministic private locations are removed in
   // the same batches. The private document id is the room id, so an
   // inconsistent private ownerId cannot orphan the exact address.
@@ -688,30 +1123,22 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
     );
   }
 
-  // The notifications addressed to the user.
-  await deleteWhere(() =>
-    db.collection('notifications')
-      .where('userId', '==', uid)
-      .orderBy('__name__'),
-  );
-
-  // The reviews — the ones the user wrote and the ones about the rooms of
-  // the user.
-  //
-  // A review of the user is personal data and has to go with the account.
-  // A review about a room of the user would be an orphan without its room,
-  // so it goes as well.
-  await deleteWhere(() =>
-    db.collection('roomReviews')
-      .where('studentId', '==', uid)
-      .orderBy('__name__'),
-  );
-
-  await deleteWhere(() =>
-    db.collection('roomReviews')
-      .where('ownerId', '==', uid)
-      .orderBy('__name__'),
-  );
+  // Moderation events and their idempotency pointers contain the ids of the
+  // reviewed student, the room owner and the administrator who performed the
+  // moderation. They follow the personal records of the deleted account
+  // instead of leaving its uid behind.
+  for (const field of ['studentId', 'ownerId', 'deletedByAdminId'] as const) {
+    await deleteWhere(() =>
+      db.collection('reviewDeletionAudit')
+        .where(field, '==', uid)
+        .orderBy('__name__'),
+    );
+    await deleteWhere(() =>
+      db.collection('reviewDeletionState')
+        .where(field, '==', uid)
+        .orderBy('__name__'),
+    );
+  }
 
   // The locks of the booking requests — a lock that points at a request of
   // a deleted account would block a new request of somebody else. The
@@ -748,6 +1175,17 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
     .digest('hex')}`;
   await db.collection('otpSendQuota').doc(otpQuotaId).delete();
 
+  // A verified-email linking operation and its per-account lock contain the
+  // uid, the plain email address and the hash of the one-time proof. They are
+  // only durable server-side retry/serialisation records and must not outlive
+  // the account they belong to.
+  await deleteWhere(() =>
+    db
+      .collection('emailLinkOperations')
+      .where('uid', '==', uid)
+      .orderBy('__name__'),
+  );
+
   // A pending Auth role-claim publication contains the deleted uid and can
   // no longer have a valid destination profile.
   await db.collection('roleClaimJobs').doc(uid).delete();
@@ -756,11 +1194,6 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // created and the blocks other accounts created against it, so a deleted
   // uid can never keep restricting somebody else's interaction.
   await deletePersonalBlocks(uid);
-
-  // The conversations of the user, with all their messages. Each parent is
-  // marked before its messages are scanned, so a late message cannot become
-  // an orphan after the parent is deleted.
-  await deleteUserConversations(uid);
 
   // The photos of the rooms of the user. Every delete is idempotent, so a
   // partial cleanup can safely be retried. Storage failures are propagated to
@@ -786,6 +1219,21 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
     }
     console.log(`The Auth account ${uid} was already gone.`);
   }
+
+  // A registration-rollback marker contains the deleted uid and may be the
+  // only durable instruction which tells the rollback worker to remove a
+  // still-pending incomplete Auth account. Keep it until the Auth deletion
+  // above has succeeded (or was already complete). If any earlier cleanup
+  // step fails, the marker remains and the worker can still finish the
+  // incomplete registration. Once Auth is gone, remove the marker so no
+  // later worker pass can act on the deleted account.
+  await deleteWhere(() =>
+    db
+      .collection(REGISTRATION_ROLLBACK_OPERATIONS)
+      .where('uid', '==', uid)
+      .orderBy('__name__'),
+  );
+  await db.collection(REGISTRATION_ROLLBACK_OPERATIONS).doc(uid).delete();
 
   // The profile is deleted only after every dependent Firestore collection,
   // the room photos and the Auth account are gone. Keeping it until the end

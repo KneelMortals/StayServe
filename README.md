@@ -12,7 +12,7 @@ manage users and decide where the app is available.
 
 | Part | Technology |
 |------|------------|
-| App | Flutter 3.44 (Dart 3.12), Riverpod, go_router |
+| App | Flutter 3.50 (Dart 3.14), Riverpod, go_router |
 | Backend | Firebase Auth, Cloud Firestore, Cloud Storage, Cloud Functions (Node 22, `us-central1`) |
 | Payments | UPI intent built **server side** — the client never chooses the payee or the amount |
 | Project | `myfirstapp-fa30f52b` |
@@ -24,7 +24,16 @@ manage users and decide where the app is available.
 ```bash
 flutter pub get
 flutter run                       # debug on a connected device
-flutter build apk --release      # build/app/outputs/flutter-apk/app-release.apk
+flutter build apk --release --split-per-abi
+```
+
+The split build writes distributable ABIs below
+`build/app/outputs/flutter-apk/` (for example `app-arm64-v8a-release.apk`).
+Do not publish the universal APK: it contains every ABI and exceeds the
+40 MB per-device delivery limit. The Play Store artifact is the app bundle:
+
+```bash
+flutter build appbundle --release
 ```
 
 The root package contains the Firebase CLI used by the local emulator and
@@ -205,8 +214,32 @@ firebase deploy --only storage
 npm run storage:cors:check
 npm run storage:cors:apply
 
-flutter build apk --release
+flutter build apk --release --split-per-abi
 ```
+
+### Release signing and Android OAuth
+
+A distributable Android release must use a protected upload/release key. Set
+these four values in the build environment (or as matching Gradle
+properties); do not commit the keystore or its passwords:
+
+```text
+STAY_SERVE_RELEASE_STORE_FILE
+STAY_SERVE_RELEASE_STORE_PASSWORD
+STAY_SERVE_RELEASE_KEY_ALIAS
+STAY_SERVE_RELEASE_KEY_PASSWORD
+```
+
+When all four values are absent, the build falls back to the debug key so
+local and CI size validation can still run. A partial configuration (including
+a missing or blank value) fails the Gradle build instead of silently producing
+a debug-signed release. A debug-key artifact is **not** production-signed and
+must not be published as an app update.
+
+Every certificate which will run the app must also be registered in the
+Firebase Android OAuth client: the local/debug SHA-1, the CI/upload SHA-1,
+and the Play App Signing SHA-1. A CI runner or Play build with an
+unregistered certificate cannot complete Google sign-in.
 
 The exact room address is stored in the server-owned
 `roomPrivate/{roomId}` collection. Public `rooms/{roomId}` documents retain
