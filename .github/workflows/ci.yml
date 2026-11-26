@@ -238,5 +238,26 @@ jobs:
       - name: Verify the iOS push and OAuth configuration
         run: flutter test test/ios_auth_configuration_test.dart
 
+      - name: Ensure the Swift package lockfiles are not tracked
+        # Xcode writes `Package.resolved` itself. A committed lockfile which
+        # was written for an older dependency set makes Xcode fetch packages
+        # the current graph does not use and then abort the build with
+        #
+        #   *** -[NSMutableArray insertObjects:atIndexes:]: count of array
+        #       (31) differs from count of index set (28)
+        #
+        # Flutter pins the plugin versions in `pubspec.lock`, so the Swift
+        # lockfile only duplicated that information and went stale on every
+        # dependency upgrade. It must stay untracked.
+        run: |
+          set -euo pipefail
+
+          tracked="$(git ls-files | grep -E '(^|/)xcshareddata/swiftpm/Package\.resolved$' || true)"
+          if [[ -n "${tracked}" ]]; then
+            echo "::error::Swift package lockfiles must not be committed:"
+            echo "${tracked}"
+            exit 1
+          fi
+
       - name: Build the unsigned iOS release
         run: flutter build ios --release --no-codesign
