@@ -10,7 +10,7 @@
   },
   "scripts": {
     "test": "npm run test:functions && npm run test:callables && npm run test:location-cli && npm run test:rules && npm run test:storage-rules && npm run test:indexes && npm run test:domain",
-    "test:functions": "npm --prefix functions run build && node tools/functions_unit_test.mjs && node functions/test/rooms_unit_test.mjs && node functions/test/room_location_unit_test.mjs && node functions/test/otp_atomicity_test.mjs && tools/test_batches.sh",
+    "test:functions": "npm --prefix functions run build && node tools/functions_unit_test.mjs && node functions/test/rooms_unit_test.mjs && node functions/test/room_location_unit_test.mjs && node functions/test/otp_atomicity_test.mjs && node --test tools/app_check_test.mjs tools/live_test_identity_test.mjs && tools/test_batches.sh",
     "test:callables": "tools/test_backend_callables.sh",
     "test:location-cli": "tools/test_private_location_cli.sh",
     "test:rules": "tools/test_firestore_rules.sh",

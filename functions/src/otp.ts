@@ -28,6 +28,11 @@ import {
   legacyEmailProofMatches,
   LEGACY_EMAIL_PROOF_SOURCE,
 } from './authIdentity';
+import { recordPhoneVerificationProof } from './phoneVerification';
+import {
+  readPhoneVerificationProof,
+  verifiedPhoneForUser,
+} from './verifiedPhone';
 
 const db = firestore.getFirestore();
 
@@ -48,13 +53,23 @@ export const REGISTRATION_ROLLBACK_OPERATIONS =
  * the token can remain valid for a short time after a provider is unlinked.
  * A failed lookup fails closed so a transient Auth error can never turn into
  * an unverified registration.
+ *
+ * A non-empty Firebase phone number is not a verification proof either: the
+ * Admin SDK can attach a number without the SMS challenge. When the caller
+ * presents a phone-provider session, that session is the proof that the owner
+ * completed Firebase's phone challenge, and it is recorded here.
  */
 async function liveFirebaseIdentity(
   uid: string,
+  token?: unknown,
 ): Promise<FirebaseAuthIdentity> {
   try {
     const user = await firebaseAuth.getAuth().getUser(uid);
-    return firebaseIdentityFromAuthUser(user);
+    const recordedPhone = await recordPhoneVerificationProof({ uid, token });
+    const proofPhone = await readPhoneVerificationProof(uid);
+    const verifiedPhone =
+      recordedPhone || verifiedPhoneForUser(user, proofPhone);
+    return firebaseIdentityFromAuthUser(user, verifiedPhone);
   } catch (error) {
     const code = String((error as { code?: unknown })?.code || '').trim();
     console.error('Could not read the live Firebase Auth identity:', error);
@@ -1111,7 +1126,7 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
   }
 
   const uid = context.auth.uid;
-  const identity = await liveFirebaseIdentity(uid);
+  const identity = await liveFirebaseIdentity(uid, context.auth.token);
   const name = String(data?.name || '').trim();
   const role = String(data?.role || 'student');
   const pincode = data?.pincode ? String(data.pincode).trim() : null;
@@ -1381,7 +1396,7 @@ export const registerUserRole = callableHttps.onCall(async (data, context) => {
     throw new functions.https.HttpsError('invalid-argument', 'Invalid role');
   }
 
-  const identity = await liveFirebaseIdentity(uid);
+  const identity = await liveFirebaseIdentity(uid, context.auth.token);
   const liveEmail = identity.email;
   const emailRef = liveEmail
     ? db.collection('otpCodes').doc(documentId('email', liveEmail))

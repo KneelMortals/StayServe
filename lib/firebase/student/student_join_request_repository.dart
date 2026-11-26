@@ -7,7 +7,18 @@ import '../../models/join_request_model.dart';
 import '../auth/auth_service.dart';
 import '../functions/functions_service.dart';
 
-final studentJoinRequestProvider = Provider<StudentJoinRequestRepository>((ref) {
+typedef JoinRequestCallable =
+    Future<Map<String, dynamic>> Function(
+      String name, {
+      Map<String, dynamic>? parameters,
+    });
+
+typedef JoinRequestDocumentReader =
+    Future<Map<String, dynamic>?> Function(String requestId);
+
+final studentJoinRequestProvider = Provider<StudentJoinRequestRepository>((
+  ref,
+) {
   return StudentJoinRequestRepository(
     firestore: ref.watch(firestoreProvider),
     auth: ref.watch(firebaseAuthProvider),
@@ -19,12 +30,24 @@ class StudentJoinRequestRepository {
   final FirebaseFirestore _firestore;
   final FirebaseAuth _auth;
   final FunctionsService _functions;
+  final JoinRequestCallable? _callable;
+  final JoinRequestDocumentReader? _documentReader;
 
   StudentJoinRequestRepository({
-    required this._firestore,
-    required this._auth,
-    required this._functions,
-  });
+    required FirebaseFirestore firestore,
+    required FirebaseAuth auth,
+    required FunctionsService functions,
+    JoinRequestCallable? callable,
+    JoinRequestDocumentReader? documentReader,
+  }) : this._(firestore, auth, functions, callable, documentReader);
+
+  StudentJoinRequestRepository._(
+    this._firestore,
+    this._auth,
+    this._functions,
+    this._callable,
+    this._documentReader,
+  );
 
   /// Create a join request for a room (student initiates)
   ///
@@ -33,44 +56,67 @@ class StudentJoinRequestRepository {
   /// a modified client (which used to mean a student could pay a fee of
   /// almost nothing, or approve their own request).
   ///
-  /// [ownerId] and [monthlyRent] are kept for backwards compatibility with
-  /// the calling screens — the server ignores them.
-  Future<JoinRequestModel> createJoinRequest({
-    required String roomId,
-    String? ownerId,
-    double? monthlyRent,
-  }) async {
+  /// The returned model is read from the canonical server-owned document.
+  /// A missing document or an identity mismatch fails closed; the client
+  /// never synthesises a request which could look authoritative in the UI.
+  Future<JoinRequestModel> createJoinRequest({required String roomId}) async {
     final user = _auth.currentUser;
     if (user == null) throw Exception('User not logged in');
 
-    final result = await _functions.callFunction(
-      'createJoinRequest',
-      parameters: {'roomId': roomId},
-    );
+    final data =
+        await (_callable?.call(
+              'createJoinRequest',
+              parameters: <String, dynamic>{'roomId': roomId},
+            ) ??
+            _functions.callFunctionData(
+              'createJoinRequest',
+              parameters: <String, dynamic>{'roomId': roomId},
+            ));
+    if (data['success'] != true) {
+      throw StateError('Booking request creation was not confirmed.');
+    }
 
-    final data = Map<String, dynamic>.from(result.data as Map);
-    final requestId = data['requestId']?.toString() ?? '';
+    final requestId = data['requestId']?.toString().trim() ?? '';
+    if (requestId.isEmpty) {
+      throw StateError('Booking request id missing from server response.');
+    }
 
     // The server writes the document; this read picks it up again so the
     // caller gets the real model (rent, owner, status).
-    final snapshot =
-        await _firestore.collection('joinRequests').doc(requestId).get();
-    if (snapshot.exists) {
-      return JoinRequestModel.fromJson(snapshot.data()!);
+    Map<String, dynamic>? canonical;
+    if (_documentReader != null) {
+      canonical = await _documentReader(requestId);
+    } else {
+      final snapshot = await _firestore
+          .collection('joinRequests')
+          .doc(requestId)
+          .get();
+      canonical = snapshot.exists ? snapshot.data() : null;
+    }
+    if (canonical == null) {
+      throw StateError('Booking request could not be read from the server.');
     }
 
-    return JoinRequestModel(
-      requestId: requestId,
-      roomId: roomId,
-      studentId: user.uid,
-      ownerId: ownerId ?? '',
-      status: JoinRequestStatus.pending,
-      createdAt: DateTime.now(),
-      updatedAt: DateTime.now(),
-      monthlyRentAtJoin: monthlyRent ?? 0,
-      commissionPercentageAtJoin:
-          (data['commissionPercentageAtJoin'] as num?)?.toDouble() ?? 0,
+    final canonicalRequestId = canonical['requestId']?.toString().trim() ?? '';
+    final canonicalRoomId = canonical['roomId']?.toString().trim() ?? '';
+    final canonicalStudentId = canonical['studentId']?.toString().trim() ?? '';
+    final canonicalOwnerId = canonical['ownerId']?.toString().trim() ?? '';
+    final canonicalStatus = canonical['status']?.toString().trim() ?? '';
+    final statusIsKnown = JoinRequestStatus.values.any(
+      (status) => status.name == canonicalStatus,
     );
+    if (canonicalRequestId != requestId ||
+        canonicalRoomId != roomId ||
+        canonicalStudentId != user.uid ||
+        canonicalOwnerId.isEmpty ||
+        canonicalOwnerId == canonicalStudentId ||
+        !statusIsKnown) {
+      throw StateError(
+        'Booking request identity does not match the server response.',
+      );
+    }
+
+    return JoinRequestModel.fromJson(canonical);
   }
 
   /// Student confirms they want to join (after owner approval) - triggers payment
@@ -99,8 +145,7 @@ class StudentJoinRequestRepository {
       'cancelJoinRequest',
       parameters: {
         'requestId': requestId,
-        if (reason != null && reason.trim().isNotEmpty)
-          'reason': reason.trim(),
+        if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
       },
     );
   }
@@ -115,9 +160,11 @@ class StudentJoinRequestRepository {
         .where('studentId', isEqualTo: user.uid)
         .orderBy('createdAt', descending: true)
         .snapshots()
-        .map((snapshot) => snapshot.docs
-            .map((doc) => JoinRequestModel.fromJson(doc.data()))
-            .toList());
+        .map(
+          (snapshot) => snapshot.docs
+              .map((doc) => JoinRequestModel.fromJson(doc.data()))
+              .toList(),
+        );
   }
 
   /// Get pending join requests for a room (owner view)
@@ -133,14 +180,19 @@ class StudentJoinRequestRepository {
         .collection('joinRequests')
         .where('roomId', isEqualTo: roomId)
         .where('ownerId', isEqualTo: user.uid)
-        .where('status', whereIn: [
-      JoinRequestStatus.pending.value,
-      JoinRequestStatus.studentConfirmed.value,
-    ])
+        .where(
+          'status',
+          whereIn: [
+            JoinRequestStatus.pending.value,
+            JoinRequestStatus.studentConfirmed.value,
+          ],
+        )
         .orderBy('createdAt', descending: true)
         .snapshots()
-        .map((snapshot) => snapshot.docs
-            .map((doc) => JoinRequestModel.fromJson(doc.data()))
-            .toList());
+        .map(
+          (snapshot) => snapshot.docs
+              .map((doc) => JoinRequestModel.fromJson(doc.data()))
+              .toList(),
+        );
   }
 }

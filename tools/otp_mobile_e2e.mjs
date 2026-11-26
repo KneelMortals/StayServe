@@ -13,6 +13,8 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 
+import { appCheckHeaders, assertAppCheckConfigured } from './app_check.mjs';
+
 const PROJECT = 'myfirstapp-fa30f52b';
 const FN = `https://us-central1-${PROJECT}.cloudfunctions.net`;
 const LOGGING = 'https://logging.googleapis.com/v2/entries:list';
@@ -89,6 +91,7 @@ function normalisePhone(phone) {
 }
 
 async function main() {
+  assertAppCheckConfigured();
   const phone = process.argv[2];
   if (!phone) throw new Error('usage: node mobile_e2e.mjs <phone>');
   const normalised = normalisePhone(phone);
@@ -98,7 +101,7 @@ async function main() {
   const sentAt = new Date(Date.now() - 5000).toISOString();
   const send = await json(`${FN}/sendOtp`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: appCheckHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ data: { channel: 'mobile', identifier: phone } }),
   });
   console.log('  response:', JSON.stringify(send.body));
@@ -131,7 +134,7 @@ async function main() {
   console.log('\n--- 3. verify it ---');
   const verify = await json(`${FN}/verifyOtp`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: appCheckHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ data: { channel: 'mobile', identifier: normalised, otp: code } }),
   });
   console.log('  response:', JSON.stringify(verify.body));

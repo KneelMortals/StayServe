@@ -109,7 +109,16 @@ auth.getUser = async (uid) => {
     email: `${uid}@example.test`,
     emailVerified: true,
     phoneNumber,
-    providerData: [{ providerId: 'password' }, { providerId: 'phone' }],
+    // The server-issued proof that the account completed Firebase's phone
+    // challenge. Without it the number is not verified, even though the live
+    // Auth record carries one.
+    customClaims: phoneNumber
+      ? { stayServeVerifiedPhone: phoneNumber }
+      : {},
+    providerData: [
+      { providerId: 'password' },
+      { providerId: 'phone', phoneNumber },
+    ],
   };
 };
 

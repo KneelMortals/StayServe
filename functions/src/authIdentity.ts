@@ -30,8 +30,9 @@ export interface FirebaseAuthIdentity {
   /**
    * Whether the phone number is a verified Firebase phone identity.
    *
-   * Firebase only exposes a linked phone number after the SMS challenge has
-   * been completed. A missing number therefore revokes the previous grant.
+   * A non-empty `phoneNumber` is **not** a verification proof: the Admin SDK
+   * can attach a number without the SMS challenge. The number is only
+   * verified when the server recorded a proof for exactly this number.
    */
   phoneVerified: boolean;
 
@@ -45,11 +46,17 @@ export interface FirebaseAuthIdentity {
  * An ID token is a snapshot which can remain cryptographically valid for a
  * short time after a provider is linked or unlinked. The user record is the
  * authority for the contacts which are currently attached to the account.
- * In particular, `phoneNumber` is present only while a verified phone
- * provider is linked, and `emailVerified` describes the live primary email.
+ * In particular, `phoneNumber` is present only while a phone provider is
+ * linked, and `emailVerified` describes the live primary email.
+ *
+ * `verifiedPhone` is the number for which the server holds a proof that the
+ * owner completed Firebase's phone challenge. It is deliberately a separate
+ * argument: the live record alone cannot distinguish a verified number from
+ * one which an administrator attached with the Admin SDK.
  */
 export function firebaseIdentityFromAuthUser(
   user: UserRecord,
+  verifiedPhone = '',
 ): FirebaseAuthIdentity {
   const email = String(user.email || '').trim().toLowerCase();
   const emailVerified = email !== '' && user.emailVerified === true;
@@ -61,14 +68,16 @@ export function firebaseIdentityFromAuthUser(
         .filter((provider) => provider.length > 0),
     ),
   ).sort();
+  const proof = String(verifiedPhone || '').trim();
 
   return {
     email,
     emailVerified,
     phone,
-    // Firebase exposes a phone number on a user record only after the SMS
-    // challenge has been completed and the provider has been linked.
-    phoneVerified: phone !== '',
+    // The phone is verified only when the server holds a proof for exactly
+    // this number. An Admin-provisioned number has no proof and therefore
+    // never grants tenant access.
+    phoneVerified: phone !== '' && proof !== '' && proof === phone,
     providers,
   };
 }

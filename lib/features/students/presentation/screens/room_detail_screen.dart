@@ -1027,21 +1027,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
               icon: const Icon(Icons.close),
               onPressed: _busy || requestId == null
                   ? null
-                  : () => _cancelBooking(
-                      context,
-                      activeRequest ??
-                          JoinRequestModel(
-                            requestId: requestId,
-                            roomId: room.roomId,
-                            studentId: currentUser.uid,
-                            ownerId: room.ownerId,
-                            status: JoinRequestStatus.pending,
-                            createdAt: DateTime.now(),
-                            updatedAt: DateTime.now(),
-                            monthlyRentAtJoin: room.monthlyRent,
-                            commissionPercentageAtJoin: 30,
-                          ),
-                    ),
+                  : () => _cancelBooking(context, requestId),
               isLoading: _busy,
               isFullWidth: true,
               type: ButtonType.danger,
@@ -1178,10 +1164,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
   /// Cancels the booking of this room.
   ///
   /// The student is asked first — a cancellation cannot be undone.
-  Future<void> _cancelBooking(
-    BuildContext context,
-    JoinRequestModel request,
-  ) async {
+  Future<void> _cancelBooking(BuildContext context, String requestId) async {
     // The messenger and the colour are taken **before** the dialog is
     // opened: the context of the button must not be used after the `await`.
     final messenger = ScaffoldMessenger.of(context);
@@ -1216,7 +1199,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       await ref
           .read(studentJoinRequestProvider)
           .cancelJoinRequest(
-            request.requestId,
+            requestId,
             reason: 'Cancelled by the student from the room page',
           );
       if (!mounted) return;
@@ -1412,11 +1395,7 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
       // a server-issued payment link from the "My Requests" screen.
       final request = await ref
           .read(studentJoinRequestProvider)
-          .createJoinRequest(
-            roomId: room.roomId,
-            ownerId: room.ownerId,
-            monthlyRent: room.monthlyRent,
-          );
+          .createJoinRequest(roomId: room.roomId);
 
       // The dialog is closed with the result — the screen that opened it
       // then turns the button into "Cancel booking". The id of the request

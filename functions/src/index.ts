@@ -354,7 +354,12 @@ export {
 
 // Administrator support messaging. The sender identity and the verified
 // badge are written only by the server.
-export { sendAdminMessage } from './adminMessaging';
+export {
+  sendAdminMessage,
+  sendAdminSupportReply,
+  listAdminSupportConversations,
+  markAdminSupportConversationRead,
+} from './adminMessaging';
 
 // Notification content and deletion are server-owned. Clients may only
 // update the read bookkeeping of their own notification.
@@ -411,10 +416,19 @@ export {
   setRoomListingAvailability,
   deleteRoomListing,
   adminSetRoomListingStatus,
+  publishRoomListing,
   onRoomCreated,
   onRoomUpdated,
   processRoomPhotoCleanupJobs,
 } from './rooms';
+
+// Room-photo uploads are server-mediated. Clients cannot write the room
+// image namespace directly and cannot put arbitrary URLs into a listing.
+export {
+  stageRoomPhoto,
+  commitRoomPhotoChanges,
+  discardRoomPhotoUpload,
+} from './roomMedia';
 
 // Durable Auth custom-claim publication retries.
 export { processRoleClaimPublicationJobs } from './roleClaims';

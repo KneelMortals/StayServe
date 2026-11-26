@@ -94,7 +94,11 @@ jobs:
         # The Flutter build restores it before the lint step runs below.
         # Build the bundle before split APKs because AGP cannot pre-bundle
         # after a multi-APK build has produced multiple shrunk-resource files.
-        run: flutter build appbundle --release
+        #
+        # Maven Central occasionally rate-limits dependency resolution with
+        # HTTP 429. The wrapper retries only that transient failure and never
+        # retries an ordinary compilation error.
+        run: tools/run_gradle_command_with_retry.sh flutter build appbundle --release
 
       - name: Enforce the Android per-device download limit
         shell: bash
@@ -139,7 +143,7 @@ jobs:
         # Flutter's supported split flow produces distributable ABI-specific
         # APKs without the oversized universal fallback and honors targeted
         # Flutter ABI flags.
-        run: flutter build apk --release --split-per-abi
+        run: tools/run_gradle_command_with_retry.sh flutter build apk --release --split-per-abi
 
       - name: Verify the Android APK variant version codes
         run: |
@@ -211,7 +215,7 @@ jobs:
       - name: Lint the Android app
         # Lint only the application module. Flutter plugins are separate
         # Gradle projects and may carry their own upstream lint findings.
-        run: ./android/gradlew -p android :app:lintDebug
+        run: tools/run_gradle_command_with_retry.sh ./android/gradlew -p android :app:lintDebug
 
   ios:
     runs-on: macos-latest

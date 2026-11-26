@@ -10,13 +10,16 @@
 //
 //   1. it creates a throw-away owner and a throw-away student;
 //   2. it makes both of them live accounts through the server-side channel
-//      (the same state `completeRegistration` produces);
-//   3. the owner creates one listing **without** the server-owned fields
-//      (what the old app did) and one listing **with** the initial values
-//      (what the app does now);
-//   4. it waits for the `onRoomCreated` trigger to normalize the first one;
+//      (the same state `completeRegistration` produces) and completes the
+//      **real** Firebase phone challenge for them, so their tokens carry the
+//      signed `stayServeVerifiedPhone` claim which the rules evaluate;
+//   3. the owner creates one listing **without** the server-owned state —
+//      which the rules now refuse — and one listing as a **draft** (what the
+//      app does now);
+//   4. the server publishes the draft through `publishRoomListing`, which
+//      verifies that the private exact location exists;
 //   5. the student runs the query the app uses (`status == available`) and
-//      both listings have to be in the result;
+//      the published listing has to be in the result;
 //   6. everything it created is removed again.
 //
 //   node tools/verify_room_visibility.mjs
@@ -26,11 +29,22 @@ import nodeFs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { prepareVerifiedPhoneIdentity } from './live_test_identity.mjs';
+import {
+  appCheckHeaders,
+  assertAppCheckConfigured,
+} from './app_check.mjs';
+
 const KEY = 'AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM';
 const PROJ = 'myfirstapp-fa30f52b';
 const BASE = `https://firestore.googleapis.com/v1/projects/${PROJ}/databases/(default)/documents`;
 const AUTH = `https://identitytoolkit.googleapis.com/v1`;
+const FUNCTIONS_BASE = `https://us-central1-${PROJ}.cloudfunctions.net`;
 const PASSWORD = 'TmpVerify!2026x';
+const PHONE_OWNER =
+  process.env.STAYSERVE_SMOKE_PHONE_OWNER || '+15555550106';
+const PHONE_STUDENT =
+  process.env.STAYSERVE_SMOKE_PHONE_STUDENT || '+15555550107';
 
 let adminToken = null;
 let pass = 0;
@@ -85,6 +99,22 @@ async function clientFs(token, method, fsPath, body) {
       'Content-Type': 'application/json',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text.slice(0, 120) }; }
+  return { status: res.status, json };
+}
+
+/** A callable with the account's own ID token (the client channel). */
+async function callable(name, token, data) {
+  const res = await fetch(`${FUNCTIONS_BASE}/${name}`, {
+    method: 'POST',
+    headers: appCheckHeaders({
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    }),
+    body: JSON.stringify({ data }),
   });
   const text = await res.text();
   let json;
@@ -178,7 +208,13 @@ async function createAccount(label) {
     );
   }
   created.uids.push(signUp.json.localId);
-  return { token: signUp.json.idToken, uid: signUp.json.localId, email };
+  return {
+    token: signUp.json.idToken,
+    refreshToken: signUp.json.refreshToken || '',
+    uid: signUp.json.localId,
+    email,
+    password: PASSWORD,
+  };
 }
 
 /**
@@ -225,22 +261,42 @@ async function makeLive(account, role) {
   }
 }
 
-function fieldOf(document, name) {
-  const value = document?.fields?.[name];
-  if (!value) return undefined;
-  if ('stringValue' in value) return value.stringValue;
-  if ('integerValue' in value) return Number(value.integerValue);
-  if ('doubleValue' in value) return value.doubleValue;
-  if ('booleanValue' in value) return value.booleanValue;
-  if ('timestampValue' in value) return value.timestampValue;
-  return undefined;
+/**
+ * Completes the real phone challenge of the throw-away account.
+ *
+ * The phone facts are never written through the Admin channel: a number
+ * which an administrator attaches is not a verification proof. The server
+ * records the proof itself and publishes the signed claims, so the refreshed
+ * token carries `stayServeVerifiedPhone`.
+ */
+async function prepareVerifiedPhone(account, phoneNumber) {
+  const live = await prepareVerifiedPhoneIdentity({
+    projectId: PROJ,
+    apiKey: KEY,
+    functionsBase: FUNCTIONS_BASE,
+    uid: account.uid,
+    email: account.email,
+    password: account.password,
+    phoneNumber,
+  });
+  account.token = live.idToken;
+  account.refreshToken = live.refreshToken || account.refreshToken;
 }
 
 async function cleanup() {
   console.log('\n--- cleanup ---');
   for (const roomId of created.roomIds) {
-    const r = await adminFs('DELETE', `/rooms/${roomId}`);
-    console.log(`  deleted room ${roomId} -> HTTP ${r.status}`);
+    // The listing is removed through the server-owned path, so the exact
+    // location, the photos and the request history disappear with it. A
+    // direct delete of the public document would leave the private location
+    // — and the exact address of the throw-away listing — behind.
+    const r = await callable('deleteRoomListing', ownerToken(), { roomId });
+    console.log(`  deleted listing ${roomId} -> HTTP ${r.status}`);
+    // The defensive fallback removes the private document as well.
+    for (const path of [`/rooms/${roomId}`, `/roomPrivate/${roomId}`]) {
+      const fallback = await adminFs('DELETE', path);
+      console.log(`  deleted ${path} -> HTTP ${fallback.status}`);
+    }
   }
   for (const uid of created.uids) {
     const r = await adminFs('DELETE', `/users/${uid}`);
@@ -259,7 +315,19 @@ async function idTokenOf(uid) {
   return null;
 }
 
+/** The current ID token of the throw-away owner. */
+function ownerToken() {
+  for (const uid of created.uids) {
+    const token = tokens.get(uid);
+    if (token) return token;
+  }
+  return '';
+}
+
 async function main() {
+  // The App Check configuration is verified **before** the throw-away
+  // accounts are created, so a missing token never leaves test data behind.
+  assertAppCheckConfigured();
   adminToken = firebaseCliToken();
   console.log(`--- project ${PROJ} ---`);
 
@@ -271,8 +339,16 @@ async function main() {
   await makeLive(owner, 'owner');
   await makeLive(student, 'student');
 
+  // The phone challenge is the real one: the server records the proof and
+  // publishes the signed claim which the rules evaluate.
+  await prepareVerifiedPhone(owner, PHONE_OWNER);
+  tokens.set(owner.uid, owner.token);
+  await prepareVerifiedPhone(student, PHONE_STUDENT);
+  tokens.set(student.uid, student.token);
+
   // -----------------------------------------------------------------------
-  // 1. The listing of the **old** app: no server-owned fields at all.
+  // 1. A listing **without** the server-owned state is refused. The old
+  //    compatibility window is closed: the status is server-owned.
   // -----------------------------------------------------------------------
   const legacyRoomId = `${owner.uid}-legacy`;
   created.roomIds.push(legacyRoomId);
@@ -287,13 +363,13 @@ async function main() {
     },
   });
   check(
-    'an owner may create a listing without the server-owned fields',
-    legacyCreate.status === 200,
+    'an owner may NOT create a listing without the server-owned draft state',
+    legacyCreate.status >= 400,
     `HTTP ${legacyCreate.status}`,
   );
 
   // -----------------------------------------------------------------------
-  // 2. The listing of the **current** app: the initial values are stated.
+  // 2. The listing of the **current** app: it is created as a draft.
   // -----------------------------------------------------------------------
   const currentRoomId = `${owner.uid}-current`;
   created.roomIds.push(currentRoomId);
@@ -304,61 +380,64 @@ async function main() {
       title: { stringValue: 'Visibility check (current payload)' },
       monthlyRent: { doubleValue: 7000 },
       occupancy: { integerValue: '2' },
-      status: { stringValue: 'available' },
+      status: { stringValue: 'draft' },
       currentOccupancy: { integerValue: '0' },
       createdAt: { timestampValue: new Date().toISOString() },
     },
   });
   check(
-    'an owner may create a listing with the initial server-owned state',
+    'an owner may create a listing as a draft',
     currentCreate.status === 200,
     `HTTP ${currentCreate.status}`,
   );
 
   // -----------------------------------------------------------------------
-  // 3. The `onRoomCreated` trigger has to normalize the legacy listing.
+  // 3. The draft is not on the market before it is published.
   // -----------------------------------------------------------------------
-  let legacyDocument = null;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const read = await adminFs('GET', `/rooms/${legacyRoomId}`);
-    if (read.status === 200) {
-      legacyDocument = read.json;
-      if (
-        fieldOf(legacyDocument, 'status') !== undefined &&
-        fieldOf(legacyDocument, 'currentOccupancy') !== undefined
-      ) {
-        break;
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
+  const draftVisible = await studentQuery(student.token);
   check(
-    'the trigger gives the legacy listing a status',
-    fieldOf(legacyDocument, 'status') === 'available',
-    `status=${fieldOf(legacyDocument, 'status')}`,
-  );
-  check(
-    'the trigger gives the legacy listing an occupancy counter',
-    fieldOf(legacyDocument, 'currentOccupancy') === 0,
-    `currentOccupancy=${fieldOf(legacyDocument, 'currentOccupancy')}`,
+    'the draft is not offered to the student before the publication',
+    !draftVisible.includes(currentRoomId),
+    `${draftVisible.length} listing(s) in the result`,
   );
 
   // -----------------------------------------------------------------------
-  // 4. The student has to see **both** listings.
+  // 4. The server publishes the draft once the exact location exists.
+  // -----------------------------------------------------------------------
+  const privateLocation = await callable('setRoomPrivateLocation', owner.token, {
+    roomId: currentRoomId,
+    address: '42 Visibility Check Lane',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  check(
+    'the owner stores the exact location privately',
+    privateLocation.status === 200 && privateLocation.json?.result?.success === true,
+    `HTTP ${privateLocation.status}`,
+  );
+  const published = await callable('publishRoomListing', owner.token, {
+    roomId: currentRoomId,
+  });
+  check(
+    'the server publishes the finished draft',
+    published.status === 200 && published.json?.result?.success === true,
+    `HTTP ${published.status}`,
+  );
+
+  // -----------------------------------------------------------------------
+  // 5. The student has to see the published listing.
   // -----------------------------------------------------------------------
   let visible = [];
   for (let attempt = 0; attempt < 10; attempt++) {
     visible = await studentQuery(student.token);
-    if (visible.includes(legacyRoomId) && visible.includes(currentRoomId)) break;
+    if (visible.includes(currentRoomId)) break;
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   check(
-    'the student sees the listing that was created without the fields',
-    visible.includes(legacyRoomId),
-    `${visible.length} listing(s) in the result`,
-  );
-  check(
-    'the student sees the listing that was created with the initial state',
+    'the student sees the published listing',
     visible.includes(currentRoomId),
     `${visible.length} listing(s) in the result`,
   );

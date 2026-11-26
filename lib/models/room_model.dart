@@ -234,11 +234,15 @@ class RoomModel {
   /// copy and the public compatibility fields in one server transaction.
   ///
   /// `status` and `currentOccupancy` are the **initial** values of a fresh
-  /// listing — `available` and `0`. Both fields are server-owned from the
-  /// moment the listing exists: `setRoomListingAvailability` /
-  /// `adminSetRoomListingStatus` change the status, an explicit availability
-  /// release also clears the occupancy, and the booking state machine changes
-  /// the counter during activation and rollback.
+  /// listing. Both fields are server-owned from the moment the listing
+  /// exists: the owner repository states the `draft` status (a new listing
+  /// is not offered to students and cannot be booked while its photos and
+  /// its private exact location are missing), `publishRoomListing` changes
+  /// the status to `available` once the listing is complete,
+  /// `setRoomListingAvailability` / `adminSetRoomListingStatus` change it
+  /// afterwards, an explicit availability release also clears the occupancy,
+  /// and the booking state machine changes the counter during activation and
+  /// rollback.
   Map<String, dynamic> toCreateJson() {
     final payload = toJson();
     // The server writes the rounded geocell after the private location has

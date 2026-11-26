@@ -27,6 +27,23 @@ class FunctionsService {
     return await callable.call(parameters);
   }
 
+  /// Calls a callable and returns its response as a JSON object.
+  ///
+  /// Repositories which need response fields use this instead of accepting an
+  /// arbitrary payload shape. It also keeps the transport detail out of the
+  /// repositories and makes their fail-closed validation directly testable.
+  Future<Map<String, dynamic>> callFunctionData(
+    String name, {
+    Map<String, dynamic>? parameters,
+  }) async {
+    final result = await callFunction(name, parameters: parameters);
+    final data = result.data;
+    if (data is! Map) {
+      throw StateError('The server returned an invalid response.');
+    }
+    return Map<String, dynamic>.from(data);
+  }
+
   /// Calls a callable that has no result the caller needs.
   ///
   /// Callable failures are converted into a normal [Exception] carrying the

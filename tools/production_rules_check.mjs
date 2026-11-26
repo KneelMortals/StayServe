@@ -23,6 +23,9 @@ import nodeFs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { appCheckHeaders, assertAppCheckConfigured } from './app_check.mjs';
+import { prepareVerifiedPhoneIdentity } from './live_test_identity.mjs';
+
 const KEY = 'AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM';
 const PROJ = 'myfirstapp-fa30f52b';
 const BASE = `https://firestore.googleapis.com/v1/projects/${PROJ}/databases/(default)/documents`;
@@ -31,6 +34,9 @@ const FUNCTIONS = `https://us-central1-${PROJ}.cloudfunctions.net`;
 
 const EMAIL = `rules.check.${Date.now()}@example.com`;
 const PASSWORD = 'TmpCheck!2026x';
+const PHONE = String(
+  process.env.STAYSERVE_SMOKE_PHONE_OWNER || '+15555550102',
+).trim();
 
 let token = null; // the throw-away account's ID token (the client)
 let adminToken = null; // the Firebase CLI OAuth token (the server)
@@ -65,10 +71,10 @@ async function auth(path, body) {
 async function callable(name, data = {}) {
   const res = await fetch(`${FUNCTIONS}/${name}`, {
     method: 'POST',
-    headers: {
+    headers: appCheckHeaders({
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
-    },
+    }),
     body: JSON.stringify({ data }),
   });
   const text = await res.text();
@@ -198,6 +204,10 @@ function firebaseCliToken() {
  * flow). The check reproduces that server-side transition through the Admin
  * SDK equivalent so the client assertions below run against a genuinely
  * live profile.
+ *
+ * The phone facts are deliberately **not** written here. A number which an
+ * administrator attaches is not a verification proof; the server only accepts
+ * a number whose owner completed Firebase's own SMS challenge.
  */
 async function prepareLiveOwner() {
   const profile = await adminFs('GET', `/users/${uid}`);
@@ -276,8 +286,15 @@ async function cleanup() {
     `/rooms/${uid}-rulecheck-initial`,
     `/roomPrivate/${uid}-rulecheck-initial`,
     `/roomDeletionTombstones/${uid}-rulecheck-initial`,
+    `/rooms/${uid}-rulecheck-nostatus`,
+    `/roomPrivate/${uid}-rulecheck-nostatus`,
+    `/rooms/${uid}-rulecheck-nolocation`,
+    `/roomPrivate/${uid}-rulecheck-nolocation`,
+    `/roomDeletionTombstones/${uid}-rulecheck-nolocation`,
     `/rooms/${uid}-rulecheck-status`,
     `/rooms/${uid}-rulecheck-occupied`,
+    `/rooms/${uid}-rulecheck-published`,
+    `/roomPrivate/${uid}-rulecheck-published`,
     `/joinRequests/${uid}-rulecheck`,
     `/users/${uid}`,
   ]) {
@@ -315,6 +332,7 @@ async function cleanup() {
 }
 
 async function main() {
+  assertAppCheckConfigured();
   console.log(`--- creating a throw-away account (${EMAIL}) ---`);
   const signUp = await auth('/accounts:signUp', {
     email: EMAIL,
@@ -333,6 +351,19 @@ async function main() {
   console.log('\n--- preparing a live owner profile (server-side channel) ---');
   adminToken = firebaseCliToken();
   await prepareLiveOwner();
+  // The phone challenge is completed with the real Firebase endpoint, the
+  // server records the proof itself and publishes the signed claims. The
+  // refreshed token therefore carries `stayServeVerifiedPhone`.
+  const liveIdentity = await prepareVerifiedPhoneIdentity({
+    projectId: PROJ,
+    apiKey: KEY,
+    functionsBase: FUNCTIONS,
+    uid,
+    email: EMAIL,
+    password: PASSWORD,
+    phoneNumber: PHONE,
+  });
+  token = liveIdentity.idToken;
   await seedNotification();
   console.log('  the throw-away account is now a live, registered owner');
 
@@ -523,9 +554,14 @@ async function main() {
   check('a user may NOT delete their own profile directly', denied(deleteProfile), `HTTP ${deleteProfile.status}`);
 
   const roomId = `${uid}-rulecheck`;
-  const createRoom = await fs('PATCH', `/rooms/${roomId}`, {
+  // A listing which the client tries to create **without** the server-owned
+  // draft state. The create is refused, so this document never exists. It
+  // is a separate id because every later check needs a listing which really
+  // exists.
+  const roomWithoutDraftState = `${uid}-rulecheck-nostatus`;
+  const createRoom = await fs('PATCH', `/rooms/${roomWithoutDraftState}`, {
     fields: {
-      roomId: { stringValue: roomId },
+      roomId: { stringValue: roomWithoutDraftState },
       title: { stringValue: 'Rule Check Room' },
       ownerId: { stringValue: uid },
       monthlyRent: { doubleValue: 10000 },
@@ -540,11 +576,34 @@ async function main() {
       },
     },
   });
-  check('an owner may create their own room (without the server-owned fields)',
-    createRoom.status === 200, `HTTP ${createRoom.status}`);
-  const createRoomWithInitialState = await fs('PATCH', `/rooms/${roomId}-initial`, {
+  check('an owner may NOT create a room without the server-owned draft state',
+    denied(createRoom), `HTTP ${createRoom.status}`);
+
+  // The listing the rest of the checks work with. It is created as a draft.
+  const createRoomWithInitialState = await fs('PATCH', `/rooms/${roomId}`, {
     fields: {
-      roomId: { stringValue: `${roomId}-initial` },
+      roomId: { stringValue: roomId },
+      title: { stringValue: 'Rule Check Room' },
+      ownerId: { stringValue: uid },
+      monthlyRent: { doubleValue: 10000 },
+      occupancy: { integerValue: '2' },
+      status: { stringValue: 'draft' },
+      currentOccupancy: { integerValue: '0' },
+      location: {
+        mapValue: {
+          fields: {
+            city: { stringValue: 'Bengaluru' },
+            state: { stringValue: 'Karnataka' },
+          },
+        },
+      },
+    },
+  });
+  check('an owner may create a room as a draft',
+    createRoomWithInitialState.status === 200, `HTTP ${createRoomWithInitialState.status}`);
+  const createPublishedRoom = await fs('PATCH', `/rooms/${roomId}-published`, {
+    fields: {
+      roomId: { stringValue: `${roomId}-published` },
       title: { stringValue: 'Rule Check Room' },
       ownerId: { stringValue: uid },
       monthlyRent: { doubleValue: 10000 },
@@ -561,8 +620,8 @@ async function main() {
       },
     },
   });
-  check('an owner may send the initial server-owned state on create',
-    createRoomWithInitialState.status === 200, `HTTP ${createRoomWithInitialState.status}`);
+  check('an owner may NOT publish a listing by itself',
+    denied(createPublishedRoom), `HTTP ${createPublishedRoom.status}`);
   const privateLocation = await callable('setRoomPrivateLocation', {
     roomId,
     address: '42 Rules Check Lane',
@@ -575,19 +634,44 @@ async function main() {
   check('the owner may store the exact location privately',
     privateLocation.status === 200 && privateLocation.json?.result?.success === true,
     `HTTP ${privateLocation.status}`);
-  const privateLocationForInitial = await callable('setRoomPrivateLocation', {
-    roomId: `${roomId}-initial`,
-    address: '42 Rules Check Lane',
-    city: 'Bengaluru',
-    state: 'Karnataka',
-    pincode: '560001',
-    latitude: 12.9716,
-    longitude: 77.5946,
+  const publishDraft = await callable('publishRoomListing', { roomId });
+  check('the server publishes a finished draft',
+    publishDraft.status === 200 && publishDraft.json?.result?.success === true,
+    `HTTP ${publishDraft.status}`);
+
+  // A **second** draft is used for the missing-location check. The listing
+  // really exists, so the refusal is caused by the missing exact location
+  // and not by a document which was never created.
+  const roomWithoutLocation = `${uid}-rulecheck-nolocation`;
+  const createRoomWithoutLocation = await fs('PATCH', `/rooms/${roomWithoutLocation}`, {
+    fields: {
+      roomId: { stringValue: roomWithoutLocation },
+      title: { stringValue: 'Rule Check Room' },
+      ownerId: { stringValue: uid },
+      monthlyRent: { doubleValue: 10000 },
+      occupancy: { integerValue: '2' },
+      status: { stringValue: 'draft' },
+      currentOccupancy: { integerValue: '0' },
+      location: {
+        mapValue: {
+          fields: {
+            city: { stringValue: 'Bengaluru' },
+            state: { stringValue: 'Karnataka' },
+          },
+        },
+      },
+    },
   });
-  check('every created listing has a private location counterpart',
-    privateLocationForInitial.status === 200 &&
-      privateLocationForInitial.json?.result?.success === true,
-    `HTTP ${privateLocationForInitial.status}`);
+  check('a second draft listing was created for the missing-location check',
+    createRoomWithoutLocation.status === 200, `HTTP ${createRoomWithoutLocation.status}`);
+  const publishDraftWithoutLocation = await callable('publishRoomListing', {
+    roomId: roomWithoutLocation,
+  });
+  check('the server refuses to publish a draft without its exact location',
+    publishDraftWithoutLocation.status >= 400 &&
+      publishDraftWithoutLocation.json?.error?.status ===
+        'FAILED_PRECONDITION',
+    `HTTP ${publishDraftWithoutLocation.status}`);
   const createRoomWithStatus = await fs('PATCH', `/rooms/${roomId}-status`, {
     fields: {
       roomId: { stringValue: `${roomId}-status` },
@@ -683,8 +767,11 @@ async function main() {
   for (const path of [
     `/rooms/${roomId}`,
     `/rooms/${roomId}-initial`,
+    `/rooms/${roomId}-published`,
     `/rooms/${roomId}-status`,
     `/rooms/${roomId}-occupied`,
+    `/rooms/${roomWithoutDraftState}`,
+    `/rooms/${roomWithoutLocation}`,
   ]) {
     const removed = await adminFs('DELETE', path);
     console.log(`  removed ${path} (server channel) -> HTTP ${removed.status}`);

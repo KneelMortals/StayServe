@@ -367,7 +367,7 @@ membership. The corresponding work happens in a Cloud Function that checks the
 | Collection / field | Client may | Server owns |
 |---|---|---|
 | `users/{uid}` | read own profile, write `name`, `phone`, `profileImage`, `fcmToken`, `savedRooms`, `pincode`, `updatedAt` | `role`, `isActive`, `registrationCompleted`, the whole document **delete** |
-| `rooms/{roomId}` | create a listing (with the **initial** `status: available` / `currentOccupancy: 0`, or with both fields left out), edit the listing fields | any other `status` / `currentOccupancy` value, the document **delete** |
+| `rooms/{roomId}` | create a listing as a **draft** (`status: draft`, `currentOccupancy: 0`), edit the listing fields | the publication of the listing (`status: available`), every other `status` / `currentOccupancy` value, the document **delete** |
 | `joinRequests/{id}` | read own/own-room requests | **everything** — create, update and delete |
 | `payments/{id}` | read own/own-room payments | **everything** — write |
 | `commissionInvoices/{id}` | live admin may set `status` + bookkeeping | create, delete, amount, rent, parties |
@@ -378,7 +378,8 @@ The callables that replace those client writes:
 
 | Callable | Who may call it | What it does |
 |---|---|---|
-| `setRoomListingAvailability` | live owner of the listing | changes `rooms.status` only |
+| `publishRoomListing` | live owner of the listing | publishes a finished draft (`status: available`); refuses a draft whose private location is missing or whose photos are not committed |
+| `setRoomListingAvailability` | live owner of the listing | changes `rooms.status` only (never publishes a draft) |
 | `adminSetRoomListingStatus` | live admin | changes `rooms.status` of any listing |
 | `deleteRoomListing` | live owner (own listing) or live admin | cancels the open requests, keeps their history, removes the listing; refuses an active booking or a pending payment |
 | `deleteNotification` | the owner of the notification | removes one notification |
@@ -389,6 +390,32 @@ Every one of them re-reads the profile of the caller, so a demoted or banned
 administrator loses the access immediately — a stale custom claim is never
 enough.
 
+### 5.1.0 A listing is published only when it is complete
+
+A new listing is created as a **draft**:
+
+1. the client writes the room document with `status: draft` — the rules
+   accept **only** that value on a create, so a client can neither publish a
+   listing by itself nor pretend that it already has tenants;
+2. the client stages and commits the room photos through the server-mediated
+   callables;
+3. the client stores the exact address through `setRoomPrivateLocation`;
+4. the client calls `publishRoomListing`. The server verifies that the
+   listing belongs to the caller, that the private exact location exists and
+   that no staged photo is still uncommitted. Only then does it set
+   `status: available`.
+
+A draft is invisible to the student search (which only offers `available`
+listings) and it cannot be booked, because the booking state machine
+requires the same status. A listing whose photo upload or whose address
+failed therefore never reaches a student — it is removed by the client
+through the server-owned `deleteRoomListing` path.
+
+A **live administrator** can still change the status of any listing through
+`adminSetRoomListingStatus`. That is a deliberate, audited override of the
+completeness check; use it only for a listing whose photos and private
+location were checked by hand.
+
 ### 5.1.1 The listing fields a student searches by
 
 The student search compares the listing status with an **equality**
@@ -398,14 +425,20 @@ invisible to every student — even though it is a valid listing.
 
 Three things keep that from happening:
 
-1. the create payload states the initial values (`status: available`,
-   `currentOccupancy: 0`); the rules accept **only** those two values, so a
-   client can neither publish a listing as occupied nor pretend that it
-   already has tenants;
-2. the `onRoomCreated` trigger gives a listing the same defaults when a
-   client left them out (an older app version);
+1. the create payload states `status: draft` and `currentOccupancy: 0`; the
+   rules accept **only** that draft state on a create, so a client can never
+   publish a listing by itself and can never pretend that it already has
+   tenants;
+2. the `onRoomCreated` trigger gives a listing the `available` default when a
+   client left the status out (an older app version) and assigns the
+   immutable listing generation;
 3. the app filters the status **in Dart**, so a listing whose status is
-   missing is still offered (a missing status means "available").
+   missing is still offered (a missing status means "available"), while an
+   unknown status — a `draft` — is treated as *not* on the market.
+
+A listing is published by the `publishRoomListing` callable, which sets
+`status: available` once the listing is complete (see
+[5.1.0](#510-a-listing-is-published-only-when-it-is-complete)).
 
 Listings that were written before this rule existed are repaired with:
 
@@ -569,21 +602,40 @@ cd ~/Desktop/StayServe
 node tools/production_core_flow_smoke.mjs
 ```
 
-It creates one disposable live owner, one disposable live student, one room
-photo, one public/private listing, one booking request, one verified
-conversation and one message. It then exercises owner create/edit, the private
-location callable, student-only booking, owner approval, student confirmation,
-the accepted-student visit details, messaging, listing deletion and both
-account-deletion triggers. The script deletes the listing through
-`deleteRoomListing`, deletes both Auth accounts, removes the completed
-account-deletion job tombstones and verifies that no disposable profile,
-request, lock, conversation, notification, private location, cleanup job or
-Storage object remains.
+It creates one disposable live owner, one disposable live student, one
+server-mediated room photo, one public/private listing, one booking request,
+one verified conversation and one message. The disposable accounts complete the
+**real** Firebase phone challenge (`PhoneAuthProvider`): the server records
+the proof itself and publishes the signed `stayServeVerifiedPhone` claim
+which the Firestore and Storage rules evaluate. An Admin-provisioned phone
+number is **not** a proof and is never accepted. The listing is created as a
+draft and published by the `publishRoomListing` callable, which verifies that
+the private exact location exists and that every staged photo was committed.
+Room photos are created through
+`stageRoomPhoto` and `commitRoomPhotoChanges`; the client never writes a
+Storage object or publishes an image URL.
 
-> **Current status:** the script reports **25 passed, 0 failed** against
-> `myfirstapp-fa30f52b`. It needs `firebase login` and deliberately writes
-> disposable production data while it runs; every artifact is removed before
-> the command exits.
+The script then exercises owner create/edit, the private-location callable,
+student-only booking, owner approval, student confirmation, the accepted-student
+visit details, messaging, listing deletion and both account-deletion triggers.
+It deletes the listing through `deleteRoomListing`, deletes both Auth accounts,
+removes the completed account-deletion job tombstones and verifies that no
+disposable profile, request, lock, conversation, notification, private location,
+room-media operation, quota, cleanup job or Storage object remains.
+
+The command needs `firebase login` and deliberately writes disposable
+production data while it runs; every artifact is removed before the command
+exits. It was not run as part of the source-only security review. If callable
+App Check enforcement has been enabled, export a valid token before running it:
+
+```bash
+export STAYSERVE_APP_CHECK_TOKEN="..."
+export STAYSERVE_REQUIRE_APP_CHECK=1
+node tools/production_core_flow_smoke.mjs
+```
+
+The `STAYSERVE_REQUIRE_APP_CHECK=1` setting makes every live callable probe
+fail before it creates test data when the token is missing.
 
 ### 5.5 Storage rules
 
@@ -597,20 +649,20 @@ The rules read the **live** Firestore profile of the caller — a custom claim
 alone is not enough, because a demoted admin keeps the old claim until the
 token expires:
 
-* `rooms/{ownerId}/{roomId}/{fileName}` may be read by every live, registered
-  account and written only by the live owner of that folder (non-empty image
-  objects up to 5 MiB);
-* `admin/{fileName}` may be written by a live administrator;
-* every other client write is denied. In particular, an administrator cannot
-  overwrite or delete an owner's room image through the Storage API.
+* `rooms/{ownerId}/{roomId}/{fileName}` may be read by every live,
+  registered account, but **all client writes are denied**. The
+  server-mediated room-photo callables validate the live owner, listing,
+  image bytes, quota, trusted bucket and exact owner/room path before the
+  Admin SDK writes the object;
+* `admin/{fileName}` may be read and written only by a live administrator;
+* every other client read and write is denied. An unknown Storage path is not
+  a compatibility escape hatch, and an administrator cannot overwrite or
+  delete an owner's room image through the Storage API.
 
-A room-photo write reads exactly two distinct Firestore documents: the
-caller's live profile and the durable `roomDeletionTombstones/{roomId}`
-reservation. Firebase permits at most two distinct Firestore documents in one
-Storage Rules evaluation, so the rule must not also read the public room
-document. The listing-deletion transaction commits the tombstone together
-with the room's `deletionInProgress` marker; the tombstone therefore closes
-the upload path both during deletion and after the room document is gone.
+The Flutter app does not link the Firebase Storage client SDK. Room-photo
+bytes travel to the callable layer and Storage writes use the Admin SDK, so
+there is no dormant client upload API which could bypass the server-owned
+room-photo protocol.
 
 The rules are **fail-closed**: a profile without `registrationCompleted: true`
 or with `isActive: false` has no access at all. Backfill the legacy profiles
@@ -643,6 +695,46 @@ The apply command uses the bucket metageneration as a precondition, so it
 fails instead of overwriting a concurrent bucket-metadata update. It changes
 only CORS metadata; it does not modify Storage rules, room images, or Firestore
 data.
+
+### 5.7 Room-photo access policy
+
+Room photos are **public media by design**. A prospective tenant has to be
+able to see the picture of a room before the booking is accepted, so the
+photo itself is not a secret. The access policy is therefore explicit about
+what is protected and what is not:
+
+| Asset | Visibility | Mechanism |
+| --- | --- | --- |
+| Room photo | Public to a holder of the URL | Per-object download token, minted by the server |
+| Exact address | Owner and the accepted student only | Server-owned `roomPrivate/{roomId}` + `getRoomVisitDetails` |
+| Coarse locality (city/state, rounded `geoCell`) | Public in `rooms/{roomId}` | Part of the public listing |
+
+The rules which implement the policy:
+
+* every room photo is written by the Admin SDK inside
+  `stageRoomPhoto` / `commitRoomPhotoChanges`. A client write below
+  `rooms/{ownerId}/{roomId}/…` is denied by the Storage rules, so an object
+  path can never be forged or overwritten by a modified client;
+* the download URL contains a **per-object, high-entropy token**
+  (`roomPhotoDownloadToken`). It is not derived from the room id, the owner
+  id or the file name, so the URL cannot be reconstructed from the listing
+  and the objects cannot be enumerated;
+* the server only accepts a URL which points at the trusted bucket, at the
+  exact owner/room path and which carries the token of the staged operation.
+  A URL which was injected into the listing by a client is rejected;
+* deleting a photo removes the Storage object (the durable cleanup of an
+  unreferenced or replaced photo). The download URL of a deleted object stops
+  working, so the access is revoked together with the object;
+* the exact address never travels with the photo. It lives in the
+  server-owned private collection and is handed out only to an accepted
+  student, which is covered by
+  [`docs/PRIVATE_LOCATION_MIGRATION.md`](docs/PRIVATE_LOCATION_MIGRATION.md).
+
+Consequence for operators: a room-photo URL is a bearer URL and must be
+treated like any other public media URL. It is **not** a capability which
+grants access to the address, to the booking data or to any account. If a
+listing must not be visible at all, remove the listing — do not rely on the
+photo URL being secret.
 
 ---
 

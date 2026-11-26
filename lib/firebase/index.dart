@@ -1,7 +1,6 @@
 export 'firebase_config.dart';
 export 'auth/auth_service.dart';
 export 'firestore/firestore_service.dart';
-export 'storage/storage_service.dart';
 export 'functions/functions_service.dart';
 export 'messaging/messaging_service.dart';
 export 'admin/admin_repository.dart';

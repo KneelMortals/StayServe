@@ -65,9 +65,12 @@ class _AdminMessageDialogState extends ConsumerState<AdminMessageDialog> {
           .sendAdminMessage(
             userId: widget.recipient.uid,
             content: content,
-            requestId: _requestTracker.requestIdFor(content),
+            requestId: _requestTracker.requestIdFor(
+              content,
+              scope: widget.recipient.uid,
+            ),
           );
-      _requestTracker.markSucceeded(content);
+      _requestTracker.markSucceeded(content, scope: widget.recipient.uid);
       if (!mounted) return;
       Navigator.of(context).pop(result);
     } catch (error) {

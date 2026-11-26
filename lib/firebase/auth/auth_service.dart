@@ -281,6 +281,11 @@ class AuthRepository {
   /// latest session claims. The server then re-reads the live Firebase Auth
   /// record; it is the only writer of `phone`, `phoneVerified`,
   /// `emailVerified` and `authProviders`.
+  ///
+  /// The server also publishes the signed proof that this account completed
+  /// Firebase's phone challenge. The token is refreshed once more afterwards
+  /// so that the direct Firestore and Storage rules can evaluate that proof
+  /// right away.
   Future<Map<String, dynamic>> syncAuthProfile() async {
     final user = _auth.currentUser;
     if (user == null) {
@@ -290,6 +295,7 @@ class AuthRepository {
     }
     await user.getIdToken(true);
     final result = await _functions.callFunction('syncAuthProfile');
+    await user.getIdToken(true);
     return Map<String, dynamic>.from(result.data as Map);
   }
 

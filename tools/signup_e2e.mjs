@@ -17,6 +17,8 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 
+import { appCheckHeaders, assertAppCheckConfigured } from './app_check.mjs';
+
 const PROJECT = 'myfirstapp-fa30f52b';
 const FN = `https://us-central1-${PROJECT}.cloudfunctions.net`;
 const LOGGING = 'https://logging.googleapis.com/v2/entries:list';
@@ -106,6 +108,7 @@ async function waitForLogCode(identifier, since, label) {
 }
 
 async function main() {
+  assertAppCheckConfigured();
   let mailAccount = null;
   let mailAuth = null;
   let idToken = null;
@@ -154,7 +157,7 @@ async function main() {
     console.log('\n--- 3. email OTP ---');
     const emailSend = await json(`${FN}/sendOtp`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: appCheckHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ data: { channel: 'email', identifier: realAddress } }),
     });
     console.log('   sendOtp:', JSON.stringify(emailSend.body));
@@ -179,7 +182,7 @@ async function main() {
 
     const emailVerify = await json(`${FN}/verifyOtp`, {
       method: 'POST',
-      headers: { ...authHeader, 'Content-Type': 'application/json' },
+      headers: appCheckHeaders({ ...authHeader, 'Content-Type': 'application/json' }),
       body: JSON.stringify({ data: { channel: 'email', identifier: realAddress, otp: emailCode } }),
     });
     console.log('   verifyOtp:', JSON.stringify(emailVerify.body));
@@ -197,7 +200,7 @@ async function main() {
     const mobileSince = new Date(Date.now() - 5000).toISOString();
     const mobileSend = await json(`${FN}/sendOtp`, {
       method: 'POST',
-      headers: { ...authHeader, 'Content-Type': 'application/json' },
+      headers: appCheckHeaders({ ...authHeader, 'Content-Type': 'application/json' }),
       body: JSON.stringify({ data: { channel: 'mobile', identifier: phone } }),
     });
     console.log('   sendOtp:', JSON.stringify(mobileSend.body));
@@ -214,7 +217,7 @@ async function main() {
 
       const mobileVerify = await json(`${FN}/verifyOtp`, {
         method: 'POST',
-        headers: { ...authHeader, 'Content-Type': 'application/json' },
+        headers: appCheckHeaders({ ...authHeader, 'Content-Type': 'application/json' }),
         body: JSON.stringify({ data: { channel: 'mobile', identifier: normalised, otp: mobileCode } }),
       });
       console.log('   verifyOtp:', JSON.stringify(mobileVerify.body));
@@ -228,7 +231,7 @@ async function main() {
     console.log('\n--- 5. completeRegistration ---');
     const complete = await json(`${FN}/completeRegistration`, {
       method: 'POST',
-      headers: { ...authHeader, 'Content-Type': 'application/json' },
+      headers: appCheckHeaders({ ...authHeader, 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         data: {
           name: 'Test Student',
@@ -247,7 +250,7 @@ async function main() {
     // same challenge has to be refused.
     const replay = await json(`${FN}/completeRegistration`, {
       method: 'POST',
-      headers: { ...authHeader, 'Content-Type': 'application/json' },
+      headers: appCheckHeaders({ ...authHeader, 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         data: {
           name: 'Test Student',

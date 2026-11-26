@@ -2,6 +2,12 @@ import * as firestore from 'firebase-admin/firestore';
 import * as auth from 'firebase-admin/auth';
 import * as functions from 'firebase-functions/v1';
 
+import {
+  readPhoneVerificationProof,
+  verifiedPhoneForUser,
+  VERIFIED_PHONE_CLAIM,
+} from './verifiedPhone';
+
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
@@ -133,34 +139,64 @@ export interface RoleClaimPublicationOptions {
  * writers could therefore publish their claims in the wrong order. The
  * revision is checked after every Auth write; a stale writer notices the
  * newer revision and republishes the current role before it returns.
+ *
+ * The publication also carries the signed verified-phone fact. The claim
+ * stores the number itself, so it stops matching the live Auth phone as soon
+ * as the number is unlinked or replaced. Publishing it together with the role
+ * keeps the two server-owned facts from drifting apart, and the same
+ * stability check makes a concurrent phone proof win instead of being lost.
  */
 export async function publishLatestRoleClaims(
   uid: string,
   options: RoleClaimPublicationOptions = {},
-): Promise<{ role: string; revision: number }> {
+): Promise<{ role: string; revision: number; verifiedPhone: string }> {
   const userRef = db.collection('users').doc(uid);
+
+  /** The signed verified-phone fact of the live account, if there is one. */
+  const readVerifiedPhone = async (): Promise<string> => {
+    try {
+      const liveUser = await authClient.getUser(uid);
+      const proofPhone = await readPhoneVerificationProof(uid);
+      return verifiedPhoneForUser(liveUser, proofPhone);
+    } catch (error) {
+      // A missing Auth record or an unreadable proof simply means that no
+      // verified phone may be published. The role claim is still published.
+      console.error(
+        `Could not read the verified-phone state of ${uid}:`,
+        error,
+      );
+      return '';
+    }
+  };
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const before = await userRef.get();
     if (!before.exists) {
       await clearPublishedRoleClaimJob(uid, '', 0);
-      return { role: '', revision: 0 };
+      return { role: '', revision: 0, verifiedPhone: '' };
     }
 
     const role = String(before.get('role') || '').trim();
     const revision = roleRevisionOf(before);
-    await authClient.setCustomUserClaims(uid, {
+    const verifiedPhone = await readVerifiedPhone();
+    const claims: Record<string, unknown> = {
       admin: role === 'admin',
       role,
       roleRevision: revision,
-    });
+    };
+    if (verifiedPhone) {
+      claims[VERIFIED_PHONE_CLAIM] = verifiedPhone;
+    }
+    await authClient.setCustomUserClaims(uid, claims);
 
     const after = await userRef.get();
+    const verifiedPhoneAfter = await readVerifiedPhone();
     if (
       after.exists &&
       roleRevisionOf(after) === revision &&
-      String(after.get('role') || '').trim() === role
+      String(after.get('role') || '').trim() === role &&
+      verifiedPhoneAfter === verifiedPhone
     ) {
       // A demotion must not leave an already-issued administrator token
       // usable. New tokens receive the new claims; old refresh sessions are
@@ -170,7 +206,7 @@ export async function publishLatestRoleClaims(
         await authClient.revokeRefreshTokens(uid);
       }
       await clearPublishedRoleClaimJob(uid, role, revision);
-      return { role, revision };
+      return { role, revision, verifiedPhone };
     }
   }
 }

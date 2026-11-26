@@ -31,25 +31,46 @@ function jwt(claims) {
 
 const OPAQUE_ADMIN_IDENTITY = 'adminIdentities/support/profile';
 
+/**
+ * A tenant token with the signed verified-phone proof.
+ *
+ * The rules require the server-issued `stayServeVerifiedPhone` claim to
+ * match the live `phone_number` claim. A token which only carries a phone
+ * number is not enough: the Admin SDK can attach a number without the SMS
+ * challenge ever being completed.
+ */
+function tenantToken(uid, role, phoneNumber) {
+  return jwt({
+    sub: uid,
+    user_id: uid,
+    role,
+    phone_number: phoneNumber,
+    stayServeVerifiedPhone: phoneNumber,
+  });
+}
+
 const TOKENS = {
-  student: jwt({ sub: 'student1', user_id: 'student1', role: 'student', phone_number: '+919876500001' }),
-  student2: jwt({ sub: 'student2', user_id: 'student2', role: 'student', phone_number: '+919876500002' }),
-  bootstrap: jwt({ sub: 'student-bootstrap', user_id: 'student-bootstrap', role: 'student', phone_number: '+919876500003' }),
-  bootstrapMissingMarker: jwt({ sub: 'student-bootstrap-missing', user_id: 'student-bootstrap-missing', role: 'student', phone_number: '+919876500004' }),
-  bootstrapOldProfile: jwt({ sub: 'student-bootstrap-old', user_id: 'student-bootstrap-old', role: 'student', phone_number: '+919876500005' }),
-  bootstrapInactive: jwt({ sub: 'student-bootstrap-inactive', user_id: 'student-bootstrap-inactive', role: 'student', phone_number: '+919876500006' }),
-  bootstrapRoleClaimed: jwt({ sub: 'student-bootstrap-role-claimed', user_id: 'student-bootstrap-role-claimed', role: 'student', phone_number: '+919876500007' }),
-  owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner', phone_number: '+919876500008' }),
+  student: tenantToken('student1', 'student', '+919876500001'),
+  student2: tenantToken('student2', 'student', '+919876500002'),
+  bootstrap: tenantToken('student-bootstrap', 'student', '+919876500003'),
+  bootstrapMissingMarker: tenantToken('student-bootstrap-missing', 'student', '+919876500004'),
+  bootstrapOldProfile: tenantToken('student-bootstrap-old', 'student', '+919876500005'),
+  bootstrapInactive: tenantToken('student-bootstrap-inactive', 'student', '+919876500006'),
+  bootstrapRoleClaimed: tenantToken('student-bootstrap-role-claimed', 'student', '+919876500007'),
+  owner: tenantToken('owner1', 'owner', '+919876500008'),
   admin: jwt({ sub: 'admin1', user_id: 'admin1', role: 'admin', admin: true }),
   // A stale/forged admin claim without a live admin profile must not work.
   fakeAdmin: jwt({ sub: 'fakeAdmin1', user_id: 'fakeAdmin1', role: 'student', admin: true }),
-  stranger: jwt({ sub: 'someoneelse', user_id: 'someoneelse', role: 'student', phone_number: '+919876500009' }),
-  pending: jwt({ sub: 'pending1', user_id: 'pending1', role: 'student', phone_number: '+919876500010' }),
-  inactive: jwt({ sub: 'inactive1', user_id: 'inactive1', role: 'student', phone_number: '+919876500011' }),
+  stranger: tenantToken('someoneelse', 'student', '+919876500009'),
+  pending: tenantToken('pending1', 'student', '+919876500010'),
+  inactive: tenantToken('inactive1', 'student', '+919876500011'),
   unverifiedPhone: jwt({ sub: 'unverifiedPhone1', user_id: 'unverifiedPhone1', role: 'student' }),
   studentWithoutPhoneToken: jwt({ sub: 'student-without-phone-token', user_id: 'student-without-phone-token', role: 'student' }),
   studentWithEmptyPhoneToken: jwt({ sub: 'student-with-empty-phone-token', user_id: 'student-with-empty-phone-token', role: 'student', phone_number: '' }),
-  legacy: jwt({ sub: 'legacy1', user_id: 'legacy1', role: 'student', phone_number: '+919876500012' }),
+  // A number which an administrator attached with the Admin SDK carries the
+  // phone attribute but no server-issued proof.
+  adminProvisionedPhone: jwt({ sub: 'admin-provisioned', user_id: 'admin-provisioned', role: 'student', phone_number: '+919876500013' }),
+  legacy: tenantToken('legacy1', 'student', '+919876500012'),
 };
 
 async function call(token, method, requestPath, body) {
@@ -564,7 +585,10 @@ async function seed() {
       createdByServer: bool(true),
       createdAt: timestamp(),
       updatedAt: timestamp(),
-      unreadCount: map({ student1: integer(0) }),
+      unreadCount: map({
+        [opaqueAdminIdentity]: integer(1),
+        student1: integer(1),
+      }),
     },
   });
   await call(
@@ -894,6 +918,30 @@ async function main() {
     await call(TOKENS.studentWithEmptyPhoneToken, 'GET', '/rooms/room1'),
     false,
   );
+  // The Admin SDK can attach a phone number to an account without the SMS
+  // challenge. The live record then carries the number, but the server never
+  // issued the signed proof, so the tenant gate stays closed.
+  await seedUser('admin-provisioned');
+  check(
+    'an administrator-provisioned phone cannot use protected room reads',
+    await call(TOKENS.adminProvisionedPhone, 'GET', '/rooms/room1'),
+    false,
+  );
+  check(
+    'an administrator-provisioned phone cannot create a listing',
+    await create(TOKENS.adminProvisionedPhone, 'rooms', 'room-admin-provisioned', {
+      roomId: string('room-admin-provisioned'),
+      ownerId: string('admin-provisioned'),
+      title: string('Admin provisioned room'),
+      monthlyRent: integer(12000),
+      securityDeposit: integer(6000),
+      occupancy: integer(2),
+      genderPreference: string('any'),
+      images: array([]),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
   check(
     'an administrator without a verified phone can still use protected room reads',
     await call(TOKENS.admin, 'GET', '/rooms/room1'),
@@ -1118,10 +1166,75 @@ async function main() {
     true,
   );
   check(
+    'a live student can still list the rooms collection',
+    await call(TOKENS.student, 'GET', '/rooms'),
+    true,
+  );
+  check(
     'a signed-in stranger cannot edit another owner room',
     await update(TOKENS.stranger, 'rooms', 'room1', {
       title: string('Hijacked room'),
     }),
+    false,
+  );
+
+  // ------------------------------------------------------------------
+  // An unpublished draft is private to its owner and to a live admin.
+  // A direct single-document read of somebody else's draft is refused;
+  // the collection query stays open because the student search pages
+  // through the collection without a status filter.
+  // ------------------------------------------------------------------
+  check(
+    'the live owner can create a draft listing for the draft-visibility checks',
+    await create(TOKENS.owner, 'rooms', 'owner-draft-room', {
+      roomId: string('owner-draft-room'),
+      ownerId: string('owner1'),
+      status: string('draft'),
+      title: string('Unfinished listing'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    true,
+  );
+  check(
+    'the owner can read their own draft listing',
+    await call(TOKENS.owner, 'GET', '/rooms/owner-draft-room'),
+    true,
+  );
+  check(
+    'a live student cannot read a foreign draft listing',
+    await call(TOKENS.student, 'GET', '/rooms/owner-draft-room'),
+    false,
+  );
+  check(
+    'a signed-in stranger cannot read a foreign draft listing',
+    await call(TOKENS.stranger, 'GET', '/rooms/owner-draft-room'),
+    false,
+  );
+  check(
+    'an anonymous caller cannot read a draft listing',
+    await callAnon('GET', '/rooms/owner-draft-room'),
+    false,
+  );
+  check(
+    'a live admin can read a draft listing',
+    await call(TOKENS.admin, 'GET', '/rooms/owner-draft-room'),
+    true,
+  );
+  check(
+    'a forged admin claim without a live admin profile cannot read a draft listing',
+    await call(TOKENS.fakeAdmin, 'GET', '/rooms/owner-draft-room'),
+    false,
+  );
+  check(
+    'a pending registration cannot read a draft listing',
+    await call(TOKENS.pending, 'GET', '/rooms/owner-draft-room'),
+    false,
+  );
+  check(
+    'a tenant without a verified phone cannot read a draft listing',
+    await call(TOKENS.unverifiedPhone, 'GET', '/rooms/owner-draft-room'),
     false,
   );
   check(
@@ -1129,6 +1242,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room', {
       roomId: string('owner-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('New room'),
       monthlyRent: double(10000),
       occupancy: integer(2),
@@ -1137,24 +1251,51 @@ async function main() {
     true,
   );
   check(
-    'live owner can create a room with the initial server-owned state',
+    'live owner can create a room as a draft',
     await create(TOKENS.owner, 'rooms', 'owner-room-with-state', {
       roomId: string('owner-room-with-state'),
       ownerId: string('owner1'),
       title: string('New room with state'),
       monthlyRent: double(10000),
       occupancy: integer(2),
-      status: string('available'),
+      status: string('draft'),
       currentOccupancy: integer(0),
       createdAt: timestamp(),
     }),
     true,
   );
   check(
+    'live owner cannot create a room which publishes itself',
+    await create(TOKENS.owner, 'rooms', 'owner-room-published', {
+      roomId: string('owner-room-published'),
+      ownerId: string('owner1'),
+      title: string('Room which publishes itself'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      status: string('available'),
+      currentOccupancy: integer(0),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'live owner cannot create a room without a status',
+    await create(TOKENS.owner, 'rooms', 'owner-room-without-status', {
+      roomId: string('owner-room-without-status'),
+      ownerId: string('owner1'),
+      title: string('Room without a status'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
     'live owner cannot create a room with a forged photo-cleanup lock',
     await create(TOKENS.owner, 'rooms', 'owner-room-forged-cleanup-lock', {
       roomId: string('owner-room-forged-cleanup-lock'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Forged cleanup lock room'),
       monthlyRent: double(10000),
       occupancy: integer(2),
@@ -1171,6 +1312,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-forged-generation', {
       roomId: string('owner-room-forged-generation'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Forged generation room'),
       monthlyRent: double(10000),
       occupancy: integer(2),
@@ -1191,6 +1333,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'room-reserved', {
       roomId: string('room-reserved'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Reused reserved room id'),
       monthlyRent: double(10000),
       occupancy: integer(2),
@@ -1214,6 +1357,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'room-reserved', {
       roomId: string('room-reserved'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Reused room after cleanup'),
       monthlyRent: double(10000),
       occupancy: integer(2),
@@ -1227,6 +1371,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-coarse-location', {
       roomId: string('owner-room-coarse-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Coarse location room'),
       monthlyRent: double(10000),
       location: map({
@@ -1243,6 +1388,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-string-location', {
       roomId: string('owner-room-string-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('String location room'),
       location: string('42 Exact Street, Bengaluru 560001'),
       occupancy: integer(2),
@@ -1255,6 +1401,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-number-location', {
       roomId: string('owner-room-number-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Numeric location room'),
       location: double(12.9716),
       occupancy: integer(2),
@@ -1267,6 +1414,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-null-location', {
       roomId: string('owner-room-null-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Null location room'),
       location: { nullValue: null },
       occupancy: integer(2),
@@ -1279,6 +1427,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-exact-location', {
       roomId: string('owner-room-exact-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Exact location room'),
       location: map({
         address: string('12 Exact Street'),
@@ -1303,6 +1452,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-legacy-location', {
       roomId: string('owner-room-legacy-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Legacy exact location room'),
       monthlyRent: double(10000),
       location: map({
@@ -1321,6 +1471,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-legacy-string-location', {
       roomId: string('owner-room-legacy-string-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Legacy string location room'),
       location: string('42 Exact Street, Bengaluru 560001'),
       occupancy: integer(2),
@@ -1341,6 +1492,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-latched-location', {
       roomId: string('owner-room-latched-location'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Latched exact location room'),
       location: map({
         address: string('12 Exact Street'),
@@ -1363,6 +1515,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'owner-room-exact-location-2', {
       roomId: string('owner-room-exact-location-2'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Rejected exact location room'),
       location: map({
         address: string('12 Exact Street'),
@@ -1376,10 +1529,26 @@ async function main() {
     false,
   );
   check(
+    'live owner cannot create a room with a client-supplied image URL',
+    await create(TOKENS.owner, 'rooms', 'owner-room-client-image', {
+      roomId: string('owner-room-client-image'),
+      ownerId: string('owner1'),
+      status: string('draft'),
+      title: string('Room with a client image'),
+      occupancy: integer(2),
+      images: array([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Fowner-room-client-image%2Froom.jpg?alt=media&token=abc',
+      ]),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
     'live owner cannot create a room with a malformed image list',
     await create(TOKENS.owner, 'rooms', 'owner-room-invalid-images', {
       roomId: string('owner-room-invalid-images'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('New room with invalid images'),
       occupancy: integer(2),
       images: mixedArray([
@@ -1395,6 +1564,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'room-with-occupancy', {
       roomId: string('room-with-occupancy'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Client occupancy'),
       occupancy: integer(2),
       currentOccupancy: integer(1),
@@ -1431,6 +1601,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'zero-capacity-room', {
       roomId: string('zero-capacity-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('No capacity'),
       occupancy: integer(0),
       createdAt: timestamp(),
@@ -1442,6 +1613,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'missing-rent-room', {
       roomId: string('missing-rent-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Missing rent'),
       occupancy: integer(2),
       createdAt: timestamp(),
@@ -1453,6 +1625,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'low-rent-room', {
       roomId: string('low-rent-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Low rent'),
       monthlyRent: double(999),
       occupancy: integer(2),
@@ -1465,6 +1638,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'string-rent-room', {
       roomId: string('string-rent-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('String rent'),
       monthlyRent: string('5000'),
       occupancy: integer(2),
@@ -1477,6 +1651,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'fractional-capacity-room', {
       roomId: string('fractional-capacity-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Fractional capacity'),
       monthlyRent: double(5000),
       occupancy: double(1.5),
@@ -1489,6 +1664,7 @@ async function main() {
     await create(TOKENS.owner, 'rooms', 'oversized-capacity-room', {
       roomId: string('oversized-capacity-room'),
       ownerId: string('owner1'),
+      status: string('draft'),
       title: string('Oversized capacity'),
       monthlyRent: double(5000),
       occupancy: integer(21),
@@ -1551,9 +1727,6 @@ async function main() {
       monthlyRent: double(12000),
       securityDeposit: double(6000),
       amenities: array(['Wi-Fi', 'Power backup']),
-      images: array([
-        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom.jpg?alt=media&token=abc',
-      ]),
       occupancy: integer(3),
       homeName: string('Updated home'),
       updatedAt: timestamp(),
@@ -1578,20 +1751,46 @@ async function main() {
     false,
   );
   check(
-    'owner can publish a list of room image URLs',
+    'owner cannot publish room image URLs directly (the server commit owns them)',
     await update(TOKENS.owner, 'rooms', 'room1', {
       images: array([
         'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom-1.jpg?alt=media&token=one',
         'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom-2.jpg?alt=media&token=two',
-        'https://storage.googleapis.com/demo.appspot.com/rooms/owner1/room1/room-3.jpg',
       ]),
     }),
-    true,
+    false,
   );
   check(
     'owner cannot publish an image URL from an unrelated host',
     await update(TOKENS.owner, 'rooms', 'room1', {
       images: array(['https://tracker.example/room.jpg']),
+    }),
+    false,
+  );
+  check(
+    'owner cannot publish an attacker-project bucket URL',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: array([
+        'https://firebasestorage.googleapis.com/v0/b/attacker-project.appspot.com/o/rooms%2Fowner1%2Froom1%2Froom.jpg?alt=media&token=abc',
+      ]),
+    }),
+    false,
+  );
+  check(
+    'owner cannot publish a trusted-bucket URL for another owner path',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: array([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner2%2Froom1%2Froom.jpg?alt=media&token=abc',
+      ]),
+    }),
+    false,
+  );
+  check(
+    'owner cannot publish a trusted-bucket URL for another room path',
+    await update(TOKENS.owner, 'rooms', 'room1', {
+      images: array([
+        'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/rooms%2Fowner1%2Froom2%2Froom.jpg?alt=media&token=abc',
+      ]),
     }),
     false,
   );
@@ -1973,7 +2172,7 @@ async function main() {
     false,
   );
   check(
-    'a support target can reply to the opaque administrator identity',
+    'a support target cannot reply to the opaque administrator identity directly',
     await create(
       TOKENS.student,
       'conversations/conv-admin-opaque/messages',
@@ -1988,8 +2187,23 @@ async function main() {
         createdAt: timestamp(),
       },
     ),
-    true,
+    false,
   );
+  // The trusted `sendAdminSupportReply` callable writes the reply with the
+  // Admin SDK, which bypasses the rules. The emulator's owner token is
+  // equivalent to that write.
+  await call('owner', 'PATCH', '/conversations/conv-admin-opaque/messages/msg-opaque-support-reply', {
+    fields: {
+      messageId: string('msg-opaque-support-reply'),
+      conversationId: string('conv-admin-opaque'),
+      senderId: string('student1'),
+      receiverId: string(OPAQUE_ADMIN_IDENTITY),
+      content: string('Student support reply'),
+      type: string('text'),
+      senderType: string('user'),
+      createdAt: timestamp(),
+    },
+  });
   check(
     'the mapped administrator can read a tenant support reply',
     await call(
@@ -2059,7 +2273,7 @@ async function main() {
     false,
   );
   check(
-    'an owner support target can reply directly with the ordinary message schema',
+    'an owner support target cannot reply directly with the ordinary message schema',
     await create(TOKENS.owner, 'conversations/conv-admin-opaque-owner/messages', 'msg-support-owner-reply', {
       messageId: string('msg-support-owner-reply'),
       conversationId: string('conv-admin-opaque-owner'),
@@ -2069,16 +2283,69 @@ async function main() {
       type: string('text'),
       createdAt: timestamp(),
     }),
-    true,
+    false,
   );
   check(
-    'a support target can update the support conversation bookkeeping',
+    'a support target cannot update the support conversation bookkeeping',
     await update(TOKENS.student, 'conversations', 'conv-admin-opaque', {
       lastMessage: string('Student support reply'),
       lastMessageAt: timestamp(),
       updatedAt: timestamp(),
     }),
-    true,
+    false,
+  );
+  check(
+    'the mapped administrator cannot clear the support unread counter directly',
+    await update(TOKENS.admin, 'conversations', 'conv-admin-opaque', {
+      unreadCount: map({
+        [OPAQUE_ADMIN_IDENTITY]: integer(0),
+        student1: integer(0),
+      }),
+    }),
+    false,
+  );
+  check(
+    'a support target cannot clear the opaque administrator unread counter',
+    await update(TOKENS.student, 'conversations', 'conv-admin-opaque', {
+      unreadCount: map({
+        [OPAQUE_ADMIN_IDENTITY]: integer(0),
+        student1: integer(0),
+      }),
+    }),
+    false,
+  );
+  check(
+    'a support target cannot increment the opaque administrator unread counter',
+    await update(TOKENS.student, 'conversations', 'conv-admin-opaque', {
+      unreadCount: map({
+        [OPAQUE_ADMIN_IDENTITY]: integer(2),
+        student1: integer(1),
+      }),
+    }),
+    false,
+  );
+  check(
+    'a support target cannot clear only its own unread counter',
+    await update(TOKENS.student, 'conversations', 'conv-admin-opaque', {
+      unreadCount: map({
+        [OPAQUE_ADMIN_IDENTITY]: integer(2),
+        student1: integer(0),
+      }),
+    }),
+    false,
+  );
+  check(
+    'a support target cannot forge the support conversation preview',
+    await update(TOKENS.student, 'conversations', 'conv-admin-opaque', {
+      lastMessage: string('Forged preview'),
+      lastMessageAt: timestamp(),
+      updatedAt: timestamp(),
+      unreadCount: map({
+        [OPAQUE_ADMIN_IDENTITY]: integer(9),
+        student1: integer(0),
+      }),
+    }),
+    false,
   );
   check(
     'a participant cannot send a message while the conversation is being deleted',

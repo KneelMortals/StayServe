@@ -7,27 +7,33 @@ rules_version = '2';
 //
 //     match /{allPaths=**} { allow read, write: if false; }
 //
-// which denies **every** upload — that is why the owner could not attach a
-// photo to a listing ("auth issue while uploading pics as owner"). The rules
-// below open the storage up again, but only for live, registered accounts
-// with the matching role.
+// which denied every client upload. Room-photo uploads are now mediated by
+// server callables, so client writes are denied again. The rules below grant
+// only the narrow reads and administrator namespace access which are still
+// required.
 //
-// The Firestore profile is the source of truth for the role. A custom claim
-// alone is not enough: it stays in an already-issued ID token until that
-// token expires, so a demoted admin could otherwise keep writing files.
+// The Firestore profile is the source of truth for account activity and role.
+// A custom claim alone is not enough: it stays in an already-issued ID token
+// until that token expires, so a demoted admin could otherwise keep accessing
+// administrator files.
 // ---------------------------------------------------------------------------
 service firebase.storage {
   match /b/{bucket}/o {
 
-    // Firebase exposes `phone_number` in the ID token only while a verified
-    // phone provider is attached to the account. The signed token fact is the
-    // Storage gate: the Firestore `phoneVerified` value is only a cache and
-    // must never grant access by itself. Using the token here also keeps a
-    // legitimate legacy tenant usable while the server backfills that cache.
+    // The signed `stayServeVerifiedPhone` claim is the server's proof that
+    // the account completed Firebase's phone challenge for one exact number.
+    // The claim stores the number itself, so it stops matching the token as
+    // soon as the live Auth phone is unlinked or replaced. A token which only
+    // carries `phone_number` is not enough: the Admin SDK can attach a
+    // number to an account without the SMS challenge ever being completed.
+    //
+    // The signed token fact is the Storage gate: the Firestore `phoneVerified`
+    // value is only a cache and must never grant access by itself.
     function hasVerifiedPhoneToken() {
       return request.auth != null &&
-        request.auth.token.get('phone_number', null) != null &&
-        request.auth.token.get('phone_number', '') != '';
+        request.auth.token.get('phone_number', '') != '' &&
+        request.auth.token.get('stayServeVerifiedPhone', '') ==
+        request.auth.token.get('phone_number', '');
     }
 
     // A live account has completed its registration and is active.
@@ -48,29 +54,11 @@ service firebase.storage {
         );
     }
 
-    function isLiveOwner() {
-      return isLiveRegisteredAccount() &&
-        firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
-          .data.get('role', '') == 'owner';
-    }
-
     function isLiveAdmin() {
       return isLiveRegisteredAccount() &&
         request.auth.token.get('admin', false) == true &&
         firestore.get(/databases/(default)/documents/users/$(request.auth.uid))
           .data.get('role', '') == 'admin';
-    }
-
-    // The deletion tombstone is committed in the same transaction as the
-    // room's `deletionInProgress` marker. It therefore covers both the
-    // deletion-in-progress state and the interval after the room document has
-    // been removed. Do not also read the room document here: Storage Rules
-    // permit at most two Firestore documents in one evaluation, and this
-    // write already needs the live profile plus the tombstone.
-    function roomPhotoWriteIsAllowed(roomId) {
-      let tombstone =
-        /databases/(default)/documents/roomDeletionTombstones/$(roomId);
-      return !firestore.exists(tombstone);
     }
 
     // -----------------------------------------------------------------------
@@ -80,27 +68,18 @@ service firebase.storage {
     //
     //     rooms/{ownerUid}/{roomId}/{fileName}
     //
-    // The uid of the owner is part of the path, so the rules can check it
-    // without trusting a field sent by the client. A signed-in owner may
-    // only write below their own folder, and can never upload into the
-    // folder of another owner.
+    // Client writes are denied in this namespace. The server-mediated room
+    // photo callable validates the live owner, the live listing, the image
+    // bytes, the trusted bucket and the exact owner/room path before the
+    // Admin SDK writes the object. It also records a durable upload
+    // operation, applies an owner quota and sweeps abandoned objects.
     //
     // Reading is open to live, registered accounts — the photos are shown to
     // the students inside the app.
     // -----------------------------------------------------------------------
     match /rooms/{ownerId}/{roomId}/{fileName} {
       allow read: if isLiveRegisteredAccount();
-      allow write: if isLiveOwner() &&
-        request.auth.uid == ownerId &&
-        roomPhotoWriteIsAllowed(roomId) &&
-        (
-          request.resource == null ||
-          (
-            request.resource.size > 0 &&
-            request.resource.size <= 5 * 1024 * 1024 &&
-            request.resource.contentType.matches('image/.*')
-          )
-        );
+      allow write: if false;
     }
 
     // -----------------------------------------------------------------------
@@ -114,20 +93,20 @@ service firebase.storage {
     // using the Admin SDK instead.
     // -----------------------------------------------------------------------
     match /admin/{fileName} {
-      allow read: if isLiveRegisteredAccount();
+      allow read: if isLiveAdmin();
       allow write: if isLiveAdmin();
     }
 
     // -----------------------------------------------------------------------
     // Everything else.
     //
-    // Reading remains open to live, registered accounts for compatibility
-    // with the existing profile/media paths. No client may write an object
-    // which has no explicit namespace rule above.
+    // There is no generic compatibility grant. A registered tenant may read
+    // the room-photo namespace above, but cannot enumerate or read private
+    // administrator files or an unrelated object under an unknown prefix.
+    // No client may write an object which has no explicit namespace rule.
     // -----------------------------------------------------------------------
     match /{allPaths=**} {
-      allow read: if isLiveRegisteredAccount();
-      allow write: if false;
+      allow read, write: if false;
     }
   }
 }

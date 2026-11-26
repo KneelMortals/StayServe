@@ -12,76 +12,93 @@ class ConversationsScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Messages')),
+      body: const ConversationsList(),
+    );
+  }
+}
+
+/// The list of the conversations of the current user.
+///
+/// It deliberately has **no scaffold of its own**: the admin area puts it
+/// into its own frame, so the drawer, the notification bell and the log out
+/// button are there on a phone as well. The plain conversation screen used
+/// to be routed into the admin area directly, which replaced the whole
+/// admin frame with a bare `Scaffold` — the administrator lost the
+/// navigation, the notifications and the log out button.
+class ConversationsList extends ConsumerWidget {
+  const ConversationsList({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
     final conversationsAsync = ref.watch(conversationsProvider);
     final currentUid = ref.watch(currentUserProvider)?.uid ?? '';
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Messages')),
-      body: conversationsAsync.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (error, _) => Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.error_outline,
-                size: 64,
-                color: Theme.of(context).colorScheme.error,
-              ),
-              const SizedBox(height: AppSpacing.md),
-              const Text('Could not load conversations'),
-              const SizedBox(height: AppSpacing.md),
-              TextButton(
-                onPressed: () => ref.invalidate(conversationsProvider),
-                child: const Text('Retry'),
-              ),
-            ],
-          ),
-        ),
-        data: (conversations) {
-          if (conversations.isEmpty) {
-            return const EmptyState(
-              icon: Icons.chat_bubble_outline,
-              title: 'No Conversations',
-              message: 'Messages with owners and students will show up here.',
-            );
-          }
-
-          return RefreshIndicator(
-            onRefresh: () async {
-              // The indicator has to wait for the **new** data —
-              // `invalidate` returns nothing, so the spinner
-              // disappeared while the list was still loading.
-              final _ = await ref.refresh(conversationsProvider.future);
-            },
-            child: ListView.builder(
-              padding: const EdgeInsets.all(AppSpacing.md),
-              itemCount: conversations.length,
-              itemBuilder: (context, index) {
-                final conversation = conversations[index];
-                final otherParticipant = conversation.getOtherParticipant(
-                  currentUid,
-                );
-                return _ConversationTile(
-                  conversation: conversation,
-                  peerId: otherParticipant,
-                  unread: conversation.getUnreadCount(currentUid) > 0,
-                  onTap: () => context.push(
-                    Uri(
-                      path: '/chat/${conversation.conversationId}',
-                      queryParameters: {
-                        'peer': otherParticipant,
-                        if (conversation.roomId?.isNotEmpty ?? false)
-                          'room': conversation.roomId!,
-                      },
-                    ).toString(),
-                  ),
-                );
-              },
+    return conversationsAsync.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (error, _) => Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.error_outline,
+              size: 64,
+              color: Theme.of(context).colorScheme.error,
             ),
-          );
-        },
+            const SizedBox(height: AppSpacing.md),
+            const Text('Could not load conversations'),
+            const SizedBox(height: AppSpacing.md),
+            TextButton(
+              onPressed: () => ref.invalidate(conversationsProvider),
+              child: const Text('Retry'),
+            ),
+          ],
+        ),
       ),
+      data: (conversations) {
+        if (conversations.isEmpty) {
+          return const EmptyState(
+            icon: Icons.chat_bubble_outline,
+            title: 'No Conversations',
+            message: 'Messages with owners and students will show up here.',
+          );
+        }
+
+        return RefreshIndicator(
+          onRefresh: () async {
+            // The indicator has to wait for the **new** data —
+            // `invalidate` returns nothing, so the spinner
+            // disappeared while the list was still loading.
+            final _ = await ref.refresh(conversationsProvider.future);
+          },
+          child: ListView.builder(
+            padding: const EdgeInsets.all(AppSpacing.md),
+            itemCount: conversations.length,
+            itemBuilder: (context, index) {
+              final conversation = conversations[index];
+              final otherParticipant = conversation.getPeerForViewer(
+                currentUid,
+              );
+              return _ConversationTile(
+                conversation: conversation,
+                peerId: otherParticipant,
+                unread: conversation.getUnreadCountForViewer(currentUid) > 0,
+                onTap: () => context.push(
+                  Uri(
+                    path: '/chat/${conversation.conversationId}',
+                    queryParameters: {
+                      'peer': otherParticipant,
+                      if (conversation.roomId?.isNotEmpty ?? false)
+                        'room': conversation.roomId!,
+                    },
+                  ).toString(),
+                ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 }

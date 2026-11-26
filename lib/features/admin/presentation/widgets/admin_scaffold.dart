@@ -89,6 +89,12 @@ const List<AdminDestination> kAdminDestinations = [
     icon: Icons.location_on_outlined,
     selectedIcon: Icons.location_on,
   ),
+  AdminDestination(
+    route: '/admin/messages',
+    label: 'Messages',
+    icon: Icons.chat_bubble_outline,
+    selectedIcon: Icons.chat_bubble,
+  ),
 ];
 
 /// The navigation of the admin area, split into groups.
@@ -103,7 +109,12 @@ final List<AdminNavGroup> kAdminNavGroups = [
   ),
   AdminNavGroup(
     title: 'People & listings',
-    destinations: [kAdminDestinations[1], kAdminDestinations[2], kAdminDestinations[3]],
+    destinations: [
+      kAdminDestinations[1],
+      kAdminDestinations[2],
+      kAdminDestinations[3],
+      kAdminDestinations[9],
+    ],
   ),
   AdminNavGroup(
     title: 'Money',
@@ -154,7 +165,7 @@ int adminDrawerIndex(String location) {
 
 /// The drawer of the admin area — the navigation on a phone.
 ///
-/// Nine destinations in a vertical rail squeezed the content of every screen
+/// Ten destinations in a vertical rail squeezed the content of every screen
 /// into a third of the width, which is what made the admin panel look
 /// broken. On a phone the navigation lives in a drawer instead, so the
 /// content gets the full width.
@@ -254,10 +265,7 @@ class _AdminDrawerHeader extends StatelessWidget {
               color: theme.colorScheme.primary,
               borderRadius: BorderRadius.circular(AppBorderRadius.md),
             ),
-            child: Icon(
-              Icons.home_work,
-              color: theme.colorScheme.onPrimary,
-            ),
+            child: Icon(Icons.home_work, color: theme.colorScheme.onPrimary),
           ),
           const SizedBox(width: AppSpacing.md),
           Expanded(
@@ -308,12 +316,12 @@ class _AdminDrawerProfile extends ConsumerWidget {
     final initials = name.trim().isEmpty
         ? '?'
         : name
-            .trim()
-            .split(RegExp(r'\s+'))
-            .where((part) => part.isNotEmpty)
-            .take(2)
-            .map((part) => part.substring(0, 1).toUpperCase())
-            .join();
+              .trim()
+              .split(RegExp(r'\s+'))
+              .where((part) => part.isNotEmpty)
+              .take(2)
+              .map((part) => part.substring(0, 1).toUpperCase())
+              .join();
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
@@ -432,9 +440,7 @@ class AdminScaffold extends ConsumerWidget {
       ),
       // On a wide screen the rail of the shell does the navigation — a
       // drawer on top of it would only be in the way.
-      drawer: isWide
-          ? null
-          : AdminNavigationDrawer(location: location),
+      drawer: isWide ? null : AdminNavigationDrawer(location: location),
       body: body,
       floatingActionButton: floatingActionButton,
     );

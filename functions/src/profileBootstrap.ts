@@ -5,6 +5,10 @@ import {
   legacyEmailProofMatches,
   LEGACY_EMAIL_PROOF_SOURCE,
 } from './authIdentity';
+import {
+  readPhoneVerificationProof,
+  verifiedPhoneForUser,
+} from './verifiedPhone';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
@@ -19,6 +23,7 @@ export interface AuthProfileBootstrapSource {
   email?: string | null;
   emailVerified?: boolean;
   phoneNumber?: string | null;
+  customClaims?: Record<string, unknown> | null;
   providerData?: Array<{ providerId?: string | null }>;
 }
 
@@ -129,6 +134,14 @@ export async function ensureUserProfile(
     .doc(accountDeletionJobId(user.uid));
   const authProviders = providerIds(user);
   const liveEmail = String(user.email || '').trim().toLowerCase();
+  // A non-empty Firebase phone number is not a verification proof: the Admin
+  // SDK can attach a number without the SMS challenge. The profile therefore
+  // starts out unverified unless the server already holds a proof for exactly
+  // this number.
+  const proofPhone = await readPhoneVerificationProof(user.uid);
+  const verifiedPhone = verifiedPhoneForUser(user, proofPhone);
+  const livePhone = String(user.phoneNumber || '').trim();
+  const phoneVerified = Boolean(verifiedPhone) && verifiedPhone === livePhone;
 
   return db.runTransaction(async (transaction) => {
     const [snapshot, rollbackSnapshot, deletionJobSnapshot] = await Promise.all([
@@ -152,7 +165,10 @@ export async function ensureUserProfile(
         email: liveEmail,
         emailVerified: liveEmail !== '' && user.emailVerified === true,
         phone: String(user.phoneNumber || '') || null,
-        phoneVerified: !!user.phoneNumber,
+        phoneVerified,
+        phoneVerifiedAt: phoneVerified
+          ? firestore.FieldValue.serverTimestamp()
+          : null,
         authProviders,
         role: 'student',
         roleClaimed: false,
@@ -192,7 +208,10 @@ export async function ensureUserProfile(
           : null,
         legacyEmailProofEmail: legacyProofMatches ? liveEmail : null,
         phone: String(user.phoneNumber || '') || null,
-        phoneVerified: !!user.phoneNumber,
+        phoneVerified,
+        phoneVerifiedAt: phoneVerified
+          ? firestore.FieldValue.serverTimestamp()
+          : null,
         authProviders,
         // A client-written admin role is never preserved. An owner role is
         // evidence of an earlier legitimate selection and is locked instead.

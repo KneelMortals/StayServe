@@ -80,17 +80,24 @@ service cloud.firestore {
             .data.get('legacyCutoff', null);
     }
 
-    // The Firebase Auth ID token carries `phone_number` only while a phone
-    // provider is attached to the account. Requiring that token fact prevents
-    // a stale Firestore `phoneVerified` cache from granting service access
-    // after the provider was unlinked and the device refreshed its session.
-    // A legacy marker-less profile may use the token fact while the explicit
-    // migration window is open; every current profile must also have the
-    // server-owned cache flag.
+    // The signed `stayServeVerifiedPhone` claim is the server's proof that
+    // the account completed Firebase's phone challenge for one exact number.
+    // The claim stores the number itself, so it stops matching the token as
+    // soon as the live Auth phone is unlinked or replaced. A token which only
+    // carries `phone_number` is not enough: the Admin SDK can attach a
+    // number to an account without the SMS challenge ever being completed.
+    //
+    // Requiring the signed fact also prevents a stale Firestore
+    // `phoneVerified` cache from granting service access after the provider
+    // was unlinked and the device refreshed its session. A legacy
+    // marker-less profile may use the token fact while the explicit migration
+    // window is open; every current profile must also have the server-owned
+    // cache flag.
     function hasVerifiedPhoneToken() {
       return request.auth != null &&
-        request.auth.token.get('phone_number', null) != null &&
-        request.auth.token.get('phone_number', '') != '';
+        request.auth.token.get('phone_number', '') != '' &&
+        request.auth.token.get('stayServeVerifiedPhone', '') ==
+        request.auth.token.get('phone_number', '');
     }
 
     // A live account is one whose registration has completed and which is
@@ -298,37 +305,32 @@ service cloud.firestore {
     // occupancy counter are not in this list.  The two server-owned state
     // fields are additionally compared below, so even a future list edit
     // cannot make them client-writable.
-    // The photo list is a list of strings with at most the same number of
-    // entries as the app allows. The explicit index checks are needed because
-    // Firestore Rules cannot iterate over a list to inspect every element.
-    // Every URL must also be an HTTPS Firebase Storage URL. This prevents a
-    // modified client from turning the room card into a tracker for an
-    // arbitrary third-party host. A legacy list which the owner does not
-    // change is allowed to remain as it is; every newly written list must
-    // have the valid shape.
-    function isRoomImageUrl(value) {
-      return value is string &&
-        value.size() > 0 &&
-        value.size() <= 2048 &&
-        value.matches(
-          'https://(firebasestorage\\.googleapis\\.com|storage\\.googleapis\\.com)/.*'
-        );
+    // The photo list is server-owned. The server stages the object in the
+    // trusted bucket, verifies that it belongs to this exact owner/room
+    // path, and commits the canonical download URL in one transaction. A
+    // client therefore cannot publish a URL from an attacker-controlled
+    // project or reuse a trusted-bucket object which belongs to another
+    // owner or room. Existing image lists remain readable and unchanged
+    // while older listings are migrated.
+    function roomCreateHasNoClientImages() {
+      let images = request.resource.data.get('images', []);
+      return images is list && images.size() == 0;
     }
 
-    function roomImagesAreValid() {
-      let images = request.resource.data.get('images', []);
-      return images is list &&
-        images.size() <= 10 &&
-        (images.size() < 1 || isRoomImageUrl(images[0])) &&
-        (images.size() < 2 || isRoomImageUrl(images[1])) &&
-        (images.size() < 3 || isRoomImageUrl(images[2])) &&
-        (images.size() < 4 || isRoomImageUrl(images[3])) &&
-        (images.size() < 5 || isRoomImageUrl(images[4])) &&
-        (images.size() < 6 || isRoomImageUrl(images[5])) &&
-        (images.size() < 7 || isRoomImageUrl(images[6])) &&
-        (images.size() < 8 || isRoomImageUrl(images[7])) &&
-        (images.size() < 9 || isRoomImageUrl(images[8])) &&
-        (images.size() < 10 || isRoomImageUrl(images[9]));
+    function roomImagesAreUnchanged() {
+      return request.resource.data.get('images', null) ==
+        resource.data.get('images', null);
+    }
+
+    // Whether an unpublished (draft) listing may be read by the caller.
+    //
+    // A draft belongs to its owner.  A live administrator may inspect it
+    // (for example after `adminSetRoomListingStatus` is used to publish a
+    // listing by hand).  Every other account is refused.
+    function roomDraftIsVisibleToCaller() {
+      return resource.data.get('status', '') != 'draft' ||
+        resource.data.get('ownerId', '') == request.auth.uid ||
+        isAdmin();
     }
 
     // ----------------------------------------------------------------------
@@ -493,11 +495,7 @@ service cloud.firestore {
         resource.data.get('deletionInProgress', false) != true &&
         changesOnlyAllowedRoomFields() &&
         publicLocationUpdateIsAllowed() &&
-        (
-          request.resource.data.get('images', null) ==
-            resource.data.get('images', null) ||
-          roomImagesAreValid()
-        ) &&
+        roomImagesAreUnchanged() &&
         request.resource.data.get('ownerId', '') ==
           resource.data.get('ownerId', '') &&
         request.resource.data.get('createdAt', null) ==
@@ -552,22 +550,36 @@ service cloud.firestore {
       // Listing and searching rooms is available to live, registered
       // accounts.  Public, pre-registration configuration lives in
       // publicSettings and is handled separately.
-      allow read: if isLiveRegisteredAccount();
+      //
+      // A **draft** is an unpublished listing.  It is readable by its owner
+      // and by a live administrator only, so a single-document read of
+      // somebody else's unfinished listing is refused.
+      allow get: if isLiveRegisteredAccount() &&
+        roomDraftIsVisibleToCaller();
+
+      // A collection query cannot be filtered by the rules, and the student
+      // search deliberately pages through the collection without a status
+      // filter (the status is applied in Dart, because a listing without the
+      // field is still a valid listing).  The list therefore stays open for
+      // live, registered accounts.  An unfinished listing is never
+      // bookable: the server-side booking check requires the `available`
+      // status, and the draft carries no exact address.
+      allow list: if isLiveRegisteredAccount();
 
       // A room is created by its live owner.  The owner id is the signed-in
       // owner and cannot be forged, and the advertised capacity must be a
       // positive number.
       //
       // `status` and `currentOccupancy` are **server-owned from the moment
-      // the listing exists**.  On the create the client may only state the
-      // *initial* values of a fresh listing — `available` and `0` — and it
-      // may leave them out completely (the `onRoomCreated` trigger then
-      // writes the same defaults).  It may never publish a listing as
-      // occupied or pretend that it already has tenants, and it may never
-      // change either field afterwards (see `ownerMayUpdateRoom`).
+      // the listing exists**.  A new listing is created as a `draft`: it is
+      // invisible to the student search and it cannot be booked while its
+      // photos and its private exact location are still missing.  The
+      // `publishRoomListing` callable flips it to `available` once the
+      // listing is complete, so a client can never publish a half-finished
+      // listing by itself.
       allow create: if isLiveOwner() &&
         roomIdHasNoDeletionTombstone(roomId) &&
-        roomImagesAreValid() &&
+        roomCreateHasNoClientImages() &&
         publicRoomCreateLocationIsAllowed(request.resource.data) &&
         roomCreateCannotForgeServerLocationFields() &&
         roomCreateCannotForgeListingGeneration() &&
@@ -575,7 +587,7 @@ service cloud.firestore {
         request.resource.data.get('ownerId', '') == request.auth.uid &&
         roomMonthlyRentIsValid(request.resource.data) &&
         roomCapacityIsValid(request.resource.data) &&
-        request.resource.data.get('status', 'available') == 'available' &&
+        request.resource.data.get('status', '') == 'draft' &&
         request.resource.data.get('currentOccupancy', 0) == 0 &&
         request.resource.data.get('roomId', roomId) == roomId;
 
@@ -879,6 +891,22 @@ service cloud.firestore {
         conversation.data.get('adminId', '') == 'adminIdentities/support/profile';
     }
 
+    // Whether this conversation is an administrator-support channel.
+    //
+    // A support channel is written by trusted callables only. The client
+    // route (`sendAdminSupportReply` and
+    // `markAdminSupportConversationRead`) validates the live support target,
+    // the durable administrator mapping and the live mapped administrator,
+    // and it writes the message, the preview and the unread counters in one
+    // transaction. A direct client write could otherwise forge a preview,
+    // move an unread counter without a message, or leave a reply in a channel
+    // whose administrator can no longer answer.
+    function isAdminSupportConversation(conversationId) {
+      return exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+        get(/databases/$(database)/documents/conversations/$(conversationId))
+          .data.get('conversationType', '') == 'adminSupport';
+    }
+
     function isAdminSupportPrivacyMigrationInProgress(conversationId) {
       let conversation = get(/databases/$(database)/documents/conversations/$(conversationId));
       return exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
@@ -927,9 +955,13 @@ service cloud.firestore {
       // admin identity or overwrite the server-owned names and room title.
       // Only the bookkeeping fields the Flutter client maintains (last
       // message, unread counts and timestamps) may change.
+      //
+      // An administrator-support channel is excluded: its bookkeeping is
+      // written by the trusted support callables.
       allow update: if isLiveRegisteredAccount() &&
         isOpaqueAdminSupportConversation(conversationId) &&
         !isAdminSupportPrivacyMigrationInProgress(conversationId) &&
+        !isAdminSupportConversation(conversationId) &&
         resource.data.get('deletionInProgress', false) != true &&
         request.auth.uid in resource.data.get('participantIds', []) &&
         resource.data.get('participantIds', []) ==
@@ -991,11 +1023,17 @@ service cloud.firestore {
       // A sender may create only a message for the other participant in the
       // containing conversation.  The payload's conversation id must match
       // the document path, and no fields outside the Flutter message model
-      // may be introduced. The student/owner support target can still use
-      // this ordinary client schema to reply.
+      // may be introduced.
+      //
+      // An administrator-support channel is excluded: the support reply is
+      // written by the trusted `sendAdminSupportReply` callable, which
+      // validates the live target, the durable administrator mapping and the
+      // live mapped administrator, and which keeps the message, the preview
+      // and the unread counters in one transaction.
       allow create: if isLiveRegisteredAccount() &&
         exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
         isOpaqueAdminSupportConversation(conversationId) &&
+        !isAdminSupportConversation(conversationId) &&
         !isAdminSupportAdmin() &&
         !isMappedAdminSupportAdmin(conversationId) &&
         !isAdminSupportPrivacyMigrationInProgress(conversationId) &&

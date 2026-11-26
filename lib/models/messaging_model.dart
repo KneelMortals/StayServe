@@ -2,6 +2,11 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import '../../core/constants/enums.dart';
 
+/// The public identity used by every administrator support conversation.
+///
+/// The real administrator uid stays in a server-only operation document.
+const String adminSupportIdentity = 'adminIdentities/support/profile';
+
 class ConversationModel {
   final String conversationId;
   final List<String> participants;
@@ -126,6 +131,34 @@ class ConversationModel {
   }
 
   int getUnreadCount(String userId) => unreadCount[userId] ?? 0;
+
+  /// The other participant as seen by the current viewer.
+  ///
+  /// A tenant sees the opaque administrator identity. The mapped
+  /// administrator is deliberately absent from `participants`, so that
+  /// administrator instead sees the student or owner who received the support
+  /// message.
+  String getPeerForViewer(String currentUserId) {
+    if (isAdminSupport && !participants.contains(currentUserId)) {
+      for (final participant in participants) {
+        if (participant != adminId) return participant;
+      }
+      return '';
+    }
+    return getOtherParticipant(currentUserId);
+  }
+
+  /// The unread counter which belongs to the current viewer.
+  ///
+  /// Support replies are addressed to the opaque administrator identity, so
+  /// the mapped administrator's counter is stored under that identity rather
+  /// than under the real Firebase uid.
+  int getUnreadCountForViewer(String currentUserId) {
+    final key = isAdminSupport && !participants.contains(currentUserId)
+        ? adminId
+        : currentUserId;
+    return key == null ? 0 : getUnreadCount(key);
+  }
 
   /// Whether this is a server-created administrator support conversation.
   ///
@@ -331,6 +364,20 @@ class MessageModel {
         adminVerified &&
         (verifiedAdminId?.isNotEmpty ?? false) &&
         senderId == verifiedAdminId;
+  }
+
+  /// Whether this message was sent by the current viewer.
+  ///
+  /// The administrator's own uid is intentionally absent from the public
+  /// support message. The complete server-owned marker identifies the opaque
+  /// administrator sender, while the recipient check keeps the same message
+  /// aligned as incoming for the student or owner who received it.
+  bool isOwnedByViewer(String currentUserId) {
+    if (currentUserId.isEmpty) return false;
+    if (senderId == currentUserId) return true;
+    return isVerifiedAdminMessage &&
+        senderId == adminSupportIdentity &&
+        receiverId != currentUserId;
   }
 
   @override

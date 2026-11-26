@@ -1,12 +1,18 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../../core/constants/enums.dart';
+import '../../../../../features/auth/presentation/providers/auth_provider.dart';
 import '../../../../../firebase/messaging/conversation_repository.dart';
 import '../../../../../models/interaction_model.dart';
 import '../../../../../models/messaging_model.dart';
 
 final conversationsProvider =
     StreamProvider.autoDispose<List<ConversationModel>>((ref) {
-      return ref.watch(conversationRepositoryProvider).watchConversations();
+      final includeAdminSupport =
+          ref.watch(currentUserRoleProvider) == UserRole.admin;
+      return ref
+          .watch(conversationRepositoryProvider)
+          .watchConversations(includeAdminSupport: includeAdminSupport);
     });
 
 final messagesProvider = StreamProvider.autoDispose

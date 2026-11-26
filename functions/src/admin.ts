@@ -27,6 +27,7 @@ import { isValidCurrentOccupancy } from './roomValidation';
 import {
   ADMIN_MESSAGE_NOTIFICATION_OPERATIONS,
   ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+  ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS,
   adminMessageNotificationId,
   adminSupportIdentityFor,
 } from './adminMessaging';
@@ -36,6 +37,8 @@ import {
   reviewNotificationId,
 } from './reviews';
 import { REGISTRATION_ROLLBACK_OPERATIONS } from './otp';
+import { ROOM_PHOTO_BUCKET } from './roomMedia';
+import { PHONE_VERIFICATION_PROOFS } from './verifiedPhone';
 
 const db = firestore.getFirestore();
 const auth = authSdk.getAuth();
@@ -306,6 +309,10 @@ async function deleteNotificationDependentsForMessage(
     .collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS)
     .where('messageId', '==', messageId)
     .get();
+  const supportReplyOperationSnapshot = await db
+    .collection(ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS)
+    .where('messageId', '==', messageId)
+    .get();
 
   const attributionRecords = [
     ...attributionSnapshot.docs,
@@ -313,7 +320,11 @@ async function deleteNotificationDependentsForMessage(
   ];
   const operationRecords = operationSnapshot.docs;
   const notificationIds = new Set<string>([deterministicNotificationId]);
-  for (const record of [...attributionRecords, ...operationRecords]) {
+  for (const record of [
+    ...attributionRecords,
+    ...operationRecords,
+    ...supportReplyOperationSnapshot.docs,
+  ]) {
     const notificationId = String(record.get('notificationId') || '').trim();
     if (notificationId) notificationIds.add(notificationId);
   }
@@ -332,6 +343,9 @@ async function deleteNotificationDependentsForMessage(
   for (const record of operationRecords) {
     serverOnlyRecords.set(record.ref.path, record.ref);
   }
+  for (const record of supportReplyOperationSnapshot.docs) {
+    serverOnlyRecords.set(record.ref.path, record.ref);
+  }
   serverOnlyRecords.set(
     db
       .collection(NOTIFICATION_ATTRIBUTIONS)
@@ -342,6 +356,12 @@ async function deleteNotificationDependentsForMessage(
   serverOnlyRecords.set(
     db.collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS).doc(messageId).path,
     db.collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS).doc(messageId),
+  );
+  serverOnlyRecords.set(
+    db
+      .collection(ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS)
+      .doc(messageId).path,
+    db.collection(ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS).doc(messageId),
   );
 
   await Promise.all(
@@ -372,9 +392,17 @@ async function deleteConversationNotificationDependents(
     .collection(ADMIN_MESSAGE_NOTIFICATION_OPERATIONS)
     .where('conversationId', '==', conversationId)
     .get();
+  const supportReplyOperationSnapshot = await db
+    .collection(ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS)
+    .where('conversationId', '==', conversationId)
+    .get();
 
   const notificationIds = new Set<string>();
-  for (const record of [...attributionSnapshot.docs, ...operationSnapshot.docs]) {
+  for (const record of [
+    ...attributionSnapshot.docs,
+    ...operationSnapshot.docs,
+    ...supportReplyOperationSnapshot.docs,
+  ]) {
     const notificationId = String(record.get('notificationId') || '').trim();
     if (notificationId) notificationIds.add(notificationId);
   }
@@ -385,6 +413,7 @@ async function deleteConversationNotificationDependents(
   await Promise.all([
     ...attributionSnapshot.docs.map((document) => document.ref.delete()),
     ...operationSnapshot.docs.map((document) => document.ref.delete()),
+    ...supportReplyOperationSnapshot.docs.map((document) => document.ref.delete()),
   ]);
 }
 
@@ -889,6 +918,15 @@ export async function deleteAttributedNotificationsForUser(
   await Promise.all(serverOnlyRecords.map((record) => record.delete()));
 }
 
+/** Deletes every room-photo object below one owner's trusted prefix. */
+async function deleteOwnerRoomPhotoObjects(uid: string): Promise<void> {
+  const bucket = storage.getStorage().bucket(ROOM_PHOTO_BUCKET);
+  const [files] = await bucket.getFiles({ prefix: `rooms/${uid}/` });
+  for (const file of files) {
+    await file.delete({ ignoreNotFound: true });
+  }
+}
+
 /**
  * Deletes everything that belongs to a user.
  *
@@ -1190,6 +1228,30 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // no longer have a valid destination profile.
   await db.collection('roleClaimJobs').doc(uid).delete();
 
+  // The durable support-reply delivery records name the deleted account on
+  // both sides of the support channel. They are server-only retry records,
+  // so they must not outlive the account. The recipient-visible notification
+  // is removed before its delivery record.
+  for (const field of ['recipientId', 'sourceAuthorUid', 'sourceRecipientUid']) {
+    const supportReplyOperations = await db
+      .collection(ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS)
+      .where(field, '==', uid)
+      .get();
+    for (const operation of supportReplyOperations.docs) {
+      const notificationId = String(operation.get('notificationId') || '').trim();
+      if (notificationId) {
+        await db.collection('notifications').doc(notificationId).delete();
+      }
+      await operation.ref.delete();
+    }
+  }
+
+  // The phone-verification proof holds the exact phone number of the deleted
+  // account. It is the durable source of the signed `stayServeVerifiedPhone`
+  // claim, so it has to go with the account: a deleted user must never keep
+  // a phone number in a server-only collection.
+  await db.collection(PHONE_VERIFICATION_PROOFS).doc(uid).delete();
+
   // Personal blocks are directional. Remove both the blocks this account
   // created and the blocks other accounts created against it, so a deleted
   // uid can never keep restricting somebody else's interaction.
@@ -1199,11 +1261,40 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // partial cleanup can safely be retried. Storage failures are propagated to
   // the durable deletion job instead of being reported as a completed
   // account deletion.
-  const bucket = storage.getStorage().bucket();
-  const [files] = await bucket.getFiles({ prefix: `rooms/${uid}/` });
-  for (const file of files) {
-    await file.delete({ ignoreNotFound: true });
-  }
+  await deleteOwnerRoomPhotoObjects(uid);
+
+  // The server-mediated room-photo protocol keeps its own durable records.
+  // They contain the deleted uid and must not survive the account. The
+  // Storage prefix above is deleted first; if that fails, the account-deletion
+  // job remains pending and these records still describe the unfinished work.
+  await deleteWhere(() =>
+    db
+      .collection('roomPhotoUploadOperations')
+      .where('ownerId', '==', uid)
+      .orderBy('__name__'),
+  );
+
+  // A stage request may have written its Storage object while the first
+  // prefix sweep was running. The upload-operation records are now gone, so
+  // sweep the exact owner prefix once more before this durable job can be
+  // completed. If this final sweep fails, the account-deletion job remains
+  // pending and retries the sweep; no operation record is discarded while its
+  // object has no remaining cleanup trigger.
+  await deleteOwnerRoomPhotoObjects(uid);
+
+  await db.collection('roomPhotoUploadQuotas').doc(uid).delete();
+  await deleteWhere(() =>
+    db
+      .collection('roomPhotoRoomQuotas')
+      .where('ownerId', '==', uid)
+      .orderBy('__name__'),
+  );
+  await deleteWhere(() =>
+    db
+      .collection('roomPhotoCommitOperations')
+      .where('ownerId', '==', uid)
+      .orderBy('__name__'),
+  );
 
   // The Auth account goes last — everything else is already gone.
   //

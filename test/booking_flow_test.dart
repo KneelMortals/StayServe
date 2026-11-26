@@ -65,11 +65,7 @@ class _FakeJoinRequestRepository extends StudentJoinRequestRepository {
   String? createError;
 
   @override
-  Future<JoinRequestModel> createJoinRequest({
-    required String roomId,
-    String? ownerId,
-    double? monthlyRent,
-  }) async {
+  Future<JoinRequestModel> createJoinRequest({required String roomId}) async {
     called = true;
     requestedRoomId = roomId;
 
@@ -81,11 +77,11 @@ class _FakeJoinRequestRepository extends StudentJoinRequestRepository {
       requestId: 'JRQ-test',
       roomId: roomId,
       studentId: 'student-1',
-      ownerId: ownerId ?? '',
+      ownerId: 'owner-1',
       status: JoinRequestStatus.pending,
       createdAt: now,
       updatedAt: now,
-      monthlyRentAtJoin: monthlyRent ?? 0,
+      monthlyRentAtJoin: 12000,
       commissionPercentageAtJoin: 30,
     );
   }
@@ -264,7 +260,16 @@ void main() {
     // produced the strange error "You have already requested to join this
     // room" from the server.
     expect(find.widgetWithText(AppButton, 'Request to Book'), findsNothing);
-    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsOneWidget);
+    final cancelButton = find.widgetWithText(AppButton, 'Cancel booking');
+    expect(cancelButton, findsOneWidget);
+
+    // The optimistic action uses only the authoritative server request id. It
+    // does not manufacture a local request model or a different fee/rent.
+    (tester.widget<AppButton>(cancelButton).onPressed)!();
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Cancel booking'));
+    await tester.pumpAndSettle();
+    expect(joinRequests.cancelledRequestId, 'JRQ-test');
   });
 
   testWidgets('cancelling the booking dialog does not send a request', (
@@ -433,6 +438,34 @@ void main() {
 
     expect(find.text('You joined this room'), findsNothing);
     expect(find.widgetWithText(AppButton, 'Cancel booking'), findsOneWidget);
+  });
+
+  testWidgets('an unconfirmed request never claims that a booking exists', (
+    tester,
+  ) async {
+    final joinRequests = _FakeJoinRequestRepository()
+      ..createError = 'Booking request could not be read from the server.';
+    final studentRepository = _FakeStudentRepository();
+    final user = MockUser(uid: 'student-1', email: 'student@example.com');
+
+    await _pumpRoom(
+      tester,
+      joinRequests: joinRequests,
+      studentRepository: studentRepository,
+      user: user,
+    );
+
+    final requestButton = find.widgetWithText(AppButton, 'Request to Book');
+    await tester.ensureVisible(requestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(requestButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Send Request'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Request failed'), findsOneWidget);
+    expect(find.widgetWithText(AppButton, 'Cancel booking'), findsNothing);
+    expect(joinRequests.cancelledRequestId, isNull);
   });
 
   testWidgets('a second request does not produce the error of the server', (

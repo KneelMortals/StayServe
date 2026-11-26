@@ -16,16 +16,18 @@ import 'package:stayserve/models/messaging_model.dart';
 import 'support/auth_identity_fakes.dart';
 
 MessageModel _message({
-  String senderId = 'admin-1',
+  String messageId = 'message-1',
+  String senderId = adminSupportIdentity,
+  String receiverId = 'student-1',
   String senderType = 'admin',
   bool adminVerified = true,
-  String? adminId = 'admin-1',
+  String? adminId = adminSupportIdentity,
 }) {
   return MessageModel.fromJson({
-    'messageId': 'message-1',
+    'messageId': messageId,
     'conversationId': 'conversation-1',
     'senderId': senderId,
-    'receiverId': 'student-1',
+    'receiverId': receiverId,
     'content': 'We will help with this.',
     'type': 'text',
     'createdAt': DateTime.utc(2026, 1, 1),
@@ -138,6 +140,42 @@ void main() {
       expect(second, isNot(first));
       expect(tracker.requestIdFor('First message'), isNot(first));
     });
+
+    test('scopes the request id by the recipient', () {
+      var nextId = 0;
+      final tracker = AdminMessageRequestTracker(() => 'request-${++nextId}');
+
+      final first = tracker.requestIdFor(
+        'Please review this room.',
+        scope: 'conversation-a',
+      );
+      final second = tracker.requestIdFor(
+        'Please review this room.',
+        scope: 'conversation-b',
+      );
+      expect(second, isNot(first));
+
+      // A successful send in one conversation must not release the pending
+      // key of the same text in another conversation.
+      tracker.markSucceeded(
+        'Please review this room.',
+        scope: 'conversation-a',
+      );
+      expect(
+        tracker.requestIdFor(
+          'Please review this room.',
+          scope: 'conversation-b',
+        ),
+        second,
+      );
+      expect(
+        tracker.requestIdFor(
+          'Please review this room.',
+          scope: 'conversation-a',
+        ),
+        isNot(first),
+      );
+    });
   });
 
   group('verified administrator message model', () {
@@ -150,6 +188,12 @@ void main() {
       expect(_message(senderId: 'student-1').isVerifiedAdminMessage, isFalse);
     });
 
+    test('uses the complete marker to align an opaque administrator reply', () {
+      expect(_message().isOwnedByViewer('admin-1'), isTrue);
+      expect(_message().isOwnedByViewer('student-1'), isFalse);
+      expect(_message(senderType: 'user').isOwnedByViewer('admin-1'), isFalse);
+    });
+
     test('does not serialize the administrator markers to a client write', () {
       final json = _message().toJson();
       expect(json.containsKey('senderType'), isFalse);
@@ -160,12 +204,12 @@ void main() {
     test('recognises a server-created administrator support conversation', () {
       final conversation = ConversationModel.fromJson({
         'conversationId': 'conversation-1',
-        'participants': ['admin-1', 'student-1'],
+        'participants': [adminSupportIdentity, 'student-1'],
         'lastMessage': 'We will help with this.',
         'lastMessageAt': DateTime.utc(2026, 1, 1),
-        'unreadCount': {'admin-1': 0, 'student-1': 1},
+        'unreadCount': {adminSupportIdentity: 2, 'student-1': 1},
         'conversationType': 'adminSupport',
-        'adminId': 'admin-1',
+        'adminId': adminSupportIdentity,
         'roomId': '',
         'roomTitle': 'StayServe Support',
         'createdAt': DateTime.utc(2026, 1, 1),
@@ -174,6 +218,10 @@ void main() {
 
       expect(conversation.isAdminSupport, isTrue);
       expect(conversation.getParticipantName('student-1'), isEmpty);
+      expect(conversation.getPeerForViewer('admin-1'), 'student-1');
+      expect(conversation.getPeerForViewer('student-1'), adminSupportIdentity);
+      expect(conversation.getUnreadCountForViewer('admin-1'), 2);
+      expect(conversation.getUnreadCountForViewer('student-1'), 1);
     });
 
     test('does not trust an administrator marker without that participant', () {
@@ -367,12 +415,12 @@ void main() {
 
       final conversation = ConversationModel(
         conversationId: 'conversation-1',
-        participants: const ['admin-1', 'student-1'],
+        participants: const [adminSupportIdentity, 'student-1'],
         lastMessage: 'We will help with this.',
         lastMessageAt: DateTime.utc(2026, 1, 1),
-        unreadCount: const {'admin-1': 0, 'student-1': 0},
+        unreadCount: const {adminSupportIdentity: 0, 'student-1': 0},
         conversationType: 'adminSupport',
-        adminId: 'admin-1',
+        adminId: adminSupportIdentity,
         roomTitle: 'StayServe Support',
         createdAt: DateTime.utc(2026, 1, 1),
         updatedAt: DateTime.utc(2026, 1, 1),
@@ -447,12 +495,12 @@ void main() {
 
       final conversation = ConversationModel(
         conversationId: 'conversation-1',
-        participants: const ['admin-1', 'student-1'],
+        participants: const [adminSupportIdentity, 'student-1'],
         lastMessage: 'We will help with this.',
         lastMessageAt: DateTime.utc(2026, 1, 1),
-        unreadCount: const {'admin-1': 0, 'student-1': 0},
+        unreadCount: const {adminSupportIdentity: 0, 'student-1': 0},
         conversationType: 'adminSupport',
-        adminId: 'admin-1',
+        adminId: adminSupportIdentity,
         roomTitle: 'StayServe Support',
         createdAt: DateTime.utc(2026, 1, 1),
         updatedAt: DateTime.utc(2026, 1, 1),
@@ -468,13 +516,40 @@ void main() {
               (ref) => Stream.value([conversation]),
             ),
             messagesProvider.overrideWith(
-              (ref, conversationId) => Stream.value([_message()]),
+              (ref, conversationId) => Stream.value([
+                _message(),
+                _message(
+                  messageId: 'tenant-message',
+                  senderId: 'student-1',
+                  receiverId: adminSupportIdentity,
+                  senderType: 'user',
+                  adminVerified: false,
+                  adminId: null,
+                ),
+              ]),
             ),
           ],
           child: MaterialApp.router(routerConfig: router),
         ),
       );
       await tester.pumpAndSettle();
+
+      final administratorBubble = tester.widget<Align>(
+        find.byKey(const ValueKey('message-bubble-message-1')),
+      );
+      expect(
+        administratorBubble.alignment,
+        Alignment.centerRight,
+        reason: 'the mapped administrator owns the opaque verified message',
+      );
+      final tenantBubble = tester.widget<Align>(
+        find.byKey(const ValueKey('message-bubble-tenant-message')),
+      );
+      expect(
+        tenantBubble.alignment,
+        Alignment.centerLeft,
+        reason: 'the tenant reply remains incoming for the administrator',
+      );
 
       expect(find.text('Admin'), findsOneWidget);
       expect(find.byIcon(Icons.verified), findsOneWidget);

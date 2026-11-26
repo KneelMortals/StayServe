@@ -168,12 +168,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         await repository.sendAdminMessage(
           userId: receiverId,
           content: text,
-          requestId: _adminRequestTracker.requestIdFor(text),
+          requestId: _adminRequestTracker.requestIdFor(text, scope: receiverId),
         );
         // The operation is now resolved. Releasing its key lets the admin
         // deliberately send the same text again while preserving the key of
         // a request whose response was lost.
-        _adminRequestTracker.markSucceeded(text);
+        _adminRequestTracker.markSucceeded(text, scope: receiverId);
       } else {
         await repository.sendMessage(
           conversationId: widget.conversationId,
@@ -460,7 +460,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   itemCount: messages.length,
                   itemBuilder: (context, index) {
                     final message = messages[index];
-                    final isMine = message.senderId == currentUid;
+                    final isMine = message.isOwnedByViewer(currentUid);
                     return _MessageBubble(message: message, isMine: isMine);
                   },
                 );
@@ -571,6 +571,7 @@ class _MessageBubble extends StatelessWidget {
     final theme = Theme.of(context);
 
     return Align(
+      key: ValueKey('message-bubble-${message.messageId}'),
       alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.only(bottom: AppSpacing.sm),

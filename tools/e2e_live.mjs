@@ -13,6 +13,9 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'node:child_process';
 
+import { appCheckHeaders, assertAppCheckConfigured } from './app_check.mjs';
+import { prepareVerifiedPhoneIdentity } from './live_test_identity.mjs';
+
 const KEY = 'AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM';
 const PROJ = 'myfirstapp-fa30f52b';
 const REGION = 'us-central1';
@@ -24,6 +27,9 @@ const STAMP = Date.now();
 const STUDENT_EMAIL = `e2e.student.${STAMP}@example.com`;
 const OWNER_EMAIL = `e2e.owner.${STAMP}@example.com`;
 const PASSWORD = 'TmpE2E!2026x';
+const OWNER_PHONE = String(
+  process.env.STAYSERVE_SMOKE_PHONE_OWNER || '+15555550103',
+).trim();
 
 let pass = 0;
 let fail = 0;
@@ -112,7 +118,12 @@ async function signUp(email) {
   if (res.status !== 200) {
     throw new Error(`signUp failed: ${JSON.stringify(res.json).slice(0, 300)}`);
   }
-  return { uid: res.json.localId, idToken: res.json.idToken };
+  return {
+    uid: res.json.localId,
+    email,
+    idToken: res.json.idToken,
+    refreshToken: res.json.refreshToken || '',
+  };
 }
 
 async function signIn(email) {
@@ -124,16 +135,21 @@ async function signIn(email) {
   if (res.status !== 200) {
     throw new Error(`signIn failed: ${JSON.stringify(res.json).slice(0, 300)}`);
   }
-  return { uid: res.json.localId, idToken: res.json.idToken };
+  return {
+    uid: res.json.localId,
+    email,
+    idToken: res.json.idToken,
+    refreshToken: res.json.refreshToken || '',
+  };
 }
 
 async function call(fnName, idToken, data) {
   const res = await fetch(`${FN}/${fnName}`, {
     method: 'POST',
-    headers: {
+    headers: appCheckHeaders({
       Authorization: `Bearer ${idToken}`,
       'Content-Type': 'application/json',
-    },
+    }),
     body: JSON.stringify({ data }),
   });
   const text = await res.text();
@@ -272,7 +288,32 @@ async function createRoom(id) {
   return write;
 }
 
+/**
+ * Prepares the server-owned role facts of a throw-away account.
+ *
+ * The phone facts are deliberately **not** written here. A number which an
+ * administrator attaches is not a verification proof; the server only accepts
+ * a number whose owner completed Firebase's own SMS challenge.
+ */
+async function prepareLiveProfile(account, role) {
+  const now = new Date().toISOString();
+  const fields = {
+    uid: { stringValue: account.uid },
+    email: { stringValue: account.email || '' },
+    name: { stringValue: `Temporary ${role} e2e account` },
+    role: { stringValue: role },
+    roleClaimed: { booleanValue: true },
+    isActive: { booleanValue: true },
+    registrationCompleted: { booleanValue: true },
+    createdAt: { timestampValue: now },
+    updatedAt: { timestampValue: now },
+    savedRooms: { arrayValue: { values: [] } },
+  };
+  return fsWrite(oauth, `users/${account.uid}`, fields);
+}
+
 async function main() {
+  assertAppCheckConfigured();
   oauth = firebaseToken();
 
   const feePayer = await readFeePayer();
@@ -283,6 +324,32 @@ async function main() {
   owner = await signUp(OWNER_EMAIL);
   check('the student account was created', !!student.uid, student.uid);
   check('the owner account was created', !!owner.uid, owner.uid);
+
+  const ownerProfileWrite = await prepareLiveProfile(owner, 'owner');
+  check(
+    'the owner profile was prepared',
+    ownerProfileWrite.status === 200,
+    `HTTP ${ownerProfileWrite.status}`,
+  );
+
+  // The phone challenge is completed with the real Firebase endpoint, the
+  // server records the proof itself and publishes the signed claims. The
+  // refreshed token therefore carries `stayServeVerifiedPhone`.
+  const liveOwner = await prepareVerifiedPhoneIdentity({
+    projectId: PROJ,
+    apiKey: KEY,
+    functionsBase: FN,
+    uid: owner.uid,
+    email: OWNER_EMAIL,
+    password: PASSWORD,
+    phoneNumber: OWNER_PHONE,
+  });
+  owner.idToken = liveOwner.idToken;
+  check(
+    'the owner has a phone-verified session',
+    liveOwner.idToken.length > 0,
+    owner.uid,
+  );
 
   // The student account is promoted to admin so that the admin-only
   // callables can be exercised. It is demoted again in the cleanup.
@@ -330,6 +397,12 @@ async function main() {
     'the student account is an admin now',
     adminClaim,
     `claims: ${JSON.stringify(lastClaims).slice(0, 200)}`,
+  );
+  const studentProfileWrite = await prepareLiveProfile(student, 'admin');
+  check(
+    'the administrator has a completed live profile',
+    studentProfileWrite.status === 200,
+    `HTTP ${studentProfileWrite.status}`,
   );
 
   section('the listing of the owner');

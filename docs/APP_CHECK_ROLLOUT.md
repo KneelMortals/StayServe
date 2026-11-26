@@ -8,7 +8,7 @@ request.
 ## Current behaviour
 
 - Android and iOS builds call `FirebaseAppCheck.instance.activate()` before
-  the first Firestore, Storage or callable request.
+  the first Firestore or callable request.
 - Debug builds use the App Check **debug** provider.
 - Release Android builds use **Play Integrity**.
 - Release iOS builds use **App Attest**, with DeviceCheck as a fallback.
@@ -21,6 +21,30 @@ request.
   usable during the rollout.
 - An App Check activation failure is logged but does not prevent the app from
   opening. The server switch is the final enforcement boundary.
+
+## Readiness blockers
+
+Do **not** set `APP_CHECK_ENFORCE=true` until all of these are resolved and
+proved with real builds:
+
+1. The Web client has no reCAPTCHA v3 site key in the checked-in build, so it
+   intentionally sends no App Check token. Because callable enforcement is
+   global, enabling it would also reject Web OTP and registration calls.
+2. The checked-in iOS project does not yet contain the App Attest/DeviceCheck
+   entitlement and Xcode capability. Add and validate them before testing an
+   iOS release token.
+3. Every Android debug, upload and Play App Signing SHA-256 fingerprint must
+   be registered. The checked-in OAuth SHA-1 is not evidence of App Check
+   readiness.
+4. The installed-client version distribution must be known. Use the existing
+   Remote Config `min_app_version` / `force_update` gate to retire a client
+   which cannot satisfy the new callable/storage contract.
+5. Every live callable probe must send a valid token. The checked-in probes
+   read `STAYSERVE_APP_CHECK_TOKEN`; set `STAYSERVE_REQUIRE_APP_CHECK=1` so
+   they fail before creating disposable production data when it is missing.
+6. A missing and invalid token must be observed to receive HTTP 401 from a
+   deployed callable. The local callable tests invoke handlers directly and do
+   not prove the HTTP-level App Check gate.
 
 ## 1. Register the apps
 
@@ -98,15 +122,23 @@ Callable enforcement and Firebase service enforcement are separate settings.
 After the updated mobile app has reached the required adoption level:
 
 1. enable App Check enforcement for Firestore in Firebase Console;
-2. enable App Check enforcement for Cloud Storage;
-3. test registration, login, listing reads, photo upload/download and every
-   callable from real Android and iOS builds;
-4. keep browser App Check disabled until the reCAPTCHA v3 provider and site
+2. test registration, login, listing reads, the server-mediated room-photo
+   callables and every other callable from real Android and iOS builds;
+3. keep browser App Check disabled until the reCAPTCHA v3 provider and site
    key are configured. Publishing the web client does not by itself enable
    App Check enforcement.
 
 Do not enable a Firebase service in enforcement mode while a supported client
 version can still call it without an App Check token.
+
+The current Flutter app does not link the Firebase Storage client SDK. Room
+photos are written by the Admin SDK from the server-mediated upload callable
+and rendered from a server-issued download-token URL with a normal HTTP image
+request. Cloud Storage service-level App Check therefore does not protect
+that display path, and it is not required for the current app's upload
+protocol. Before enabling it, inventory any remaining Storage SDK consumers
+and validate the download-token and URL policy separately rather than
+mistaking an App Check toggle for a complete room-photo access boundary.
 
 ## Web configuration
 

@@ -2,6 +2,11 @@ import * as functions from 'firebase-functions/v1';
 import * as firestore from 'firebase-admin/firestore';
 import * as authSdk from 'firebase-admin/auth';
 
+import {
+  liveVerifiedPhoneFor,
+  revokeStaleVerifiedPhone,
+} from './phoneVerification';
+
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
 import './firebase';
@@ -11,9 +16,17 @@ const db = firestore.getFirestore();
 /**
  * Confirms that Firebase still has a verified phone linked to the account.
  *
- * The Firestore profile is a server-owned cache of the Firebase Auth facts.
- * It is necessary for efficient rule evaluation, but it cannot by itself
- * detect a phone provider which a modified client unlinked without calling
+ * A non-empty Firebase `phoneNumber` is not enough: the Admin SDK can attach
+ * a number without the SMS challenge, and the live record does not say which
+ * of the two happened. The number is therefore only accepted when the server
+ * holds a proof that the owner completed Firebase's phone challenge for
+ * exactly this number. The proof is either the durable server-only document
+ * or the signed `stayServeVerifiedPhone` claim, and both are bound to the
+ * live number.
+ *
+ * The Firestore profile is a server-owned cache of that decision. It is
+ * necessary for efficient rule evaluation, but it cannot by itself detect a
+ * phone provider which a modified client unlinked without calling
  * `syncAuthProfile`. Firebase Auth has no provider-update trigger, so every
  * sensitive callable reads the live user record before it grants tenant
  * access. A failed lookup fails closed.
@@ -41,11 +54,13 @@ export async function assertLiveVerifiedPhone(uid: string): Promise<void> {
   }
 
   const phone = String(user.phoneNumber || '').trim();
-  if (!phone) {
+  const verifiedPhone = await liveVerifiedPhoneFor(user);
+  if (!verifiedPhone) {
     // Revoke a stale cached grant as soon as the live Auth lookup proves that
-    // the phone provider was unlinked. The write is best-effort because the
-    // authorization decision below already fails closed.
-    await cacheLivePhoneState(uid, null, false);
+    // the phone provider was unlinked or replaced. The write is best-effort
+    // because the authorization decision below already fails closed.
+    await cacheLivePhoneState(uid, phone || null, false);
+    await revokeStaleVerifiedPhone(uid, user);
     throw new functions.https.HttpsError(
       'permission-denied',
       'Verify your phone number before using StayServe.',
@@ -56,7 +71,7 @@ export async function assertLiveVerifiedPhone(uid: string): Promise<void> {
   // lets Firestore/Storage rules evaluate the service gate. Backfill it here
   // so a legitimate legacy profile which predates `phoneVerified` is not
   // locked out after its live phone has been confirmed.
-  await cacheLivePhoneState(uid, phone, true);
+  await cacheLivePhoneState(uid, verifiedPhone, true);
 }
 
 /**
@@ -332,6 +347,35 @@ export async function assertLiveAdmin(uid: string): Promise<void> {
 }
 
 /**
+ * Checks a Firestore owner-profile snapshot against the live owner policy.
+ *
+ * This pure snapshot check is used inside Firestore transactions as well as
+ * by [assertLiveOwner]. The transaction-time read closes the race where an
+ * owner is demoted or banned after the callable's first authorization check
+ * but before its write commits.
+ */
+export function assertLiveOwnerProfileSnapshot(
+  snapshot: firestore.DocumentSnapshot,
+  uid: string,
+): void {
+  const role = String(snapshot.get('role') || '')
+    .trim()
+    .toLowerCase();
+  if (
+    !uid ||
+    !snapshot.exists ||
+    snapshot.get('registrationCompleted') !== true ||
+    snapshot.get('isActive') !== true ||
+    role !== 'owner'
+  ) {
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'Owner access required',
+    );
+  }
+}
+
+/**
  * Checks the **live** owner role.
  *
  * An owner custom claim remains valid in an already-issued ID token until
@@ -358,21 +402,7 @@ export async function assertLiveOwner(uid: string): Promise<void> {
     );
   }
 
-  const role = String(snapshot.get('role') || '')
-    .trim()
-    .toLowerCase();
-  if (
-    !snapshot.exists ||
-    snapshot.get('registrationCompleted') !== true ||
-    snapshot.get('isActive') !== true ||
-    role !== 'owner'
-  ) {
-    throw new functions.https.HttpsError(
-      'permission-denied',
-      'Owner access required',
-    );
-  }
-
+  assertLiveOwnerProfileSnapshot(snapshot, uid);
   await assertLiveVerifiedPhone(uid);
 }
 

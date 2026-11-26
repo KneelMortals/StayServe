@@ -13,8 +13,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
-import 'package:firebase_storage/firebase_storage.dart';
-
 import 'package:stayserve/core/constants/enums.dart';
 import 'package:stayserve/firebase/admin/admin_repository.dart';
 import 'package:stayserve/firebase/auth/auth_service.dart';
@@ -27,7 +25,6 @@ import 'package:stayserve/firebase/payments/payment_repository.dart';
 import 'package:stayserve/firebase/reviews/review_repository.dart';
 import 'package:stayserve/firebase/student/student_join_request_repository.dart';
 import 'package:stayserve/firebase/student/student_repository.dart';
-import 'package:stayserve/firebase/storage/storage_service.dart';
 import 'package:stayserve/firebase/visits/visit_repository.dart';
 import 'package:stayserve/models/interaction_model.dart';
 import 'package:stayserve/models/join_request_model.dart';
@@ -58,12 +55,6 @@ class FakeFirebaseFunctions implements FirebaseFunctions {
       throw StateError('Cloud Functions are not available in the button audit');
 }
 
-class FakeFirebaseStorage implements FirebaseStorage {
-  @override
-  dynamic noSuchMethod(Invocation invocation) =>
-      throw StateError('Firebase Storage is not available in the button audit');
-}
-
 /// The result of a callable function.
 class FakeCallableResult implements HttpsCallableResult<dynamic> {
   @override
@@ -88,36 +79,6 @@ class FakeFunctionsService extends FunctionsService {
   }
 }
 
-/// A storage service that answers with a placeholder URL.
-class FakeStorageService extends StorageService {
-  FakeStorageService() : super(FakeFirebaseStorage());
-
-  @override
-  Future<String> uploadFile({
-    required String path,
-    required String fileName,
-    required List<int> bytes,
-    String contentType = 'image/jpeg',
-  }) async {
-    return 'https://example.test/$path/$fileName';
-  }
-
-  @override
-  Future<String> uploadImage({
-    required String path,
-    required String fileName,
-    required List<int> bytes,
-  }) async {
-    return 'https://example.test/$path/$fileName';
-  }
-
-  @override
-  Future<bool> deleteFile(String url) async => true;
-
-  @override
-  Future<List<String>> deleteFiles(List<String> urls) async => const [];
-}
-
 // ---------------------------------------------------------------------------
 // The repositories.
 // ---------------------------------------------------------------------------
@@ -129,7 +90,6 @@ class FakeOwnerRepository extends OwnerRepository {
         firestore: FakeFirestore(),
         auth: MockFirebaseAuth(),
         functions: FakeFunctionsService(),
-        storage: FakeStorageService(),
       );
 
   @override
@@ -176,11 +136,7 @@ class FakeStudentJoinRequestRepository extends StudentJoinRequestRepository {
       );
 
   @override
-  Future<JoinRequestModel> createJoinRequest({
-    required String roomId,
-    String? ownerId,
-    double? monthlyRent,
-  }) async {
+  Future<JoinRequestModel> createJoinRequest({required String roomId}) async {
     return auditRequest();
   }
 

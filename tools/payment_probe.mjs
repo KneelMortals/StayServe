@@ -1,8 +1,8 @@
 // Probe: what does the deployed server answer when the **student** opens
 // the payment sheet for a room with a small rent?
 //
-// It creates a throw-away student and owner, a listing with a rent of 444
-// (the same rent the real listing has), runs the booking up to the payment
+// It creates a throw-away student and owner, a listing with a valid minimum
+// rent, runs the booking up to the payment
 // and prints the **whole** answer of `createUpiPayment` — the UPI intent
 // included. Everything it creates is removed again.
 //
@@ -12,6 +12,9 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'node:child_process';
+
+import { appCheckHeaders, assertAppCheckConfigured } from './app_check.mjs';
+import { prepareVerifiedPhoneIdentity } from './live_test_identity.mjs';
 
 const KEY = 'AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM';
 const PROJ = 'myfirstapp-fa30f52b';
@@ -24,6 +27,12 @@ const STAMP = Date.now();
 const STUDENT_EMAIL = `probe.student.${STAMP}@example.com`;
 const OWNER_EMAIL = `probe.owner.${STAMP}@example.com`;
 const PASSWORD = 'TmpProbe!2026x';
+const STUDENT_PHONE = String(
+  process.env.STAYSERVE_SMOKE_PHONE_STUDENT || '+15555550104',
+).trim();
+const OWNER_PHONE = String(
+  process.env.STAYSERVE_SMOKE_PHONE_OWNER || '+15555550105',
+).trim();
 
 function firebaseToken() {
   try {
@@ -58,13 +67,21 @@ async function signUp(email) {
     returnSecureToken: true,
   });
   if (res.status !== 200) throw new Error(`signUp: ${JSON.stringify(res.json)}`);
-  return { uid: res.json.localId, idToken: res.json.idToken };
+  return {
+    uid: res.json.localId,
+    email,
+    idToken: res.json.idToken,
+    refreshToken: res.json.refreshToken || '',
+  };
 }
 
 async function call(fnName, idToken, data) {
   const res = await fetch(`${FN}/${fnName}`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+    headers: appCheckHeaders({
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json',
+    }),
     body: JSON.stringify({ data }),
   });
   const text = await res.text();
@@ -129,12 +146,63 @@ let owner;
 const roomId = `PROBE-ROOM-${STAMP}`;
 let requestId = null;
 
+/**
+ * Prepares the server-owned role facts of a throw-away account.
+ *
+ * The phone facts are deliberately **not** written here. A number which an
+ * administrator attaches is not a verification proof; the server only accepts
+ * a number whose owner completed Firebase's own SMS challenge.
+ */
+async function prepareLiveProfile(account, role) {
+  const now = new Date().toISOString();
+  return fsWrite(oauth, `users/${account.uid}`, {
+    uid: { stringValue: account.uid },
+    email: { stringValue: account.email || '' },
+    name: { stringValue: `Temporary ${role} payment probe` },
+    role: { stringValue: role },
+    roleClaimed: { booleanValue: true },
+    isActive: { booleanValue: true },
+    registrationCompleted: { booleanValue: true },
+    createdAt: { timestampValue: now },
+    updatedAt: { timestampValue: now },
+    savedRooms: { arrayValue: { values: [] } },
+  });
+}
+
 async function main() {
+  assertAppCheckConfigured();
   oauth = firebaseToken();
 
   student = await signUp(STUDENT_EMAIL);
   owner = await signUp(OWNER_EMAIL);
   console.log('student', student.uid, 'owner', owner.uid);
+
+  await prepareLiveProfile(student, 'student');
+  await prepareLiveProfile(owner, 'owner');
+
+  // The phone challenge is completed with the real Firebase endpoint, the
+  // server records the proof itself and publishes the signed claims. The
+  // refreshed tokens therefore carry `stayServeVerifiedPhone`.
+  const liveStudent = await prepareVerifiedPhoneIdentity({
+    projectId: PROJ,
+    apiKey: KEY,
+    functionsBase: FN,
+    uid: student.uid,
+    email: STUDENT_EMAIL,
+    password: PASSWORD,
+    phoneNumber: STUDENT_PHONE,
+  });
+  const liveOwner = await prepareVerifiedPhoneIdentity({
+    projectId: PROJ,
+    apiKey: KEY,
+    functionsBase: FN,
+    uid: owner.uid,
+    email: OWNER_EMAIL,
+    password: PASSWORD,
+    phoneNumber: OWNER_PHONE,
+  });
+  student.idToken = liveStudent.idToken;
+  owner.idToken = liveOwner.idToken;
 
   const now = new Date().toISOString();
   await fsWrite(oauth, `rooms/${roomId}`, {
@@ -142,7 +210,7 @@ async function main() {
     ownerId: { stringValue: owner.uid },
     title: { stringValue: 'Probe listing' },
     description: { stringValue: 'throw away' },
-    monthlyRent: { doubleValue: 444 },
+    monthlyRent: { doubleValue: 4444 },
     securityDeposit: { doubleValue: 500 },
     location: {
       mapValue: {

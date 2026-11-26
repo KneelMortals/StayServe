@@ -128,9 +128,14 @@ membership:
 * clients cannot create or activate join requests, payments or invoices;
 * `rooms.currentOccupancy` is changed only by server-side booking activation
   and rollback;
+* a new listing is created as a **draft** (`status: draft`). It is invisible
+  to the student search and it cannot be booked while its photos or its
+  private exact location are missing. The server publishes it through
+  `publishRoomListing`, which verifies the live owner, the listing ownership,
+  the private exact location and that every staged photo was committed;
 * owners change listing availability through
   `setRoomListingAvailability`, which verifies the live owner role and the
-  listing ownership;
+  listing ownership (and never publishes a draft);
 * admins change the status of any listing through
   `adminSetRoomListingStatus` (live admin role);
 * a listing is removed through `deleteRoomListing` — the server refuses a
@@ -160,7 +165,7 @@ profile; a fresh dry run reports `Already complete: 1, Legacy candidates: 0`).
 |------|---------------|
 | `lib/core/` | router, theme, shared widgets, constants |
 | `lib/features/` | one folder per feature (auth, students, owners, admin, payments, messaging, …) |
-| `lib/firebase/` | the Firebase plumbing — Auth, Firestore, Storage, Functions, messaging |
+| `lib/firebase/` | the Firebase plumbing — Auth, Firestore, Functions, messaging |
 | `lib/models/` | the hand-written data models (no build_runner) |
 | `functions/src/` | the Cloud Functions |
 | `tools/` | maintenance scripts (admin promotion, rules tests, end-to-end checks) |
@@ -173,21 +178,28 @@ profile; a fresh dry run reports `Already complete: 1, Legacy candidates: 0`).
 
 ```bash
 flutter analyze lib test      # expect: No issues found!
-flutter test                  # the Dart/widget regression suite (311 tests)
+flutter test                  # Dart/widget regression suite
 flutter test --platform chrome test/web_firebase_config_test.dart # browser Firebase selection
 npm run test:functions        # backend unit/security and room checks
-npm run test:callables        # backend callable state-machine suite (461)
-tools/test_firestore_rules.sh # Firestore rules, against the emulator (170)
-tools/test_storage_rules.sh   # Storage rules, against both emulators (30)
+npm run test:callables        # backend callable state-machine suite
+tools/test_firestore_rules.sh # Firestore rules, against the emulator
+tools/test_storage_rules.sh   # Storage rules, against both emulators
 tools/test_private_location_cli.sh # private-location operator CLI regression
-node tools/production_rules_check.mjs # deployed Firestore rules (46)
-node tools/production_core_flow_smoke.mjs # isolated production core flow (25)
+node tools/production_rules_check.mjs # deployed Firestore rules (mutates disposable test data)
+node tools/production_core_flow_smoke.mjs # isolated production core flow (mutates disposable test data)
 ```
 
-`npm test` runs the three backend/rules suites together. The functions are
-compiled automatically before the Node checks read their helpers. The same
-analysis, tests and release builds run in `.github/workflows/ci.yml` for
-pushes and pull requests.
+`npm test` runs the backend callable/unit suites, Firestore and Storage rules,
+index validation, the private-location CLI regressions, and the domain
+cutover checks. The functions are compiled automatically before the Node
+checks read their helpers. The same analysis, tests and release builds run in
+`.github/workflows/ci.yml` for pushes and pull requests.
+
+The two `node tools/production_*` commands above intentionally exercise the
+live project and create disposable data. After callable App Check enforcement
+is enabled, set `STAYSERVE_APP_CHECK_TOKEN` and
+`STAYSERVE_REQUIRE_APP_CHECK=1` so the scripts fail before creating data
+when the token is missing.
 
 ---
 
@@ -249,6 +261,32 @@ for this project is complete and the durable finalization latch prevents the
 legacy exact-public-write window from reopening. The full procedure and
 recovery rules remain in
 [`docs/PRIVATE_LOCATION_MIGRATION.md`](docs/PRIVATE_LOCATION_MIGRATION.md).
+
+### Room-photo access policy
+
+Room photos are **public media by design**: a listing photo is meant to be
+seen by every prospective tenant, so its download URL is a bearer URL. The
+policy which makes that acceptable is narrow and explicit:
+
+* the **exact address stays private**. A photo never contains the address as
+  a machine-readable field; the location lives in the server-owned
+  `roomPrivate/{roomId}` document and is handed out only to an accepted
+  student through `getRoomVisitDetails`;
+* the download URL carries a **per-object, high-entropy token** which the
+  server mints when it stages the photo. The token is not derived from the
+  room id, the owner id or the file name, so the URL cannot be guessed or
+  enumerated from the listing;
+* the URL is **revoked by deletion**: the durable room-photo cleanup removes
+  the Storage object when a photo is no longer referenced, which invalidates
+  the token with it;
+* **clients cannot write** to the bucket. Every object is written by the
+  Admin SDK inside `stageRoomPhoto` / `commitRoomPhotoChanges`, which
+  validate the live owner, the listing generation, the image bytes, the
+  quota and the exact `rooms/{ownerId}/{roomId}/…` path.
+
+In short: a room photo is public content with an unguessable URL, while the
+address of the room is not. The detailed protocol is described in
+[`DEPLOYMENT.md`](DEPLOYMENT.md#57-room-photo-access-policy).
 
 > **Rotate the mailbox token.** A live bearer token for the OTP mailbox was
 > committed to the repository in `.mail_inbox.json`. The file has been deleted

@@ -27,6 +27,8 @@ process.env.FIREBASE_CONFIG = JSON.stringify({ projectId: PROJECT });
 // protocol so it does not look for application-default credentials while it
 // initializes the shared Auth service.
 process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9099';
+process.env.ROOM_PHOTO_BUCKET =
+  process.env.ROOM_PHOTO_BUCKET || 'demo.appspot.com';
 
 const firestore = require('firebase-admin/firestore');
 const authSdk = require('firebase-admin/auth');
@@ -72,6 +74,7 @@ const {
 const {
   deleteRoomListing,
   processRoomPhotoCleanupJobs,
+  publishRoomListing,
   setRoomListingAvailability,
   adminSetRoomListingStatus,
 } = require(path.join(ROOT, 'lib', 'rooms.js'));
@@ -87,9 +90,15 @@ const {
 } = require(path.join(ROOT, 'lib', 'authProfile.js'));
 const {
   ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
+  ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS,
+  adminConversationId,
   adminMessageNotificationId,
   adminSupportIdentityFor,
+  listAdminSupportConversations,
+  markAdminSupportConversationRead,
   sendAdminMessage,
+  sendAdminSupportReply,
+  supportReplyNotificationId,
 } = require(path.join(ROOT, 'lib', 'adminMessaging.js'));
 const {
   getRoomReviews,
@@ -152,7 +161,14 @@ auth.getUser = async (uid) => ({
   // The callable suite models a live linked phone by default. Tests which
   // exercise an unlinked provider override this getter explicitly.
   phoneNumber: '+919876500000',
-  providerData: [{ providerId: 'password' }],
+  // The signed proof that the account completed Firebase's phone challenge.
+  // A number without this server-issued fact is not verified, even when the
+  // live Auth record carries it.
+  customClaims: { stayServeVerifiedPhone: '+919876500000' },
+  providerData: [
+    { providerId: 'password' },
+    { providerId: 'phone', phoneNumber: '+919876500000' },
+  ],
 });
 
 let pass = 0;
@@ -404,6 +420,7 @@ async function reset() {
     'notificationAttributions',
     'adminMessageNotificationOperations',
     'adminSupportConversationOperations',
+    'adminSupportReplyNotificationOperations',
     'rooms',
     'roomPrivate',
     'roomReviews',
@@ -1313,6 +1330,43 @@ async function testAccountCleanupRemovesReviewNotificationDependents() {
     sourceReviewId: reviewId,
   });
 
+  // The verified-phone proof holds the exact phone number of the account. It
+  // is personal data and must not survive the deletion.
+  await db.collection('phoneVerificationProofs').doc('student-1').set({
+    uid: 'student-1',
+    phone: '+919999000001',
+    provider: 'phone',
+  });
+
+  // A support reply of the deleted account towards the administrator. Its
+  // delivery operation names the deleted uid on both sides of the channel.
+  const supportReplyMessageId = 'MSG-ACCOUNT-CLEANUP-support';
+  const supportReplyCopyId = supportReplyNotificationId(
+    'ADMIN-ACCOUNT-CLEANUP',
+    supportReplyMessageId,
+  );
+  await db
+    .collection('adminSupportReplyNotificationOperations')
+    .doc(supportReplyMessageId)
+    .set({
+      operationId: supportReplyMessageId,
+      notificationId: supportReplyCopyId,
+      messageId: supportReplyMessageId,
+      conversationId: 'ADMIN-ACCOUNT-CLEANUP',
+      recipientId: 'admin-1',
+      sourceAuthorUid: 'student-1',
+      sourceRecipientUid: 'admin-1',
+      sourceType: 'adminSupportReply',
+    });
+  await db.collection('notifications').doc(supportReplyCopyId).set({
+    userId: 'admin-1',
+    title: 'StayServe Support',
+    body: 'You have a new support reply.',
+    type: 'newMessage',
+    data: { conversationId: 'ADMIN-ACCOUNT-CLEANUP' },
+    read: false,
+  });
+
   const originalUpdateUser = auth.updateUser;
   const originalRevoke = auth.revokeRefreshTokens;
   const originalDeleteUser = auth.deleteUser;
@@ -1346,6 +1400,30 @@ async function testAccountCleanupRemovesReviewNotificationDependents() {
       (await db
         .collection('notificationAttributions')
         .doc(notificationId)
+        .get()).exists,
+      false,
+    );
+    check(
+      'the account cleanup removed the phone-verification proof',
+      (await db
+        .collection('phoneVerificationProofs')
+        .doc('student-1')
+        .get()).exists,
+      false,
+    );
+    check(
+      'the account cleanup removed the support-reply delivery operation',
+      (await db
+        .collection('adminSupportReplyNotificationOperations')
+        .doc(supportReplyMessageId)
+        .get()).exists,
+      false,
+    );
+    check(
+      'the account cleanup removed the support-reply notification',
+      (await db
+        .collection('notifications')
+        .doc(supportReplyCopyId)
         .get()).exists,
       false,
     );
@@ -6459,8 +6537,8 @@ async function testPhotoCleanupKeepsAReAddedImage() {
   await reset();
   const path = 'rooms/owner-1/RM-1/photo.jpg';
   const url =
-    'https://firebasestorage.googleapis.com/v0/b/demo/o/' +
-    encodeURIComponent(path);
+    'https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/' +
+    `${encodeURIComponent(path)}?alt=media&token=abc`;
   await seedRoom('RM-1', 'owner-1', { images: [url] });
   await db.collection('cleanupJobs').doc('readded-photo').set({
     type: 'roomPhotoPaths',
@@ -9084,11 +9162,791 @@ async function testConcurrentEmailLinksAreSerialized() {
   }
 }
 
+async function testSupportRepliesUseTheTrustedRoute() {
+  section('a support reply is written by the trusted server route');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await seedUser('student-2', 'student');
+  await db.collection('users').doc('student-1').set({
+    ...profile('student-1', 'student'),
+    phoneVerified: true,
+  });
+  await db.collection('users').doc('student-2').set({
+    ...profile('student-2', 'student'),
+    phoneVerified: true,
+  });
+
+  const sent = await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'Please update your room details.',
+      requestId: 'support-reply-admin-message',
+    },
+    'admin-1',
+  );
+  const adminIdentity = adminSupportIdentityFor('admin-1');
+  check('the administrator message is stored', sent.success, true);
+
+  await db.collection('conversations').doc(sent.conversationId).update({
+    unreadCount: {
+      [adminIdentity]: 0,
+      'student-1': 2,
+    },
+  });
+
+  const reply = await invoke(
+    sendAdminSupportReply,
+    {
+      conversationId: sent.conversationId,
+      content: 'I have updated the room details.',
+      requestId: 'support-reply-request-1',
+    },
+    'student-1',
+  );
+  check('the support reply is accepted', reply.success, true);
+  check(
+    'the support reply keeps the request id idempotent',
+    reply.alreadySent,
+    false,
+  );
+
+  const storedReply = await db
+    .collection('conversations')
+    .doc(sent.conversationId)
+    .collection('messages')
+    .doc(reply.messageId)
+    .get();
+  check(
+    'the support reply names the support target as the sender',
+    storedReply.get('senderId'),
+    'student-1',
+  );
+  check(
+    'the support reply names the opaque administrator as the receiver',
+    storedReply.get('receiverId'),
+    adminIdentity,
+  );
+  check(
+    'the support reply does not carry an administrator marker',
+    storedReply.get('adminVerified') == null,
+    true,
+  );
+  check(
+    'the support reply is stored with the administrator reply in one channel',
+    (await db
+      .collection('conversations')
+      .doc(sent.conversationId)
+      .collection('messages')
+      .get()).size,
+    2,
+  );
+
+  const replyUnread = (
+    await db.collection('conversations').doc(sent.conversationId).get()
+  ).get('unreadCount');
+  check(
+    'the support reply raises the administrator counter by exactly one',
+    replyUnread[adminIdentity],
+    1,
+  );
+  check(
+    'the support reply preserves the tenant counter',
+    replyUnread['student-1'],
+    2,
+  );
+  check(
+    'the support reply updates the conversation preview',
+    (await db.collection('conversations').doc(sent.conversationId).get()).get(
+      'lastMessage',
+    ),
+    'I have updated the room details.',
+  );
+
+  const retriedReply = await invoke(
+    sendAdminSupportReply,
+    {
+      conversationId: sent.conversationId,
+      content: 'I have updated the room details.',
+      requestId: 'support-reply-request-1',
+    },
+    'student-1',
+  );
+  check('the support reply retry is idempotent', retriedReply.alreadySent, true);
+  check(
+    'the support reply retry did not create a duplicate message',
+    (await db
+      .collection('conversations')
+      .doc(sent.conversationId)
+      .collection('messages')
+      .get()).size,
+    2,
+  );
+  check(
+    'the support reply retry did not raise the administrator counter again',
+    (
+      await db.collection('conversations').doc(sent.conversationId).get()
+    ).get('unreadCount')[adminIdentity],
+    1,
+  );
+
+  await expectDenied(
+    'the same request id cannot be reused for a different reply',
+    () =>
+      invoke(
+        sendAdminSupportReply,
+        {
+          conversationId: sent.conversationId,
+          content: 'A different reply.',
+          requestId: 'support-reply-request-1',
+        },
+        'student-1',
+      ),
+    'already-exists',
+  );
+
+  await expectDenied(
+    'another tenant cannot reply to somebody else support channel',
+    () =>
+      invoke(
+        sendAdminSupportReply,
+        {
+          conversationId: sent.conversationId,
+          content: 'Not my conversation.',
+          requestId: 'support-reply-request-foreign',
+        },
+        'student-2',
+      ),
+    'permission-denied',
+  );
+
+  await expectDenied(
+    'a support reply cannot address an unknown conversation',
+    () =>
+      invoke(
+        sendAdminSupportReply,
+        {
+          conversationId: 'ADMIN-unknown-conversation',
+          content: 'Hello?',
+          requestId: 'support-reply-request-unknown',
+        },
+        'student-1',
+      ),
+    'not-found',
+  );
+
+  // The mapped administrator has to stay live: a reply which was written after
+  // a demotion would stay in a channel which nobody can answer.
+  await db.collection('users').doc('admin-1').update({ role: 'student' });
+  await expectDenied(
+    'a support reply to a demoted administrator is refused',
+    () =>
+      invoke(
+        sendAdminSupportReply,
+        {
+          conversationId: sent.conversationId,
+          content: 'Still there?',
+          requestId: 'support-reply-request-demoted',
+        },
+        'student-1',
+      ),
+    'permission-denied',
+  );
+  await db.collection('users').doc('admin-1').update({ role: 'admin' });
+
+  // The support target clears its own counter; the administrator's counter
+  // stays untouched.
+  const tenantReadReceipt = await invoke(
+    markAdminSupportConversationRead,
+    { conversationId: sent.conversationId },
+    'student-1',
+  );
+  check('the support target can clear its own counter', tenantReadReceipt.success, true);
+  const afterTenantRead = (
+    await db.collection('conversations').doc(sent.conversationId).get()
+  ).get('unreadCount');
+  check('the support target counter was cleared', afterTenantRead['student-1'], 0);
+  check(
+    'the administrator counter survived the tenant read receipt',
+    afterTenantRead[adminIdentity],
+    1,
+  );
+
+  await expectDenied(
+    'an unmapped administrator cannot clear the support conversation',
+    () =>
+      invoke(
+        markAdminSupportConversationRead,
+        { conversationId: sent.conversationId },
+        'student-2',
+      ),
+    'permission-denied',
+  );
+
+  // The cached `phoneVerified` flag alone must not authorize the read
+  // receipt. A tenant whose phone provider was unlinked keeps the stale
+  // cache until the next profile synchronisation, so the live Auth proof
+  // decides.
+  const originalGetUser = auth.getUser;
+  auth.getUser = async (uid) => ({
+    uid,
+    email: `${uid}@example.test`,
+    emailVerified: false,
+    phoneNumber: '+919876500000',
+    // The signed proof is gone: the live number is no longer bound to a
+    // completed phone challenge.
+    customClaims: {},
+    providerData: [
+      { providerId: 'password' },
+      { providerId: 'phone', phoneNumber: '+919876500000' },
+    ],
+  });
+  try {
+    await expectDenied(
+      'a tenant without a live verified phone cannot clear its counter',
+      () =>
+        invoke(
+          markAdminSupportConversationRead,
+          { conversationId: sent.conversationId },
+          'student-1',
+        ),
+      'permission-denied',
+    );
+  } finally {
+    auth.getUser = originalGetUser;
+  }
+
+  // The notification is addressed to the real administrator, never to the
+  // synthetic identity.
+  await db.collection('users').doc('admin-1').update({
+    fcmToken: 'support-reply-device-token',
+  });
+  const supportPushes = [];
+  const supportMessagingGetter = messagingSdk.getMessaging;
+  messagingSdk.getMessaging = () => ({
+    send: async (message) => {
+      supportPushes.push(message);
+      return 'support-reply-message-id';
+    },
+  });
+  let secondReply;
+  try {
+    secondReply = await invoke(
+      sendAdminSupportReply,
+      {
+        conversationId: sent.conversationId,
+        content: 'A second reply.',
+        requestId: 'support-reply-request-2',
+      },
+      'student-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = supportMessagingGetter;
+  }
+  const administratorNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', 'admin-1')
+    .get();
+  check(
+    'every support reply notifies the real administrator exactly once',
+    administratorNotifications.size,
+    2,
+  );
+  const secondNotification = administratorNotifications.docs.find(
+    (document) =>
+      document.get('data')?.messageId === secondReply.messageId,
+  );
+  check(
+    'the support reply notification was created',
+    Boolean(secondNotification),
+    true,
+  );
+  check(
+    'the support reply notification points at the support conversation',
+    secondNotification?.get('data')?.conversationId,
+    sent.conversationId,
+  );
+  check(
+    'the support reply notification does not copy the private reply text',
+    String(secondNotification?.get('body') || '').includes('A second reply.'),
+    false,
+  );
+  check('the support reply sends one device push', supportPushes.length, 1);
+  const syntheticNotifications = await db
+    .collection('notifications')
+    .where('userId', '==', adminIdentity)
+    .get();
+  check(
+    'the support reply does not notify the synthetic identity',
+    syntheticNotifications.size,
+    0,
+  );
+}
+
+async function testLegacyAdminUnreadCounterSurvivesTheConversion() {
+  section('a legacy administrator unread counter survives the conversion');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await db.collection('users').doc('student-1').set({
+    ...profile('student-1', 'student'),
+    phoneVerified: true,
+  });
+
+  const conversationId = adminConversationId('admin-1', 'student-1');
+  const adminIdentity = adminSupportIdentityFor('admin-1');
+  const now = firestore.Timestamp.now();
+
+  // A legacy support channel counted the administrator's unread replies under
+  // the administrator's real uid.
+  await db.collection('conversations').doc(conversationId).set({
+    conversationId,
+    participantIds: ['admin-1', 'student-1'],
+    participantNames: {
+      'admin-1': 'StayServe Admin',
+      'student-1': 'student-1',
+    },
+    conversationType: 'adminSupport',
+    adminId: 'admin-1',
+    unreadCount: {
+      'admin-1': 3,
+      'student-1': 2,
+    },
+    lastMessage: 'An earlier reply.',
+    lastMessageAt: now,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'Please update your room details.',
+      requestId: 'legacy-unread-remap',
+    },
+    'admin-1',
+  );
+
+  const conversation = await db
+    .collection('conversations')
+    .doc(conversationId)
+    .get();
+  const unread = conversation.get('unreadCount');
+  check(
+    'the legacy administrator counter is remapped to the opaque identity',
+    unread[adminIdentity],
+    3,
+  );
+  check(
+    'the legacy administrator uid is no longer a counter key',
+    unread['admin-1'] === undefined,
+    true,
+  );
+  check(
+    'the tenant counter survives the conversion and the new message',
+    unread['student-1'],
+    3,
+  );
+  check(
+    'the conversion replaces the administrator participant',
+    conversation.get('participantIds'),
+    [adminIdentity, 'student-1'],
+  );
+  check(
+    'the conversion replaces the administrator marker',
+    conversation.get('adminId'),
+    adminIdentity,
+  );
+}
+
+async function testSupportReplyNotificationDeliveryIsRetryable() {
+  section('a failed support-reply notification is repaired by the retry');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await db.collection('users').doc('student-1').set({
+    ...profile('student-1', 'student'),
+    phoneVerified: true,
+  });
+  await db.collection('users').doc('admin-1').update({
+    fcmToken: 'support-retry-device-token',
+  });
+
+  const sent = await invoke(
+    sendAdminMessage,
+    {
+      userId: 'student-1',
+      content: 'Please update your room details.',
+      requestId: 'support-retry-admin-message',
+    },
+    'admin-1',
+  );
+
+  // The first device push fails. The message itself is stored.
+  const failedPushes = [];
+  const originalGetter = messagingSdk.getMessaging;
+  messagingSdk.getMessaging = () => ({
+    send: async (message) => {
+      failedPushes.push(message);
+      throw new Error('The device push failed.');
+    },
+  });
+  let reply;
+  try {
+    reply = await invoke(
+      sendAdminSupportReply,
+      {
+        conversationId: sent.conversationId,
+        content: 'I have updated the room details.',
+        requestId: 'support-retry-request',
+      },
+      'student-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = originalGetter;
+  }
+  check('the support reply is stored even though the push failed', reply.success, true);
+  check('the failed push was attempted', failedPushes.length, 1);
+
+  const operationRef = db
+    .collection(ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS)
+    .doc(reply.messageId);
+  const operation = await operationRef.get();
+  check('the durable delivery operation exists', operation.exists, true);
+  check(
+    'the failed push is still pending',
+    operation.get('pushDeliveryState'),
+    'pending',
+  );
+  check(
+    'the in-app notification was created',
+    (
+      await db.collection('notifications').where('userId', '==', 'admin-1').get()
+    ).size,
+    1,
+  );
+
+  // The retry of the same request repairs the failed push.
+  const repairedPushes = [];
+  messagingSdk.getMessaging = () => ({
+    send: async (message) => {
+      repairedPushes.push(message);
+      return 'support-retry-message-id';
+    },
+  });
+  let retried;
+  try {
+    retried = await invoke(
+      sendAdminSupportReply,
+      {
+        conversationId: sent.conversationId,
+        content: 'I have updated the room details.',
+        requestId: 'support-retry-request',
+      },
+      'student-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = originalGetter;
+  }
+  check('the retry is idempotent', retried.alreadySent, true);
+  check('the retry repeated the failed push', repairedPushes.length, 1);
+  const repairedOperation = await operationRef.get();
+  check(
+    'the repaired push is marked as delivered',
+    repairedOperation.get('pushDeliveryState'),
+    'delivered',
+  );
+  check(
+    'the retry did not create a second message',
+    (
+      await db
+        .collection('conversations')
+        .doc(sent.conversationId)
+        .collection('messages')
+        .get()
+    ).size,
+    2,
+  );
+  check(
+    'the retry did not create a second notification',
+    (
+      await db.collection('notifications').where('userId', '==', 'admin-1').get()
+    ).size,
+    1,
+  );
+
+  // A missing in-app notification is repaired by the next retry as well.
+  const notificationSnapshot = await db
+    .collection('notifications')
+    .where('userId', '==', 'admin-1')
+    .limit(1)
+    .get();
+  await notificationSnapshot.docs[0].ref.delete();
+  messagingSdk.getMessaging = () => ({
+    send: async () => 'support-retry-message-id',
+  });
+  try {
+    await invoke(
+      sendAdminSupportReply,
+      {
+        conversationId: sent.conversationId,
+        content: 'I have updated the room details.',
+        requestId: 'support-retry-request',
+      },
+      'student-1',
+    );
+  } finally {
+    messagingSdk.getMessaging = originalGetter;
+  }
+  check(
+    'the retry recreated the missing in-app notification',
+    (
+      await db.collection('notifications').where('userId', '==', 'admin-1').get()
+    ).size,
+    1,
+  );
+}
+
+async function testDraftListingsArePublishedByTheServer() {
+  section('a new listing is published by the server when it is complete');
+
+  await reset();
+  await seedUser('owner-1', 'owner');
+  await seedUser('owner-2', 'owner');
+  await seedUser('student-1', 'student');
+
+  // A new listing starts as a draft. It is not offered to students and it
+  // cannot be booked while its photos and its private location are missing.
+  await db.collection('rooms').doc('RM-DRAFT').set({
+    roomId: 'RM-DRAFT',
+    ownerId: 'owner-1',
+    title: 'Draft room',
+    monthlyRent: 6000,
+    occupancy: 2,
+    currentOccupancy: 0,
+    status: 'draft',
+    listingGeneration: 'generation-draft',
+    images: [],
+  });
+
+  await expectDenied(
+    'a draft without its private location cannot be published',
+    () => invoke(publishRoomListing, { roomId: 'RM-DRAFT' }, 'owner-1'),
+    'failed-precondition',
+  );
+
+  await db.collection('roomPrivate').doc('RM-DRAFT').set({
+    roomId: 'RM-DRAFT',
+    ownerId: 'owner-1',
+    address: '42 Test Street',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+
+  const published = await invoke(
+    publishRoomListing,
+    { roomId: 'RM-DRAFT' },
+    'owner-1',
+  );
+  check('the finished draft is published', published.success, true);
+  check(
+    'the published listing is available',
+    (await db.collection('rooms').doc('RM-DRAFT').get()).get('status'),
+    'available',
+  );
+
+  const retried = await invoke(
+    publishRoomListing,
+    { roomId: 'RM-DRAFT' },
+    'owner-1',
+  );
+  check('the publication retry is idempotent', retried.alreadyPublished, true);
+  check(
+    'the retry did not change the listing again',
+    (await db.collection('rooms').doc('RM-DRAFT').get()).get('status'),
+    'available',
+  );
+
+  await expectDenied(
+    'another owner cannot publish a foreign listing',
+    () => invoke(publishRoomListing, { roomId: 'RM-DRAFT' }, 'owner-2'),
+    'permission-denied',
+  );
+
+  await expectDenied(
+    'a student cannot publish a listing',
+    () => invoke(publishRoomListing, { roomId: 'RM-DRAFT' }, 'student-1'),
+    'permission-denied',
+  );
+
+  // The live role is authoritative: a demoted owner cannot publish a
+  // listing with a stale custom claim.
+  await db.collection('rooms').doc('RM-DRAFT-3').set({
+    roomId: 'RM-DRAFT-3',
+    ownerId: 'owner-1',
+    title: 'Draft room of a demoted owner',
+    monthlyRent: 6000,
+    occupancy: 2,
+    currentOccupancy: 0,
+    status: 'draft',
+    listingGeneration: 'generation-draft-3',
+    images: [],
+  });
+  await db.collection('roomPrivate').doc('RM-DRAFT-3').set({
+    roomId: 'RM-DRAFT-3',
+    ownerId: 'owner-1',
+    address: '44 Test Street',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  await db.collection('users').doc('owner-1').update({ role: 'student' });
+  await expectDenied(
+    'a demoted owner cannot publish a listing',
+    () => invoke(publishRoomListing, { roomId: 'RM-DRAFT-3' }, 'owner-1'),
+    'permission-denied',
+  );
+  check(
+    'the demoted draft stays unpublished',
+    (await db.collection('rooms').doc('RM-DRAFT-3').get()).get('status'),
+    'draft',
+  );
+  await db.collection('users').doc('owner-1').update({ role: 'owner' });
+
+  // A staged photo which was never committed keeps the listing unpublished.
+  await db.collection('rooms').doc('RM-DRAFT-2').set({
+    roomId: 'RM-DRAFT-2',
+    ownerId: 'owner-1',
+    title: 'Draft room with a staged photo',
+    monthlyRent: 6000,
+    occupancy: 2,
+    currentOccupancy: 0,
+    status: 'draft',
+    listingGeneration: 'generation-draft-2',
+    images: [],
+  });
+  await db.collection('roomPrivate').doc('RM-DRAFT-2').set({
+    roomId: 'RM-DRAFT-2',
+    ownerId: 'owner-1',
+    address: '43 Test Street',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  await db.collection('roomPhotoUploadOperations').doc('upload-draft-2').set({
+    ownerId: 'owner-1',
+    roomId: 'RM-DRAFT-2',
+    uploadId: 'upload-draft-2',
+    listingGeneration: 'generation-draft-2',
+    status: 'uploaded',
+    byteLength: 1024,
+  });
+  await expectDenied(
+    'a draft with an uncommitted photo cannot be published',
+    () => invoke(publishRoomListing, { roomId: 'RM-DRAFT-2' }, 'owner-1'),
+    'failed-precondition',
+  );
+  check(
+    'the incomplete draft stays unpublished',
+    (await db.collection('rooms').doc('RM-DRAFT-2').get()).get('status'),
+    'draft',
+  );
+
+  // The transactional counter is authoritative inside the publication
+  // transaction: a listing whose room quota still holds a pending upload is
+  // not published, even when the operation records were already swept.
+  await db.collection('rooms').doc('RM-DRAFT-4').set({
+    roomId: 'RM-DRAFT-4',
+    ownerId: 'owner-1',
+    title: 'Draft room with a pending quota',
+    monthlyRent: 6000,
+    occupancy: 2,
+    currentOccupancy: 0,
+    status: 'draft',
+    listingGeneration: 'generation-draft-4',
+    images: [],
+  });
+  await db.collection('roomPrivate').doc('RM-DRAFT-4').set({
+    roomId: 'RM-DRAFT-4',
+    ownerId: 'owner-1',
+    address: '45 Test Street',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  await db.collection('roomPhotoRoomQuotas').doc('RM-DRAFT-4').set({
+    roomId: 'RM-DRAFT-4',
+    ownerId: 'owner-1',
+    listingGeneration: 'generation-draft-4',
+    pendingCount: 1,
+    pendingBytes: 1024,
+  });
+  await expectDenied(
+    'a draft with a pending room-photo quota cannot be published',
+    () => invoke(publishRoomListing, { roomId: 'RM-DRAFT-4' }, 'owner-1'),
+    'failed-precondition',
+  );
+  check(
+    'the draft with a pending quota stays unpublished',
+    (await db.collection('rooms').doc('RM-DRAFT-4').get()).get('status'),
+    'draft',
+  );
+
+  // The quota of an earlier lifetime of the same room id does not block a
+  // new listing.
+  await db.collection('roomPhotoRoomQuotas').doc('RM-DRAFT-4').update({
+    listingGeneration: 'generation-of-an-earlier-lifetime',
+    pendingCount: 3,
+  });
+  const publishedAfterFence = await invoke(
+    publishRoomListing,
+    { roomId: 'RM-DRAFT-4' },
+    'owner-1',
+  );
+  check(
+    'a quota of an earlier listing lifetime does not block the publication',
+    publishedAfterFence.success,
+    true,
+  );
+
+  // The owner cannot publish the listing with the availability toggle.
+  await expectDenied(
+    'the availability toggle cannot publish a draft',
+    () =>
+      invoke(
+        setRoomListingAvailability,
+        { roomId: 'RM-DRAFT-2', isOccupied: false },
+        'owner-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the availability toggle left the draft alone',
+    (await db.collection('rooms').doc('RM-DRAFT-2').get()).get('status'),
+    'draft',
+  );
+}
+
 async function testAdminMessagingAndReviewDeletion() {
   section('administrators can message users and delete any review');
 
   await reset();
   await seedUser('admin-1', 'admin');
+  await seedUser('admin-2', 'admin');
   await seedUser('student-1', 'student');
   await seedUser('owner-1', 'owner');
   // `sendAdminMessage` uses the same phone-verified tenant policy as every
@@ -9193,6 +10051,73 @@ async function testAdminMessagingAndReviewDeletion() {
     'the server-only conversation operation keeps the opaque identity',
     conversationOperation.get('adminIdentity'),
     adminIdentity,
+  );
+
+  const administratorInbox = await invoke(
+    listAdminSupportConversations,
+    {},
+    'admin-1',
+  );
+  check(
+    'the mapped administrator discovers the support conversation',
+    administratorInbox.conversationIds,
+    [sent.conversationId],
+  );
+  check(
+    'the administrator inbox does not expose the raw administrator uid',
+    JSON.stringify(administratorInbox).includes('admin-1'),
+    false,
+  );
+  const otherAdministratorInbox = await invoke(
+    listAdminSupportConversations,
+    {},
+    'admin-2',
+  );
+  check(
+    'an unmapped administrator does not discover the support conversation',
+    otherAdministratorInbox.conversationIds,
+    [],
+  );
+  await expectDenied(
+    'a tenant cannot list the administrator support inbox',
+    () => invoke(listAdminSupportConversations, {}, 'student-1'),
+    'permission-denied',
+  );
+
+  await db.collection('conversations').doc(sent.conversationId).update({
+    unreadCount: {
+      [adminIdentity]: 4,
+      'student-1': 3,
+    },
+  });
+  await expectDenied(
+    'an unmapped administrator cannot clear the support unread counter',
+    () =>
+      invoke(
+        markAdminSupportConversationRead,
+        { conversationId: sent.conversationId },
+        'admin-2',
+      ),
+    'permission-denied',
+  );
+  const readReceipt = await invoke(
+    markAdminSupportConversationRead,
+    { conversationId: sent.conversationId },
+    'admin-1',
+  );
+  check('the mapped administrator clears the support unread counter', readReceipt.success, true);
+  const clearedUnread = (
+    await db.collection('conversations').doc(sent.conversationId).get()
+  ).get('unreadCount');
+  check(
+    'the trusted read receipt clears only the opaque administrator key',
+    clearedUnread[adminIdentity],
+    0,
+  );
+  check(
+    'the trusted read receipt preserves the tenant unread counter',
+    clearedUnread['student-1'],
+    3,
   );
   const conversationOperationRead = await readDocumentAsClient({
     collection: ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
@@ -9644,7 +10569,10 @@ async function testLegacyAdminSupportPrivacyMigration() {
     collection: 'conversations',
     documentId: conversationId,
     uid: 'student-1',
-    claims: { phone_number: '+919876500001' },
+    claims: {
+      phone_number: '+919876500001',
+      stayServeVerifiedPhone: '+919876500001',
+    },
   });
   check(
     'a tenant cannot directly read a legacy raw-uid support conversation',
@@ -9655,12 +10583,34 @@ async function testLegacyAdminSupportPrivacyMigration() {
     collection: `conversations/${conversationId}/messages`,
     documentId: 'legacy-admin-message',
     uid: 'student-1',
-    claims: { phone_number: '+919876500001' },
+    claims: {
+      phone_number: '+919876500001',
+      stayServeVerifiedPhone: '+919876500001',
+    },
   });
   check(
     'a tenant cannot directly read a legacy raw-uid support message',
     legacyMessageRead.status >= 400,
     true,
+  );
+
+  const legacyAdministratorInbox = await invoke(
+    listAdminSupportConversations,
+    {},
+    'admin-1',
+  );
+  check(
+    'the administrator inbox discovers and migrates a legacy support conversation',
+    legacyAdministratorInbox.conversationIds,
+    [conversationId],
+  );
+  check(
+    'the migrated legacy conversation is mapped to the administrator',
+    (await db
+      .collection(ADMIN_SUPPORT_CONVERSATION_OPERATIONS)
+      .doc(conversationId)
+      .get()).get('adminUid'),
+    'admin-1',
   );
 
   const tenantDetails = await invoke(
@@ -9730,7 +10680,10 @@ async function testLegacyAdminSupportPrivacyMigration() {
     collection: 'conversations',
     documentId: conversationId,
     uid: 'student-1',
-    claims: { phone_number: '+919876500001' },
+    claims: {
+      phone_number: '+919876500001',
+      stayServeVerifiedPhone: '+919876500001',
+    },
   });
   check(
     'the tenant can read the migrated opaque support conversation',
@@ -9746,7 +10699,10 @@ async function testLegacyAdminSupportPrivacyMigration() {
     collection: `conversations/${conversationId}/messages`,
     documentId: 'legacy-admin-message',
     uid: 'student-1',
-    claims: { phone_number: '+919876500001' },
+    claims: {
+      phone_number: '+919876500001',
+      stayServeVerifiedPhone: '+919876500001',
+    },
   });
   check(
     'the tenant can read the migrated opaque support messages',
@@ -9782,12 +10738,22 @@ async function testReviewAndAdminMessagingEnforceLiveVerifiedPhone() {
     emailVerified: false,
     // The administrator is exempt from the tenant phone policy. The student
     // still has a stale Firestore grant, but Firebase Auth no longer has the
-    // phone provider. The owner has a live phone.
+    // phone provider. The owner has a live phone with a server-issued proof.
     phoneNumber:
       uid === 'admin-1' || uid === 'student-1'
         ? null
         : '+919876500001',
-    providerData: [{ providerId: 'password' }],
+    customClaims:
+      uid === 'owner-1'
+        ? { stayServeVerifiedPhone: '+919876500001' }
+        : {},
+    providerData:
+      uid === 'owner-1'
+        ? [
+            { providerId: 'password' },
+            { providerId: 'phone', phoneNumber: '+919876500001' },
+          ]
+        : [{ providerId: 'password' }],
   });
 
   try {
@@ -10405,6 +11371,11 @@ async function testUserProfileBootstrapRepairsMalformedFcmDocument() {
   check(
     'the repaired profile has the live phone verification state',
     profile.get('phoneVerified'),
+    false,
+  );
+  check(
+    'a linked phone without a server proof is not marked verified',
+    profile.get('phoneVerifiedAt') == null,
     true,
   );
   check('the repaired profile has the live providers', profile.get('authProviders'), [
@@ -10439,6 +11410,36 @@ async function testUserProfileBootstrapRepairsMalformedFcmDocument() {
     providerData: [{ providerId: 'google.com' }, { providerId: 'phone' }],
   });
   check('a trigger retry preserves the complete profile', retryResult, 'preserved');
+
+  // A profile which was repaired after the account already completed the
+  // phone challenge keeps its verified state: the server-issued proof is
+  // read from the signed claim (or the durable proof document).
+  await ensureUserProfile({
+    uid: 'proven-bootstrap-user',
+    displayName: 'Proven Bootstrap User',
+    email: 'proven-bootstrap@example.test',
+    emailVerified: true,
+    phoneNumber: '+919876500002',
+    customClaims: { stayServeVerifiedPhone: '+919876500002' },
+    providerData: [
+      { providerId: 'google.com' },
+      { providerId: 'phone', phoneNumber: '+919876500002' },
+    ],
+  });
+  const provenProfile = await db
+    .collection('users')
+    .doc('proven-bootstrap-user')
+    .get();
+  check(
+    'a repaired profile keeps a proven phone verified',
+    provenProfile.get('phoneVerified'),
+    true,
+  );
+  check(
+    'a repaired profile records when the phone was verified',
+    provenProfile.get('phoneVerifiedAt') !== undefined,
+    true,
+  );
 
   const forgedAdminRef = db.collection('users').doc('forged-admin');
   await forgedAdminRef.set({
@@ -10605,6 +11606,10 @@ async function main() {
   await testAuthProfileSyncAndEmailLink();
   await testConcurrentEmailLinksAreSerialized();
   await testIncompleteRegistrationRollback();
+  await testSupportRepliesUseTheTrustedRoute();
+  await testLegacyAdminUnreadCounterSurvivesTheConversion();
+  await testSupportReplyNotificationDeliveryIsRetryable();
+  await testDraftListingsArePublishedByTheServer();
   await testAdminMessagingAndReviewDeletion();
   await testLegacyAdminSupportPrivacyMigration();
   await testReviewAndAdminMessagingEnforceLiveVerifiedPhone();

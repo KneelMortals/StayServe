@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -14,31 +16,63 @@ import '../../../models/room_model.dart';
 import '../../../models/room_private_location.dart';
 import '../auth/auth_service.dart';
 import '../functions/functions_service.dart';
-import '../storage/storage_service.dart';
-import 'room_image_reconciliation.dart';
 
 final ownerRepositoryProvider = Provider<OwnerRepository>((ref) {
   return OwnerRepository(
     firestore: ref.watch(firestoreProvider),
     auth: ref.watch(firebaseAuthProvider),
     functions: ref.watch(functionsServiceProvider),
-    storage: ref.watch(storageServiceProvider),
   );
 });
 
-/// The files uploaded for one room edit.
+/// The files staged for one room edit.
 ///
-/// The object paths are tracked in addition to the download URLs because an
-/// upload can succeed while fetching its download URL fails. In that case
-/// there is no URL to delete, but the object path is still known.
+/// The upload ids are the durable server-side handles. A staged object is
+/// attached to the listing only by the server's commit callable; if the
+/// edit fails, the same handle tells the server which unreferenced object
+/// may be removed.
 class _RoomImageUpload {
+  final List<String> uploadIds;
   final List<String> newlyUploadedUrls;
-  final List<String> newlyUploadedPaths;
 
   const _RoomImageUpload({
+    required this.uploadIds,
     required this.newlyUploadedUrls,
-    required this.newlyUploadedPaths,
   });
+}
+
+/// One room-create attempt which may still need to be reconciled.
+///
+/// The room id is retained after an ambiguous Firestore acknowledgement so a
+/// retry updates the same listing instead of publishing a duplicate.
+///
+/// The upload ids of the staged photos are retained as well. The server
+/// returns the same download URL for an upload id it already knows, so a
+/// retry commits the **same** photo objects instead of uploading the same
+/// bytes under a second URL. The committed photo list therefore cannot
+/// contain the same photo twice.
+class _PendingRoomCreation {
+  final String roomId;
+
+  /// The upload ids which this attempt already staged.
+  final List<String> uploadIds;
+
+  const _PendingRoomCreation(this.roomId, {this.uploadIds = const <String>[]});
+}
+
+/// The result of reading the room document after an ambiguous write.
+enum _RoomCreationState { absent, matching, mismatched, unknown }
+
+/// The result of reading the live publication state of a listing.
+enum _PublicationState {
+  /// The listing is live — the publication committed on the server.
+  published,
+
+  /// The listing is still a draft — the publication did not commit.
+  notPublished,
+
+  /// The live state could not be read.
+  unknown,
 }
 
 /// Reads a room-photo list without trusting its Firestore shape.
@@ -54,12 +88,49 @@ List<String> _safeImageUrls(dynamic value) {
   return urls;
 }
 
+/// A stable key for one form submission.
+///
+/// The form recreates its [RoomDraft] after every tap, including new
+/// timestamps. The retry key therefore uses only the submitted listing data
+/// and the selected photo names, not those transient timestamps.
+String _roomCreationFingerprint(RoomDraft draft) {
+  final room = draft.room;
+  final location = draft.privateLocation;
+  return jsonEncode(<String, dynamic>{
+    'title': room.title.trim(),
+    'description': room.description.trim(),
+    'monthlyRent': room.monthlyRent,
+    'securityDeposit': room.securityDeposit,
+    'city': room.location.city.trim(),
+    'state': room.location.state.trim(),
+    'roomType': room.roomType.name,
+    'furnishing': room.furnishing.name,
+    'availableFrom': room.availableFrom.toUtc().toIso8601String(),
+    'amenities': room.amenities,
+    'occupancy': room.occupancy,
+    'genderPreference': room.genderPreference.name,
+    'address': location.address.trim(),
+    'locationCity': location.city.trim(),
+    'locationState': location.state.trim(),
+    'pincode': location.pincode.trim(),
+    // The home groups the listing in the owner's list. It is persisted with
+    // the listing, so it has to be part of the attempt key: a retry which
+    // only changes the selected home must not be folded into the earlier
+    // attempt, which would keep the previous home on the listing.
+    'homeId': room.homeId,
+    'homeName': room.homeName,
+    'newImages': draft.newImages.map((image) => image.name).toList(),
+    'originalImages': draft.originalImageUrls,
+  });
+}
+
 /// Data access for the room owner side of the app.
 class OwnerRepository {
   final FirebaseFirestore _firestore;
   final FirebaseAuth _auth;
   final FunctionsService _functions;
-  final StorageService _storage;
+  final Map<String, _PendingRoomCreation> _pendingRoomCreations =
+      <String, _PendingRoomCreation>{};
 
   static const Uuid _uuid = Uuid();
 
@@ -67,7 +138,6 @@ class OwnerRepository {
     required this._firestore,
     required this._auth,
     required this._functions,
-    required this._storage,
   });
 
   String? get _uid => _auth.currentUser?.uid;
@@ -201,6 +271,20 @@ class OwnerRepository {
     );
   }
 
+  /// Publishes a finished draft listing.
+  ///
+  /// The server owns the publication: it verifies that the listing belongs
+  /// to the caller, that its private exact location exists and that every
+  /// staged photo was committed. Only then does the listing become visible
+  /// to students.
+  Future<void> _publishRoomListing(String roomId) async {
+    await _functions.callVoidFunction(
+      'publishRoomListing',
+      parameters: {'roomId': roomId},
+      fallbackMessage: 'Could not publish the listing',
+    );
+  }
+
   RoomPrivateLocation _draftPrivateLocation(
     RoomDraft draft, {
     required String roomId,
@@ -241,39 +325,95 @@ class OwnerRepository {
       throw Exception('The monthly rent must be between ₹1,000 and ₹10,00,000');
     }
 
-    final roomId = 'RM-${_uuid.v4()}';
+    final attemptKey = '$uid:${_roomCreationFingerprint(draft)}';
+    final pendingCreation = _pendingRoomCreations[attemptKey];
+    var roomId = pendingCreation?.roomId ?? 'RM-${_uuid.v4()}';
+    var reuseExistingRoom = false;
+    var reuseUploadIds = const <String>[];
 
-    final upload = await _uploadImages(roomId, draft);
-    final imageUrls = upload.newlyUploadedUrls;
+    if (pendingCreation != null) {
+      final existingState = await _reconcileRoomCreation(roomId, uid);
+      if (existingState == _RoomCreationState.matching ||
+          existingState == _RoomCreationState.unknown) {
+        // The previous acknowledgement was ambiguous. Never overwrite this
+        // room id: a retry must reconcile and complete the same listing.
+        reuseExistingRoom = true;
+        // The photos of the earlier attempt are staged under known upload
+        // ids. Re-using them keeps the committed photo list free of
+        // duplicates.
+        reuseUploadIds = pendingCreation.uploadIds;
+      } else if (existingState == _RoomCreationState.mismatched) {
+        // The id no longer belongs to this owner. It cannot be reused safely.
+        _pendingRoomCreations.remove(attemptKey);
+        roomId = 'RM-${_uuid.v4()}';
+      }
+    }
+    _pendingRoomCreations[attemptKey] = _PendingRoomCreation(roomId);
 
+    final roomRef = _firestore.collection('rooms').doc(roomId);
     final document = draft.room.copyWith(
       roomId: roomId,
       ownerId: uid,
-      images: imageUrls,
+      // Room photos are server-owned. The listing starts empty and the
+      // server commit callable attaches only objects which it uploaded to
+      // the exact owner/room path in the trusted bucket.
+      images: const <String>[],
       createdAt: draft.room.createdAt,
       updatedAt: DateTime.now(),
-      // A new listing always starts on the market and without any tenants.
-      // Both fields are server-owned from the moment the listing exists
-      // (the Firestore rules accept only these initial values), so they are
-      // stated here instead of being left out — a listing without a status
-      // is invisible to the student search, because a Firestore equality
-      // query never matches a document that does not have the field.
-      status: RoomStatus.available,
+      // A new listing never has tenants. The counter is server-owned from
+      // the moment the listing exists.
       currentOccupancy: 0,
     );
 
+    // The listing is created as a **draft**. It is not offered to students
+    // and it cannot be booked while its photos and its private exact
+    // location are still missing. The status is server-owned: the client may
+    // not publish the listing by itself, and a listing without a status is
+    // invisible to the student search anyway, because a Firestore equality
+    // query never matches a document that does not have the field.
+    final createPayload = document.toCreateJson()..['status'] = 'draft';
+
+    var upload = const _RoomImageUpload(
+      uploadIds: <String>[],
+      newlyUploadedUrls: <String>[],
+    );
     var listingRemoved = false;
+    // The publication state of the listing. It stays `notPublished` while the
+    // publication was never attempted, and it becomes `unknown` when the live
+    // state could not be read. An unknown or a committed publication must
+    // never lead to a deletion of the listing.
+    var publicationState = _PublicationState.notPublished;
     try {
-      // The public document starts with coarse locality data only. The
-      // owner-only callable then stores the exact location privately and,
-      // during the compatibility stage, keeps the legacy public fields in
-      // the same transaction.
-      await _firestore
-          .collection('rooms')
-          .doc(roomId)
-          .set(document.toCreateJson());
+      if (!reuseExistingRoom) {
+        try {
+          await roomRef.set(createPayload);
+        } catch (error) {
+          // A Firestore error does not prove that the create failed. Re-read
+          // the exact room document and verify both identity fields before
+          // deciding that this attempt did not commit.
+          final state = await _reconcileRoomCreation(roomId, uid);
+          if (state != _RoomCreationState.matching) rethrow;
+        }
+      }
+
+      upload = await _stageImages(
+        roomId,
+        draft,
+        reuseUploadIds: reuseUploadIds,
+      );
+      // The upload ids are retained so a retry of this attempt stages the
+      // same photo objects instead of uploading the same bytes a second time.
+      _pendingRoomCreations[attemptKey] = _PendingRoomCreation(
+        roomId,
+        uploadIds: upload.uploadIds,
+      );
+      await _commitRoomPhotoChanges(roomId, draft, upload);
 
       try {
+        // The public document starts with coarse locality data only. The
+        // owner-only callable then stores the exact location privately and,
+        // during the compatibility stage, keeps the legacy public fields in
+        // the same transaction.
         await _writePrivateLocation(
           roomId,
           _draftPrivateLocation(draft, roomId: roomId, ownerId: uid),
@@ -282,33 +422,66 @@ class OwnerRepository {
         // A listing without its private counterpart is not a complete
         // listing. Remove it through the server so the photos and the
         // request history are cleaned up consistently.
-        try {
-          await _functions.callVoidFunction(
-            'deleteRoomListing',
-            parameters: {'roomId': roomId},
-            fallbackMessage: 'Could not remove the incomplete listing',
-          );
-          listingRemoved = true;
-        } catch (_) {
-          await _rollbackNewUploadsIfUnreferenced(
-            _firestore.collection('rooms').doc(roomId),
-            upload,
-          );
-        }
+        listingRemoved = await _deleteRoomListingBestEffort(roomId);
         rethrow;
       }
+
+      try {
+        // The listing is complete now. The server publishes it; only then is
+        // it offered to students and only then can it be booked.
+        await _publishRoomListing(roomId);
+      } catch (error) {
+        // A lost acknowledgement does not prove that the publication failed.
+        // The live listing decides: a published listing is complete and must
+        // never be removed by a failed retry.
+        publicationState = await _readPublicationState(roomId, uid);
+        if (publicationState == _PublicationState.notPublished) {
+          // The publication really did not commit. The listing stays
+          // invisible to students and is removed through the server so the
+          // photos and the request history are cleaned up consistently.
+          listingRemoved = await _deleteRoomListingBestEffort(roomId);
+          rethrow;
+        }
+        if (publicationState == _PublicationState.unknown) {
+          // The live state is unknown. The listing keeps its draft state, so
+          // it is invisible to students and it is not removed on a guess.
+          rethrow;
+        }
+        // The publication committed: the listing is complete.
+        publicationState = _PublicationState.published;
+      }
     } catch (error) {
-      // A network failure does not prove that the write was not committed.
-      // Reconcile with the room document before deleting an uploaded object:
-      // a committed listing must never be left pointing at deleted photos.
-      if (!listingRemoved) {
-        await _rollbackNewUploadsIfUnreferenced(
-          _firestore.collection('rooms').doc(roomId),
-          upload,
-        );
+      // A lost acknowledgement does not prove that the server commit failed.
+      // The server-side discard operation checks the live listing before it
+      // removes anything, so a committed photo is never deleted by a retry.
+      await _discardUploadsBestEffort(roomId, upload.uploadIds);
+
+      // Roll back only a listing whose owner and room identity were
+      // confirmed. An ambiguous read leaves the pending room id in place so
+      // the next form submission reconciles the same listing.
+      //
+      // A listing whose publication is unknown or committed is never removed:
+      // the server may already have published it, and a published listing is
+      // complete. The live status is checked as well, so a listing which was
+      // published by another device in the meantime stays as it is.
+      final roomState = await _reconcileRoomCreation(roomId, uid);
+      final publicationUncertain =
+          publicationState == _PublicationState.unknown ||
+          publicationState == _PublicationState.published;
+      if (!listingRemoved &&
+          !publicationUncertain &&
+          roomState == _RoomCreationState.matching &&
+          await _roomIsUnpublishedAndEmpty(roomId, uid)) {
+        listingRemoved = await _deleteRoomListingBestEffort(roomId);
+      }
+      if (listingRemoved ||
+          roomState == _RoomCreationState.absent ||
+          roomState == _RoomCreationState.mismatched) {
+        _pendingRoomCreations.remove(attemptKey);
       }
       rethrow;
     }
+    _pendingRoomCreations.remove(attemptKey);
     return roomId;
   }
 
@@ -318,23 +491,39 @@ class OwnerRepository {
     if (uid == null) throw Exception('User not logged in');
 
     final roomRef = _firestore.collection('rooms').doc(draft.room.roomId);
-    final upload = await _uploadImages(draft.room.roomId, draft);
+
+    // The live listing is validated **before** anything is committed.
+    //
+    // A rejected edit — for example a capacity below the number of people
+    // who already live in the room — must not leave a new location or new
+    // photos behind. The server-side location write and the photo commit are
+    // separate, durable operations, so a failure between them cannot be
+    // rolled back completely; the cheap validation therefore runs first.
+    final currentOccupancy = await _readLiveOccupancy(roomRef, uid);
+    _assertOwnerEditIsValid(draft, currentOccupancy);
+
+    final upload = await _stageImages(draft.room.roomId, draft);
     final document = draft.room.copyWith(updatedAt: DateTime.now());
 
     try {
-      // The exact location is written first. The server stores it privately
-      // and updates the public compatibility fields in the same transaction,
-      // so a failed photo/listing update can never split the address across
-      // two different values.
-      await _writePrivateLocation(
-        draft.room.roomId,
-        _draftPrivateLocation(draft, roomId: draft.room.roomId, ownerId: uid),
-      );
-
-      // The image list and the other owner-editable fields are committed in
-      // one transaction. The transaction re-reads the live room, so a photo
-      // added by another device while this form was open is preserved and a
-      // photo which another edit already removed is never restored.
+      // The owner-editable fields are committed in one transaction, and the
+      // capacity is validated **inside** that same transaction.
+      //
+      // The tenant counter is server-owned: it is raised by the booking
+      // activation and lowered by the rollback. The capacity therefore may
+      // never be smaller than the number of people who already live there.
+      // The booking activation reads the same document in its own
+      // transaction and refuses to overbook a listing, so the two
+      // transactions serialise: either this edit lowers the capacity first
+      // and the activation sees the new capacity, or the activation raises
+      // the counter first and this transaction sees the new counter.
+      //
+      // This transaction is therefore the **first** write of the edit. A
+      // rejected edit never reaches the location write or the photo commit,
+      // so it cannot leave a new address or new photos behind.
+      //
+      // The image list is deliberately omitted: it is server-owned, so this
+      // write cannot restore a stale photo or forge a download URL.
       await _firestore.runTransaction((transaction) async {
         final snapshot = await transaction.get(roomRef);
         if (!snapshot.exists) throw Exception('Room not found');
@@ -344,52 +533,31 @@ class OwnerRepository {
           throw Exception('You can only edit your own listings');
         }
 
-        // The tenant counter is server-owned: it is raised by the booking
-        // activation and lowered by the rollback. The capacity therefore may
-        // never be smaller than the number of people who already live there.
-        final currentOccupancy =
-            (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
-        if (draft.room.occupancy < 1 || draft.room.occupancy > 20) {
-          throw Exception(
-            'The number of people who can live in the room must be between 1 and 20',
-          );
-        }
-        if (!draft.room.monthlyRent.isFinite ||
-            draft.room.monthlyRent < 1000 ||
-            draft.room.monthlyRent > 1000000) {
-          throw Exception(
-            'The monthly rent must be between ₹1,000 and ₹10,00,000',
-          );
-        }
-        if (draft.room.occupancy < currentOccupancy) {
-          throw Exception(
-            'This room already has $currentOccupancy '
-            '${currentOccupancy == 1 ? 'person' : 'people'} living in it, so '
-            'the capacity cannot be lower than $currentOccupancy.',
-          );
-        }
+        final liveOccupancy = (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
+        _assertOwnerEditIsValid(draft, liveOccupancy);
 
-        final result = reconcileRoomImages(
-          currentImages: _safeImageUrls(data?['images']),
-          originalImages: draft.originalImageUrls,
-          draftImages: draft.room.images,
-          uploadedImages: upload.newlyUploadedUrls,
-        );
-        if (result.images.length > AppConstants.maxImagesPerRoom) {
-          throw Exception(
-            'A room can have at most '
-            '${AppConstants.maxImagesPerRoom} photos.',
-          );
-        }
-
-        final payload = document.toOwnerUpdateJson()
-          ..['images'] = result.images;
+        final payload = document.toOwnerUpdateJson()..remove('images');
         transaction.update(roomRef, payload);
       });
+
+      // The exact location is written next. The server stores it privately
+      // and updates the public compatibility fields in the same transaction,
+      // so the address can never split across two different values.
+      await _writePrivateLocation(
+        draft.room.roomId,
+        _draftPrivateLocation(draft, roomId: draft.room.roomId, ownerId: uid),
+      );
+
+      // Photo additions and removals are committed by the server. It reads
+      // the live listing, so a photo added by another device while this form
+      // was open is preserved. Only URLs which this form explicitly removed
+      // are taken out of the list.
+      await _commitRoomPhotoChanges(draft.room.roomId, draft, upload);
     } catch (error) {
-      // The acknowledgement may have been lost after Firestore committed the
-      // transaction. Reconcile before deleting any newly uploaded object.
-      await _rollbackNewUploadsIfUnreferenced(roomRef, upload);
+      // The acknowledgement may have been lost after the server committed the
+      // photo change. The server-side discard operation checks the live
+      // listing before it removes anything.
+      await _discardUploadsBestEffort(draft.room.roomId, upload.uploadIds);
       rethrow;
     }
 
@@ -400,20 +568,77 @@ class OwnerRepository {
     // a newer edit still references.
   }
 
-  /// Uploads the newly picked photos and returns the complete photo list.
+  /// The number of people who live in the listing right now.
   ///
-  /// The photos are stored under `rooms/{ownerUid}/{roomId}/…`. The uid of
-  /// the owner is part of the path on purpose: the Firebase Storage rules
-  /// check it, so a signed-in user can only ever write below their own
-  /// folder — nobody can upload into the folder of another owner.
-  Future<_RoomImageUpload> _uploadImages(String roomId, RoomDraft draft) async {
-    final newlyUploadedUrls = <String>[];
-    final newlyUploadedPaths = <String>[];
-    final uid = _uid;
-    if (uid == null) throw Exception('User not logged in');
+  /// The read is the pre-flight check of an owner edit. It fails closed: a
+  /// listing which cannot be read is not edited, because its current
+  /// occupancy is unknown.
+  Future<int> _readLiveOccupancy(
+    DocumentReference<Map<String, dynamic>> roomRef,
+    String ownerId,
+  ) async {
+    final snapshot = await roomRef.get();
+    if (!snapshot.exists) throw Exception('Room not found');
+    final data = snapshot.data();
+    if (data?['ownerId'] != ownerId) {
+      throw Exception('You can only edit your own listings');
+    }
+    return (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
+  }
+
+  /// The owner-editable limits of one listing.
+  ///
+  /// The same limits are enforced by the Firestore rules and by the server.
+  /// They are checked here before any side effect, so a rejected edit never
+  /// changes the location or the photos of the listing.
+  void _assertOwnerEditIsValid(RoomDraft draft, int currentOccupancy) {
+    if (draft.room.occupancy < 1 || draft.room.occupancy > 20) {
+      throw Exception(
+        'The number of people who can live in the room must be between 1 and 20',
+      );
+    }
+    if (!draft.room.monthlyRent.isFinite ||
+        draft.room.monthlyRent < 1000 ||
+        draft.room.monthlyRent > 1000000) {
+      throw Exception('The monthly rent must be between ₹1,000 and ₹10,00,000');
+    }
+    if (draft.room.occupancy < currentOccupancy) {
+      throw Exception(
+        'This room already has $currentOccupancy '
+        '${currentOccupancy == 1 ? 'person' : 'people'} living in it, so '
+        'the capacity cannot be lower than $currentOccupancy.',
+      );
+    }
+  }
+
+  /// Stages the newly picked photos with the server.
+  ///
+  /// The bytes are sent to a callable which verifies the live owner, the live
+  /// listing, the image signature and the upload quota. The Admin SDK then
+  /// writes the object below `rooms/{ownerUid}/{roomId}/…` in the trusted
+  /// bucket. The client never receives a Storage write capability.
+  ///
+  /// [reuseUploadIds] carries the upload ids of an earlier attempt of the
+  /// same listing. The server knows those ids already and returns the same
+  /// download URLs, so a retry commits the same photo objects instead of
+  /// uploading the same bytes a second time under a fresh URL. The committed
+  /// photo list therefore never shows the same photo twice.
+  Future<_RoomImageUpload> _stageImages(
+    String roomId,
+    RoomDraft draft, {
+    List<String> reuseUploadIds = const <String>[],
+  }) async {
+    final uploadIds = <String>[];
+    final uploadedUrls = <String>[];
+    // The ids are only re-used when the earlier attempt staged exactly the
+    // same number of photos. A different photo list gets fresh ids.
+    final reusableIds = reuseUploadIds.length == draft.newImages.length
+        ? reuseUploadIds
+        : const <String>[];
 
     try {
-      for (final image in draft.newImages) {
+      for (var index = 0; index < draft.newImages.length; index += 1) {
+        final image = draft.newImages[index];
         final bytes = await _readBytes(image);
         if (bytes == null) {
           throw Exception('Could not read one of the selected room photos.');
@@ -431,86 +656,251 @@ class OwnerRepository {
           );
         }
 
-        final fileName =
-            '${DateTime.now().millisecondsSinceEpoch}'
-            '_${_uuid.v4().substring(0, 8)}.jpg';
-        final objectPath = 'rooms/$uid/$roomId/$fileName';
-
-        // Track the path before starting the upload. The object may be
-        // created even when fetching its download URL fails afterwards.
-        newlyUploadedPaths.add(objectPath);
-        final url = await _storage.uploadImage(
-          path: 'rooms/$uid/$roomId',
-          fileName: fileName,
-          bytes: bytes,
+        final uploadId = index < reusableIds.length
+            ? reusableIds[index]
+            : _uuid.v4();
+        // Track the id before the request. The server may have accepted the
+        // object even when its acknowledgement was lost.
+        uploadIds.add(uploadId);
+        final result = await _functions.callFunction(
+          'stageRoomPhoto',
+          parameters: {
+            'roomId': roomId,
+            'uploadId': uploadId,
+            'data': base64Encode(bytes),
+            // These are advisory replacement hints. The server uses them
+            // only to reserve a photo slot; the commit still recalculates
+            // the authoritative final image list.
+            'removeUrls': _plannedRemovalUrls(draft),
+          },
         );
-        newlyUploadedUrls.add(url);
+        final raw = result.data;
+        if (raw is! Map) {
+          throw Exception('The room-photo upload response was invalid.');
+        }
+        final data = Map<String, dynamic>.from(raw);
+        final returnedUploadId = data['uploadId']?.toString().trim() ?? '';
+        final url = data['url']?.toString().trim() ?? '';
+        if (returnedUploadId.isEmpty || url.isEmpty) {
+          throw Exception('The room-photo upload response was incomplete.');
+        }
+        if (returnedUploadId != uploadId) {
+          uploadIds.add(returnedUploadId);
+        }
+        uploadedUrls.add(url);
       }
     } catch (error) {
-      // A later upload may fail after earlier files were uploaded. Roll the
-      // partial upload back so the room never keeps orphaned objects.
-      await _deletePathsBestEffort(newlyUploadedPaths);
+      // A later upload may fail after earlier files were staged. The server
+      // removes only objects which the live listing does not reference.
+      await _discardUploadsBestEffort(roomId, uploadIds);
       AppLogger.warning('Could not upload a room photo', error: error);
       rethrow;
     }
 
     return _RoomImageUpload(
-      newlyUploadedUrls: newlyUploadedUrls,
-      newlyUploadedPaths: newlyUploadedPaths,
+      uploadIds: uploadIds,
+      newlyUploadedUrls: uploadedUrls,
     );
   }
 
-  /// Deletes uploaded objects by their known Storage paths.
-  Future<void> _deletePathsBestEffort(List<String> paths) async {
-    if (paths.isEmpty) return;
-    final failed = await _storage.deleteFilesAtPaths(paths);
-    if (failed.isNotEmpty) {
+  /// The photos which this form explicitly removed when it was opened.
+  ///
+  /// The difference is computed against the form's original image snapshot,
+  /// so a concurrent edit cannot restore an image which another device already
+  /// removed and cannot remove an image which this form never displayed.
+  List<String> _plannedRemovalUrls(RoomDraft draft) {
+    final retained = _safeImageUrls(draft.room.images).toSet();
+    return _safeImageUrls(
+      draft.originalImageUrls,
+    ).where((url) => !retained.contains(url)).toList(growable: false);
+  }
+
+  /// Commits staged additions and this form's explicit removals.
+  ///
+  /// The same commit id is used for the retry. A lost acknowledgement is
+  /// therefore idempotent on the server and can never append a duplicate
+  /// photo.
+  Future<void> _commitRoomPhotoChanges(
+    String roomId,
+    RoomDraft draft,
+    _RoomImageUpload upload,
+  ) async {
+    final removedUrls = _plannedRemovalUrls(draft);
+    if (upload.uploadIds.isEmpty && removedUrls.isEmpty) return;
+
+    final commitId = _uuid.v4();
+    final parameters = <String, dynamic>{
+      'roomId': roomId,
+      'commitId': commitId,
+      'uploadIds': upload.uploadIds,
+      'removeUrls': removedUrls,
+    };
+
+    Object? lastError;
+    for (var attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await _functions.callFunction(
+          'commitRoomPhotoChanges',
+          parameters: parameters,
+        );
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    // If both acknowledgements were lost, the live listing is the authority.
+    // A commit which reached the server must not be mistaken for a failure
+    // and cleaned up by the caller.
+    final committed = await _photoChangesAreCommitted(
+      roomId,
+      upload.newlyUploadedUrls,
+      removedUrls,
+    );
+    if (committed) return;
+    throw lastError ?? Exception('Could not save the room photos.');
+  }
+
+  /// Whether the live listing already has the requested photo state.
+  Future<bool> _photoChangesAreCommitted(
+    String roomId,
+    List<String> uploadedUrls,
+    List<String> removedUrls,
+  ) async {
+    try {
+      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
+      if (!snapshot.exists) return false;
+      final images = _safeImageUrls(snapshot.data()?['images']).toSet();
+      final additionsPresent = uploadedUrls.every(images.contains);
+      final removalsAbsent = removedUrls.every((url) => !images.contains(url));
+      return additionsPresent && removalsAbsent;
+    } catch (error) {
       AppLogger.warning(
-        'Could not delete ${failed.length} uploaded room photo object(s)',
-        error: failed,
+        'Could not reconcile the committed room-photo change',
+        error: error,
       );
+      return false;
     }
   }
 
-  /// Removes newly uploaded objects only when the room does not reference
-  /// them.
-  ///
-  /// A failed Firestore acknowledgement is ambiguous: the write may have been
-  /// committed even though the client saw an error. Deleting the files in
-  /// that case would leave a committed listing pointing at missing photos.
-  /// When the follow-up read itself fails, the objects are kept because a
-  /// missing photo is worse than a temporarily unreferenced object.
-  Future<void> _rollbackNewUploadsIfUnreferenced(
-    DocumentReference<Map<String, dynamic>> roomRef,
-    _RoomImageUpload upload,
+  /// Asks the server to remove staged objects which were never referenced.
+  Future<void> _discardUploadsBestEffort(
+    String roomId,
+    List<String> uploadIds,
   ) async {
-    if (upload.newlyUploadedPaths.isEmpty) return;
-
-    final Set<String> referencedUrls;
-    try {
-      final snapshot = await roomRef.get();
-      final currentImages = snapshot.exists
-          ? _safeImageUrls(snapshot.data()?['images'])
-          : const <String>[];
-      referencedUrls = currentImages.toSet();
-    } catch (error) {
-      AppLogger.warning(
-        'Could not verify a failed room edit; uploaded photos were kept',
-        error: error,
-      );
-      return;
-    }
-
-    final unreferencedPaths = <String>[];
-    for (var index = 0; index < upload.newlyUploadedPaths.length; index++) {
-      final url = index < upload.newlyUploadedUrls.length
-          ? upload.newlyUploadedUrls[index]
-          : null;
-      if (url == null || !referencedUrls.contains(url)) {
-        unreferencedPaths.add(upload.newlyUploadedPaths[index]);
+    for (final uploadId in uploadIds.toSet()) {
+      try {
+        await _functions.callVoidFunction(
+          'discardRoomPhotoUpload',
+          parameters: {'roomId': roomId, 'uploadId': uploadId},
+          fallbackMessage: 'Could not remove an unused room photo',
+        );
+      } catch (error) {
+        AppLogger.warning(
+          'Could not discard an unused room-photo upload',
+          error: error,
+        );
       }
     }
-    await _deletePathsBestEffort(unreferencedPaths);
+  }
+
+  /// Removes an incomplete listing through the server-owned deletion path.
+  Future<bool> _deleteRoomListingBestEffort(String roomId) async {
+    try {
+      await _functions.callVoidFunction(
+        'deleteRoomListing',
+        parameters: {'roomId': roomId},
+        fallbackMessage: 'Could not remove the incomplete listing',
+      );
+      return true;
+    } catch (error) {
+      AppLogger.warning(
+        'Could not remove an incomplete room listing',
+        error: error,
+      );
+      return false;
+    }
+  }
+
+  /// Reconciles one ambiguous room-create acknowledgement.
+  ///
+  /// The document id alone is not proof that this owner created the room:
+  /// both the stored owner id and the stored room id must match the attempt.
+  Future<_RoomCreationState> _reconcileRoomCreation(
+    String roomId,
+    String ownerId,
+  ) async {
+    try {
+      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
+      if (!snapshot.exists) return _RoomCreationState.absent;
+      final data = snapshot.data();
+      if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
+        return _RoomCreationState.mismatched;
+      }
+      return _RoomCreationState.matching;
+    } catch (error) {
+      AppLogger.warning(
+        'Could not reconcile the room-create acknowledgement',
+        error: error,
+      );
+      return _RoomCreationState.unknown;
+    }
+  }
+
+  /// Whether the live listing is confirmed to be an unpublished draft which
+  /// carries no committed photo.
+  ///
+  /// A listing whose publication state is unknown must never be removed: the
+  /// server may already have published it. A published listing is complete
+  /// and stays, so the live status is checked here as well.
+  Future<bool> _roomIsUnpublishedAndEmpty(String roomId, String ownerId) async {
+    try {
+      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
+      if (!snapshot.exists) return true;
+      final data = snapshot.data();
+      if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
+        return false;
+      }
+      if (data?['status'] == 'available') {
+        // The server published this listing. It is complete and must stay.
+        return false;
+      }
+      return _safeImageUrls(data?['images']).isEmpty;
+    } catch (error) {
+      AppLogger.warning(
+        'Could not verify the incomplete room listing',
+        error: error,
+      );
+      return false;
+    }
+  }
+
+  /// Reads the live publication state of one listing.
+  ///
+  /// The read is the reconciliation of an ambiguous `publishRoomListing`
+  /// acknowledgement. It fails closed: a listing which cannot be read is
+  /// reported as unknown, and an unknown state never removes a listing.
+  Future<_PublicationState> _readPublicationState(
+    String roomId,
+    String ownerId,
+  ) async {
+    try {
+      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
+      if (!snapshot.exists) return _PublicationState.notPublished;
+      final data = snapshot.data();
+      if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
+        return _PublicationState.notPublished;
+      }
+      return data?['status'] == 'available'
+          ? _PublicationState.published
+          : _PublicationState.notPublished;
+    } catch (error) {
+      AppLogger.warning(
+        'Could not reconcile the listing publication',
+        error: error,
+      );
+      return _PublicationState.unknown;
+    }
   }
 
   /// Reads the bytes of a picked image.

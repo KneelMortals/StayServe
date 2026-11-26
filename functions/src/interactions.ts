@@ -280,7 +280,7 @@ function adminSupportOperationMatches(
  * fences message writes, scrubs the old messages and then publishes the
  * opaque identity in one final parent update.
  */
-async function migrateLegacyAdminSupportConversation(
+export async function migrateLegacyAdminSupportConversation(
   conversationRef: firestore.DocumentReference,
   conversationId: string,
 ): Promise<void> {

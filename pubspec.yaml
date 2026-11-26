@@ -21,20 +21,20 @@ dependencies:
   firebase_core: ^3.4.0
   firebase_auth: ^5.1.0
   cloud_firestore: ^5.2.0
-  firebase_storage: ^12.1.0
   firebase_messaging: ^15.0.0
-  # Pinned below 5.6.0 / 5.5.0 on purpose: from 5.6.0 (cloud_functions) and
-  # 5.5.0 (firebase_remote_config) onwards these plugins apply the Kotlin
-  # Gradle Plugin themselves, which Flutter rejects:
+  # These releases are pinned together with Firebase Core 3.15.2 so every
+  # FlutterFire Apple package requests the same Swift package:
+  # `3.15.2-firebase-core-swift`. The previous cloud_functions 5.5.2 and
+  # firebase_remote_config 5.4.7 manifests requested 3.14.0 and 3.15.1
+  # respectively, which made Xcode's Swift package resolver reject the app.
   #
-  #   WARNING: Your app uses the following plugins that apply Kotlin Gradle
-  #   Plugin (KGP): cloud_functions, firebase_remote_config
-  #   Future versions of Flutter will fail to build ...
-  #
-  # 5.5.2 / 5.4.7 are the newest releases that do **not** apply KGP; their
-  # Kotlin sources are compiled by AGP 9's built-in Kotlin support.
-  cloud_functions: '>=5.1.0 <5.6.0'
-  firebase_remote_config: '>=5.1.0 <5.5.0'
+  # Both releases apply the legacy Kotlin Android Gradle Plugin. Flutter
+  # 3.50 and AGP 9.3.1 still support that plugin and the Android release
+  # build is regression-tested in CI. They must be replaced together with
+  # newer FlutterFire releases once those releases support AGP's built-in
+  # Kotlin without changing the shared Swift package version again.
+  cloud_functions: 5.6.2
+  firebase_remote_config: 5.5.0
 
   # Serialization
   # NOTE: models are hand-written (no code generation) so that the project
@@ -104,13 +104,6 @@ dev_dependencies:
 dependency_overrides:
   firebase_core: 3.15.2
   firebase_core_platform_interface: 6.0.3
-  # `cloud_functions 5.5.2` still talks to the native side over the classic
-  # `plugins.flutter.io/firebase_functions` method channel, while
-  # `cloud_functions_platform_interface 5.8.x` has already moved to Pigeon
-  # (`dev.flutter.pigeon.cloud_functions_platform_interface.CloudFunctionsHostApi.call`).
-  # The two generations do not understand each other, so the last
-  # method-channel release is pinned here.
-  cloud_functions_platform_interface: 5.7.2
   # `firebase_messaging 15.2.10` still calls the legacy `sendMessage` method,
   # but that method was removed from newer platform-interface releases (4.11+).
   # Those releases also target the Firebase Core 5.x API, while this project

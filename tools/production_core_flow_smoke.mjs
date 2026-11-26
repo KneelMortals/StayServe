@@ -4,8 +4,9 @@
 // and removes every artifact it creates.
 //
 // This test intentionally uses the same channels as the Flutter app:
-//   * a client ID token for Firestore and Storage writes;
+//   * a client ID token for Firestore reads and the callable boundary;
 //   * callable HTTPS requests for owner, booking, visit and messaging actions;
+//   * server-mediated room-photo callables instead of a client Storage write;
 //   * the server-side OAuth channel only to prepare the disposable live roles
 //     and to verify/clean the resulting data.
 //
@@ -15,6 +16,9 @@
 
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
+
+import { appCheckHeaders, assertAppCheckConfigured } from './app_check.mjs';
+import { prepareVerifiedPhoneIdentity } from './live_test_identity.mjs';
 
 const require = createRequire(import.meta.url);
 const firebaseToolsAuth = require('firebase-tools/lib/auth');
@@ -26,9 +30,14 @@ const FIRESTORE_BASE =
   `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}` +
   '/databases/(default)/documents';
 const STORAGE_ADMIN_BASE = `https://storage.googleapis.com/storage/v1/b/${BUCKET}/o`;
-const STORAGE_CLIENT_BASE = `https://firebasestorage.googleapis.com/v0/b/${BUCKET}/o`;
 const AUTH_BASE = 'https://identitytoolkit.googleapis.com/v1';
 const FUNCTIONS_BASE = `https://us-central1-${PROJECT_ID}.cloudfunctions.net`;
+const SMOKE_PHONE_OWNER = String(
+  process.env.STAYSERVE_SMOKE_PHONE_OWNER || '+15555550100',
+).trim();
+const SMOKE_PHONE_STUDENT = String(
+  process.env.STAYSERVE_SMOKE_PHONE_STUDENT || '+15555550101',
+).trim();
 
 const EXACT_LOCATION = {
   address: '42 Production Smoke Test Lane',
@@ -52,6 +61,8 @@ const artifacts = {
   accounts: [],
   roomId: '',
   objectPath: '',
+  uploadId: '',
+  commitId: '',
   requestId: '',
   conversationId: '',
   messageId: '',
@@ -129,12 +140,13 @@ async function clientFirestore(token, method, path, body) {
 }
 
 async function callable(name, token, data = {}) {
+  const headers = appCheckHeaders({
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  });
   return jsonRequest(`${FUNCTIONS_BASE}/${name}`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({ data }),
   });
 }
@@ -210,19 +222,23 @@ async function createDisposableAccount(label) {
     password,
     uid: response.body.localId,
     token: response.body.idToken,
+    refreshToken: response.body.refreshToken || '',
   };
   artifacts.accounts.push(account);
   return account;
 }
 
-async function makeLiveProfile(account, role) {
+async function makeLiveProfile(account, role, phoneNumber) {
+  // The role and the registration state are server-owned facts which the
+  // probe prepares through the Admin channel. The **phone** facts are not
+  // written here: a phone number which an administrator invents is not a
+  // verification proof, and the server would reject it.
   const now = new Date().toISOString();
   const response = await adminFirestore('PATCH', `/users/${account.uid}`, {
     fields: {
       uid: { stringValue: account.uid },
       email: { stringValue: account.email },
       name: { stringValue: `Temporary ${role} smoke account` },
-      phone: { nullValue: null },
       role: { stringValue: role },
       roleClaimed: { booleanValue: true },
       isActive: { booleanValue: true },
@@ -238,42 +254,71 @@ async function makeLiveProfile(account, role) {
         JSON.stringify(response.body),
     );
   }
+
+  // The phone challenge is completed with the real Firebase endpoint, the
+  // server records the proof itself and publishes the signed claims. The
+  // refreshed token therefore carries `stayServeVerifiedPhone`, which the
+  // Firestore and Storage rules evaluate.
+  const liveIdentity = await prepareVerifiedPhoneIdentity({
+    projectId: PROJECT_ID,
+    apiKey: API_KEY,
+    functionsBase: FUNCTIONS_BASE,
+    uid: account.uid,
+    email: account.email,
+    password: account.password,
+    phoneNumber,
+  });
+  account.token = liveIdentity.idToken;
+  account.refreshToken = liveIdentity.refreshToken || account.refreshToken;
 }
 
-async function uploadPhoto(account, roomId) {
-  const objectPath = `rooms/${account.uid}/${roomId}/smoke.png`;
-  artifacts.objectPath = objectPath;
-  const url = new URL(STORAGE_CLIENT_BASE);
-  url.searchParams.set('uploadType', 'media');
-  url.searchParams.set('name', objectPath);
+async function stageAndCommitPhoto(account, roomId) {
   const png = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
     'base64',
   );
-  const response = await jsonRequest(url.toString(), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${account.token}`,
-      'Content-Type': 'image/png',
-    },
-    body: png,
+  const uploadId = `smoke-${crypto.randomUUID()}`;
+  const commitId = `smoke-commit-${crypto.randomUUID()}`;
+  artifacts.uploadId = uploadId;
+  artifacts.commitId = commitId;
+
+  const stageResponse = await callable('stageRoomPhoto', account.token, {
+    roomId,
+    uploadId,
+    data: png.toString('base64'),
+    removeUrls: [],
   });
-  if (response.status !== 200) {
+  const staged = stageResponse.body?.result || {};
+  if (stageResponse.status !== 200 || !staged.uploadId || !staged.url) {
     throw new Error(
-      `Could not upload the disposable room photo: HTTP ${response.status} ` +
-        JSON.stringify(response.body),
+      'Could not stage the disposable room photo: ' +
+        `HTTP ${stageResponse.status} ${JSON.stringify(stageResponse.body)}`,
     );
   }
-  const uploaded = response.body;
-  const downloadToken = uploaded.downloadTokens || '';
-  const imageUrl =
-    `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(BUCKET)}` +
-    `/o/${encodeURIComponent(objectPath)}?alt=media` +
-    (downloadToken ? `&token=${encodeURIComponent(downloadToken)}` : '');
-  return { uploaded, imageUrl };
+  artifacts.objectPath = String(staged.path || '');
+
+  const commitResponse = await callable('commitRoomPhotoChanges', account.token, {
+    roomId,
+    commitId,
+    uploadIds: [staged.uploadId],
+    removeUrls: [],
+  });
+  const committed = commitResponse.body?.result || {};
+  const images = Array.isArray(committed.images) ? committed.images : [];
+  if (
+    commitResponse.status !== 200 ||
+    images.length !== 1 ||
+    images[0] !== staged.url
+  ) {
+    throw new Error(
+      'Could not commit the disposable room photo: ' +
+        `HTTP ${commitResponse.status} ${JSON.stringify(commitResponse.body)}`,
+    );
+  }
+  return { staged, committed };
 }
 
-async function createRoom(account, imageUrl) {
+async function createRoom(account) {
   const roomId = artifacts.roomId || `RM-SMOKE-${crypto.randomUUID()}`;
   artifacts.roomId = roomId;
   const now = new Date().toISOString();
@@ -306,10 +351,10 @@ async function createRoom(account, imageUrl) {
         occupancy: { integerValue: '2' },
         currentOccupancy: { integerValue: '0' },
         genderPreference: { stringValue: 'any' },
-        images: {
-          arrayValue: { values: [{ stringValue: imageUrl }] },
-        },
-        status: { stringValue: 'available' },
+        images: { arrayValue: { values: [] } },
+        // A new listing is created as a draft. The server publishes it once
+        // the photos and the private exact location are complete.
+        status: { stringValue: 'draft' },
         createdAt: { timestampValue: now },
         updatedAt: { timestampValue: now },
       },
@@ -322,6 +367,17 @@ async function createRoom(account, imageUrl) {
     );
   }
   return roomId;
+}
+
+async function publishRoom(owner, roomId) {
+  const response = await callable('publishRoomListing', owner.token, { roomId });
+  if (response.status !== 200 || response.body?.error) {
+    throw new Error(
+      'Could not publish the disposable room: ' +
+        `HTTP ${response.status} ${JSON.stringify(response.body)}`,
+    );
+  }
+  return response.body?.result || {};
 }
 
 async function updateRoomTitle(account, roomId, title) {
@@ -499,6 +555,16 @@ async function collectResidue() {
       `roomDeletionTombstones/${artifacts.roomId}`,
       `/roomDeletionTombstones/${artifacts.roomId}`,
     ]);
+    knownDocuments.push([
+      `roomPhotoRoomQuotas/${artifacts.roomId}`,
+      `/roomPhotoRoomQuotas/${artifacts.roomId}`,
+    ]);
+  }
+  for (const account of artifacts.accounts) {
+    knownDocuments.push([
+      `roomPhotoUploadQuotas/${account.uid}`,
+      `/roomPhotoUploadQuotas/${account.uid}`,
+    ]);
   }
   if (artifacts.requestId) {
     knownDocuments.push([
@@ -560,6 +626,10 @@ async function collectResidue() {
     'cleanupJobs',
     'accountDeletionJobs',
     'roleClaimJobs',
+    'roomPhotoUploadOperations',
+    'roomPhotoUploadQuotas',
+    'roomPhotoRoomQuotas',
+    'roomPhotoCommitOperations',
     'conversations',
   ]) {
     const documents = await listCollection(collection);
@@ -650,6 +720,10 @@ async function cleanupProductionArtifacts() {
     knownPaths.push(`/rooms/${artifacts.roomId}`);
     knownPaths.push(`/roomPrivate/${artifacts.roomId}`);
     knownPaths.push(`/roomDeletionTombstones/${artifacts.roomId}`);
+    knownPaths.push(`/roomPhotoRoomQuotas/${artifacts.roomId}`);
+  }
+  for (const account of artifacts.accounts) {
+    knownPaths.push(`/roomPhotoUploadQuotas/${account.uid}`);
   }
   if (artifacts.requestId) {
     knownPaths.push(`/joinRequests/${artifacts.requestId}`);
@@ -695,6 +769,10 @@ async function cleanupProductionArtifacts() {
     'cleanupJobs',
     'accountDeletionJobs',
     'roleClaimJobs',
+    'roomPhotoUploadOperations',
+    'roomPhotoUploadQuotas',
+    'roomPhotoRoomQuotas',
+    'roomPhotoCommitOperations',
     'conversations',
   ]) {
     try {
@@ -745,6 +823,7 @@ async function cleanupProductionArtifacts() {
 
 async function main() {
   console.log(`--- project ${PROJECT_ID} ---`);
+  assertAppCheckConfigured();
   adminToken = await getAdminToken();
 
   const owner = await createDisposableAccount('owner');
@@ -752,30 +831,55 @@ async function main() {
   console.log(`  owner uid: ${owner.uid}`);
   console.log(`  student uid: ${student.uid}`);
 
-  await makeLiveProfile(owner, 'owner');
-  await makeLiveProfile(student, 'student');
+  await makeLiveProfile(owner, 'owner', SMOKE_PHONE_OWNER);
+  await makeLiveProfile(student, 'student', SMOKE_PHONE_STUDENT);
   check('the disposable owner and student are live', true);
 
   artifacts.roomId = `RM-SMOKE-${crypto.randomUUID()}`;
-  const { uploaded, imageUrl } = await uploadPhoto(owner, artifacts.roomId);
-  check(
-    'the live owner uploaded a room photo',
-    uploaded.name === artifacts.objectPath && uploaded.contentType === 'image/png',
-    uploaded.name || '',
-  );
-
-  const roomId = await createRoom(owner, imageUrl);
+  const roomId = await createRoom(owner);
   artifacts.lockId = crypto
     .createHash('sha256')
     .update(`${student.uid}:${roomId}`)
     .digest('hex');
   check('the live owner created a public room listing', Boolean(roomId), roomId);
 
+  const { staged } = await stageAndCommitPhoto(owner, roomId);
+  const stagedObjects = await storageObjects(
+    `rooms/${owner.uid}/${roomId}/room-photo-${staged.uploadId}`,
+  );
+  const committedRoom = await adminFirestore('GET', `/rooms/${roomId}`);
+  const committedImages = stringArray(committedRoom.body?.fields?.images);
+  check(
+    'the server staged the room photo in the trusted owner/room path',
+    staged.path ===
+      `rooms/${owner.uid}/${roomId}/room-photo-${staged.uploadId}` &&
+      stagedObjects.length === 1,
+    staged.path || '',
+  );
+  check(
+    'the server committed exactly the canonical room image',
+    committedImages.length === 1 && committedImages[0] === staged.url,
+    committedImages.join(','),
+  );
+
   const privateLocation = await setPrivateLocation(owner, roomId);
   check(
     'the owner stored the exact location privately',
     privateLocation.success === true && privateLocation.stage === 'private',
     privateLocation.stage || '',
+  );
+
+  const published = await publishRoom(owner, roomId);
+  check(
+    'the server published the completed draft',
+    published.success === true && published.status === 'available',
+    published.status || '',
+  );
+  const publishedRoom = await adminFirestore('GET', `/rooms/${roomId}`);
+  check(
+    'the published listing is on the market',
+    scalar(publishedRoom.body?.fields?.status) === 'available',
+    String(scalar(publishedRoom.body?.fields?.status) || ''),
   );
 
   const roomResponse = await adminFirestore('GET', `/rooms/${roomId}`);

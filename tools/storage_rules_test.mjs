@@ -8,13 +8,19 @@
 // The emulator does not enforce production's two-Firestore-document limit for
 // Storage Rules, so the suite also checks the rule source for that invariant.
 
-import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 const PORT = Number(process.argv[2] || 9199);
 const PROJECT = process.argv[3] || 'demo-stayserve-rules';
 const FIRESTORE_PORT = Number(process.argv[4] || 8181);
 const BUCKET = `${PROJECT}.firebasestorage.app`;
 const STORAGE_HOST = `http://127.0.0.1:${PORT}`;
+process.env.FIREBASE_STORAGE_EMULATOR_HOST = `127.0.0.1:${PORT}`;
+const requireFunctions = createRequire(
+  new URL('../functions/package.json', import.meta.url),
+);
+const { initializeApp } = requireFunctions('firebase-admin/app');
+const { getStorage } = requireFunctions('firebase-admin/storage');
 const FIRESTORE_HOST =
   `http://127.0.0.1:${FIRESTORE_PORT}` +
   `/v1/projects/${PROJECT}/databases/(default)/documents`;
@@ -27,18 +33,31 @@ function jwt(claims) {
   return `${b64url({ alg: 'none', typ: 'JWT' })}.${b64url(claims)}.`;
 }
 
+/**
+ * A tenant token with the signed verified-phone proof.
+ *
+ * The Storage rules require the server-issued `stayServeVerifiedPhone` claim
+ * to match the live `phone_number` claim. A token which only carries a phone
+ * number is not enough: the Admin SDK can attach a number without the SMS
+ * challenge ever being completed.
+ */
+function tenantToken(uid, role, phoneNumber) {
+  return jwt({
+    sub: uid,
+    user_id: uid,
+    role,
+    phone_number: phoneNumber,
+    stayServeVerifiedPhone: phoneNumber,
+  });
+}
+
 const TOKENS = {
-  owner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner', phone_number: '+919876500001' }),
-  owner2: jwt({ sub: 'owner2', user_id: 'owner2', role: 'owner', phone_number: '+919876500002' }),
-  student: jwt({ sub: 'student1', user_id: 'student1', role: 'student', phone_number: '+919876500003' }),
-  pending: jwt({ sub: 'pending1', user_id: 'pending1', role: 'student', phone_number: '+919876500004' }),
-  inactive: jwt({ sub: 'inactive1', user_id: 'inactive1', role: 'owner', phone_number: '+919876500005' }),
-  unregistered: jwt({
-    sub: 'unregistered1',
-    user_id: 'unregistered1',
-    role: 'owner',
-    phone_number: '+919876500006',
-  }),
+  owner: tenantToken('owner1', 'owner', '+919876500001'),
+  owner2: tenantToken('owner2', 'owner', '+919876500002'),
+  student: tenantToken('student1', 'student', '+919876500003'),
+  pending: tenantToken('pending1', 'student', '+919876500004'),
+  inactive: tenantToken('inactive1', 'owner', '+919876500005'),
+  unregistered: tenantToken('unregistered1', 'owner', '+919876500006'),
   unverifiedOwner: jwt({
     sub: 'unverified-owner1',
     user_id: 'unverified-owner1',
@@ -60,19 +79,22 @@ const TOKENS = {
     role: 'owner',
     phone_number: '',
   }),
-  legacyOwner: jwt({
-    sub: 'legacy-owner1',
-    user_id: 'legacy-owner1',
+  // A number which an administrator attached with the Admin SDK carries the
+  // phone attribute but no server-issued proof.
+  adminProvisionedOwner: jwt({
+    sub: 'admin-provisioned-owner1',
+    user_id: 'admin-provisioned-owner1',
     role: 'owner',
-    phone_number: '+919876500013',
+    phone_number: '+919876500014',
   }),
+  legacyOwner: tenantToken('legacy-owner1', 'owner', '+919876500013'),
   admin: jwt({
     sub: 'admin1',
     user_id: 'admin1',
     role: 'admin',
     admin: true,
   }),
-  demotedOwner: jwt({ sub: 'owner1', user_id: 'owner1', role: 'owner', phone_number: '+919876500001' }),
+  demotedOwner: tenantToken('owner1', 'owner', '+919876500001'),
   demotedAdmin: jwt({
     sub: 'admin1',
     user_id: 'admin1',
@@ -286,6 +308,21 @@ function check(label, actual, expectedOk) {
 const OWN_OBJECT = 'rooms/owner1/room1/photo.jpg';
 const OTHER_OBJECT = 'rooms/owner2/room2/photo.jpg';
 const ADMIN_OBJECT = 'admin/report.pdf';
+const adminApp = initializeApp(
+  {
+    projectId: PROJECT,
+    storageBucket: BUCKET,
+  },
+  `storage-rules-seed-${process.pid}`,
+);
+const adminBucket = getStorage(adminApp).bucket(BUCKET);
+
+async function seedStorageObject(objectPath, bytes = Buffer.from('image')) {
+  await adminBucket.file(objectPath).save(bytes, {
+    resumable: false,
+    metadata: { contentType: 'image/jpeg' },
+  });
+}
 
 async function main() {
   await seedUser('owner1', { role: 'owner' });
@@ -325,49 +362,26 @@ async function main() {
   await seedDeletingRoom('deleting-room');
 
   console.log(
-    '\n--- room-photo write stays within the production Firestore access limit ---',
-  );
-  const storageRulesSource = readFileSync(
-    new URL('../storage.rules', import.meta.url),
-    'utf8',
-  );
-  const roomPhotoGuard =
-    storageRulesSource.match(
-      /function roomPhotoWriteIsAllowed\([^)]*\)\s*\{[\s\S]*?\n    \}/,
-    )?.[0] || '';
-  const roomPhotoGuardReadsRoomDocument =
-    roomPhotoGuard.includes('/documents/rooms/');
-  const roomPhotoGuardChecksTombstone =
-    roomPhotoGuard.includes('/documents/roomDeletionTombstones/');
-  check(
-    'the room-photo guard does not read a third Firestore document',
-    roomPhotoGuardReadsRoomDocument
-      ? { status: 400, body: { error: { message: 'room document read' } } }
-      : { status: 200, body: {} },
-    !roomPhotoGuardReadsRoomDocument,
+    '\n--- clients cannot write the room-photo namespace directly ---',
   );
   check(
-    'the room-photo guard uses the durable deletion tombstone',
-    roomPhotoGuardChecksTombstone
-      ? { status: 200, body: {} }
-      : { status: 400, body: { error: { message: 'tombstone read missing' } } },
-    true,
-  );
-
-  console.log('\n--- live owners may write only below their own folder ---');
-  check(
-    'a live owner may upload a room photo',
+    'a live owner may not upload a room photo directly',
     await upload(TOKENS.owner, OWN_OBJECT),
-    true,
+    false,
   );
   check(
-    'a live owner may overwrite their own room photo',
+    'a live owner may not overwrite their own room photo',
     await upload(TOKENS.owner, OWN_OBJECT),
-    true,
+    false,
   );
   check(
     'a live owner may not write below another owner folder',
     await upload(TOKENS.owner, OTHER_OBJECT),
+    false,
+  );
+  check(
+    'a live owner may not upload under a nonexistent room id',
+    await upload(TOKENS.owner, 'rooms/owner1/RM-NOT-CREATED/orphan.jpg'),
     false,
   );
   check(
@@ -381,7 +395,7 @@ async function main() {
     false,
   );
 
-  console.log('\n--- every other account is denied room-image writes ---');
+  console.log('\n--- every tenant account is denied room-image writes ---');
   check(
     'a live student may not upload a room photo',
     await upload(TOKENS.student, 'rooms/student1/room/photo.jpg'),
@@ -412,12 +426,12 @@ async function main() {
     false,
   );
   check(
-    'a legacy owner with a signed phone token may upload while the cache is backfilled',
+    'a legacy owner may not bypass the server-mediated upload path',
     await upload(
       TOKENS.legacyOwner,
       'rooms/legacy-owner1/room/photo.jpg',
     ),
-    true,
+    false,
   );
   check(
     'an anonymous caller may not upload a room photo',
@@ -482,10 +496,12 @@ async function main() {
   await seedUser('admin1', { role: 'admin' });
 
   console.log('\n--- room photos are readable by live registered accounts ---');
+  await seedStorageObject(OWN_OBJECT);
+  await seedStorageObject(OTHER_OBJECT);
   check(
-    'the second owner may create their own room photo',
+    'the second owner may not create their own room photo directly',
     await upload(TOKENS.owner2, OTHER_OBJECT),
-    true,
+    false,
   );
   check(
     'a live student may read a room photo',
@@ -512,6 +528,14 @@ async function main() {
     await get(TOKENS.ownerWithEmptyPhoneToken, OWN_OBJECT),
     false,
   );
+  // The Admin SDK can attach a phone number to an account without the SMS
+  // challenge. The live record then carries the number, but the server never
+  // issued the signed proof, so the tenant gate stays closed.
+  check(
+    'an owner with an administrator-provisioned phone may not read a room photo',
+    await get(TOKENS.adminProvisionedOwner, OWN_OBJECT),
+    false,
+  );
   check(
     'an anonymous caller may not read a room photo',
     await get(null, OWN_OBJECT),
@@ -523,7 +547,7 @@ async function main() {
     false,
   );
 
-  console.log('\n--- image type and size are validated ---');
+  console.log('\n--- metadata cannot bypass the room-namespace denial ---');
   check(
     'an owner may not upload a non-image object',
     await upload(TOKENS.owner, 'rooms/owner1/room1/file.txt', {
@@ -547,18 +571,18 @@ async function main() {
     false,
   );
   check(
-    'an owner may upload an object of exactly 5 MiB',
+    'an owner may not upload an object of exactly 5 MiB directly',
     await upload(TOKENS.owner, 'rooms/owner1/room1/max.jpg', {
       bytes: Buffer.alloc(5 * 1024 * 1024),
     }),
-    true,
+    false,
   );
 
-  console.log('\n--- deletes follow the same owner boundary ---');
+  console.log('\n--- room-object deletion is server-owned too ---');
   check(
-    'a live owner may delete their own room photo',
+    'a live owner may not delete their own room photo directly',
     await remove(TOKENS.owner, OWN_OBJECT),
-    true,
+    false,
   );
   check(
     'a live student may not delete a room photo',

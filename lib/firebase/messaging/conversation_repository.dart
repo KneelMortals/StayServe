@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
@@ -25,28 +28,39 @@ final conversationRepositoryProvider = Provider<ConversationRepository>((ref) {
 /// the same trimmed text as the operation identity: a retry which only adds
 /// whitespace is the same send. Once a send succeeds, its key is released so
 /// that deliberately sending the same text again creates a new message.
+///
+/// The key is additionally scoped by the recipient (a conversation or a user
+/// id). Two sends of the same text to different recipients are different
+/// operations, and one of them must not release the other's key — otherwise
+/// a retry after a lost response could create a second message.
 class AdminMessageRequestTracker {
   AdminMessageRequestTracker(this._newRequestId);
 
   final String Function() _newRequestId;
-  final Map<String, String> _pendingRequestIdsByContent = {};
+  final Map<String, String> _pendingRequestIdsByKey = {};
 
-  /// The stable request id for an unresolved send of [content].
-  String requestIdFor(String content) {
+  /// The stable request id for an unresolved send of [content] to [scope].
+  ///
+  /// [scope] identifies the recipient of the message. It may be empty when a
+  /// caller only ever talks to one recipient.
+  String requestIdFor(String content, {String scope = ''}) {
     final canonicalContent = content.trim();
     if (canonicalContent.isEmpty) {
       throw ArgumentError.value(content, 'content', 'Message cannot be empty');
     }
-    return _pendingRequestIdsByContent.putIfAbsent(
-      canonicalContent,
+    return _pendingRequestIdsByKey.putIfAbsent(
+      _keyFor(scope, canonicalContent),
       _newRequestId,
     );
   }
 
   /// Releases the key after the server has confirmed the send.
-  void markSucceeded(String content) {
-    _pendingRequestIdsByContent.remove(content.trim());
+  void markSucceeded(String content, {String scope = ''}) {
+    _pendingRequestIdsByKey.remove(_keyFor(scope, content.trim()));
   }
+
+  String _keyFor(String scope, String canonicalContent) =>
+      '$scope\u0000$canonicalContent';
 }
 
 /// Data access for conversations and their messages.
@@ -57,6 +71,14 @@ class ConversationRepository {
   final FirebaseAuth _auth;
   final FunctionsService _functions;
 
+  /// The idempotency key of an unresolved administrator-support reply.
+  ///
+  /// The server derives the message id from the request id, so a retry after
+  /// a lost response updates the same message instead of creating a second
+  /// one.
+  final AdminMessageRequestTracker _supportReplyRequestTracker =
+      AdminMessageRequestTracker(() => _uuid.v4());
+
   ConversationRepository({
     required this._firestore,
     required this._auth,
@@ -66,11 +88,23 @@ class ConversationRepository {
   String? get _uid => _auth.currentUser?.uid;
 
   /// Conversations the current user takes part in, newest first.
-  Stream<List<ConversationModel>> watchConversations() {
+  ///
+  /// Administrator support conversations are discovered through a trusted
+  /// server callable because their public participant list contains an opaque
+  /// identity instead of the administrator's real uid. The returned ids are
+  /// then watched as exact documents, where Firestore independently verifies
+  /// the server-only administrator mapping for every request.
+  ///
+  /// The discovery runs again while the inbox is open: a support
+  /// conversation which was created after the inbox was mounted has to show
+  /// up without a restart of the app.
+  Stream<List<ConversationModel>> watchConversations({
+    bool includeAdminSupport = false,
+  }) {
     final uid = _uid;
     if (uid == null) return Stream.value([]);
 
-    return _firestore
+    final ordinaryStream = _firestore
         .collection('conversations')
         .where('participantIds', arrayContains: uid)
         .orderBy('updatedAt', descending: true)
@@ -81,7 +115,142 @@ class ConversationRepository {
               .whereType<ConversationModel>()
               .toList(),
         );
+
+    if (!includeAdminSupport) return ordinaryStream;
+
+    return Stream<List<ConversationModel>>.multi((controller) {
+      final ordinaryConversations = <String, ConversationModel>{};
+      final supportConversations = <String, ConversationModel>{};
+      final subscriptions = <StreamSubscription<dynamic>>[];
+      final supportSubscriptions = <String, StreamSubscription<dynamic>>{};
+      var stopped = false;
+      var discovering = false;
+
+      void emitConversations() {
+        if (stopped) return;
+        final conversationsById = <String, ConversationModel>{
+          ...ordinaryConversations,
+          ...supportConversations,
+        };
+        final conversations = conversationsById.values.toList()
+          ..sort((left, right) {
+            final byUpdatedAt = right.updatedAt.compareTo(left.updatedAt);
+            if (byUpdatedAt != 0) return byUpdatedAt;
+            return left.conversationId.compareTo(right.conversationId);
+          });
+        controller.add(conversations);
+      }
+
+      void addError(Object error, StackTrace stackTrace) {
+        if (stopped) return;
+        controller.addError(error, stackTrace);
+      }
+
+      subscriptions.add(
+        ordinaryStream.listen((conversations) {
+          ordinaryConversations.clear();
+          for (final conversation in conversations) {
+            ordinaryConversations[conversation.conversationId] = conversation;
+          }
+          emitConversations();
+        }, onError: addError),
+      );
+
+      /// Looks for the support conversations of the current administrator.
+      ///
+      /// The ids are diffed against the watched ones: a new conversation is
+      /// watched, and a conversation which is no longer mapped to this
+      /// administrator is dropped together with its subscription.
+      Future<void> discoverSupportConversations({
+        required bool reportErrors,
+      }) async {
+        if (stopped || discovering) return;
+        discovering = true;
+        try {
+          final supportConversationIds =
+              await listAdminSupportConversationIds();
+          if (stopped) return;
+
+          final wanted = supportConversationIds.toSet();
+
+          // The conversations which are no longer mapped to this
+          // administrator are removed from the inbox.
+          for (final conversationId in supportSubscriptions.keys.toList()) {
+            if (wanted.contains(conversationId)) continue;
+            final subscription = supportSubscriptions.remove(conversationId);
+            await subscription?.cancel();
+            supportConversations.remove(conversationId);
+          }
+
+          // The new conversations are watched as exact documents.
+          for (final conversationId in wanted) {
+            if (stopped) return;
+            if (supportSubscriptions.containsKey(conversationId)) continue;
+            final supportStream = _firestore
+                .collection('conversations')
+                .doc(conversationId)
+                .snapshots();
+            supportSubscriptions[conversationId] = supportStream.listen((
+              snapshot,
+            ) {
+              final conversation = _parseConversation(snapshot);
+              if (conversation == null) {
+                supportConversations.remove(conversationId);
+              } else {
+                supportConversations[conversationId] = conversation;
+              }
+              emitConversations();
+            }, onError: addError);
+          }
+          emitConversations();
+        } catch (error, stackTrace) {
+          if (reportErrors) {
+            addError(error, stackTrace);
+          } else {
+            // A failed refresh must not empty the inbox. The next refresh
+            // tries again.
+            AppLogger.warning(
+              'Could not refresh the administrator inbox',
+              error: error,
+            );
+          }
+        } finally {
+          discovering = false;
+        }
+      }
+
+      unawaited(discoverSupportConversations(reportErrors: true));
+
+      // The inbox keeps looking for new support conversations while it is
+      // open. Without it a conversation which was created after the inbox
+      // was mounted stayed invisible until the app was restarted.
+      final discoveryTimer = Timer.periodic(
+        adminSupportDiscoveryInterval,
+        (_) => unawaited(discoverSupportConversations(reportErrors: false)),
+      );
+
+      controller.onCancel = () async {
+        stopped = true;
+        discoveryTimer.cancel();
+        for (final subscription in subscriptions) {
+          await subscription.cancel();
+        }
+        for (final subscription in supportSubscriptions.values) {
+          await subscription.cancel();
+        }
+        supportSubscriptions.clear();
+      };
+    });
   }
+
+  /// How often the administrator inbox looks for new support conversations.
+  ///
+  /// The support conversations cannot be queried directly — their public
+  /// participant list contains an opaque identity instead of the
+  /// administrator's real uid — so the client asks the trusted server for
+  /// the ids of the conversations which are mapped to it.
+  @visibleForTesting
+  Duration get adminSupportDiscoveryInterval => const Duration(seconds: 30);
 
   /// Messages inside a conversation, oldest first.
   Stream<List<MessageModel>> watchMessages(String conversationId) {
@@ -136,6 +305,25 @@ class ConversationRepository {
     // Conversation creation is server-owned. The server verifies the room
     // and its owner before it creates the participant list, so this client
     // can only send into a conversation which already exists.
+
+    // An administrator-support channel is written by the trusted server
+    // route only. The server validates the live support target, the durable
+    // administrator mapping and the live mapped administrator, and it writes
+    // the message, the preview and the unread counters in one transaction.
+    // A direct client write could forge a preview or move an unread counter
+    // without a message.
+    final conversationSnapshot = await conversationRef.get();
+    final conversationData = conversationSnapshot.data();
+    final isAdminSupport =
+        conversationData?['conversationType'] == 'adminSupport' &&
+        conversationData?['adminId'] == adminSupportIdentity;
+    if (isAdminSupport) {
+      await _sendAdminSupportReply(
+        conversationId: conversationId,
+        content: content,
+      );
+      return;
+    }
 
     // The message and the conversation counters are written in one
     // transaction, so the unread counter can never drift away from the
@@ -201,6 +389,32 @@ class ConversationRepository {
     }
   }
 
+  /// Sends a reply to the administrator of a support channel.
+  ///
+  /// The server owns the message, the preview and the unread counters, so a
+  /// retry with the same request id cannot create a second message.
+  Future<void> _sendAdminSupportReply({
+    required String conversationId,
+    required String content,
+  }) async {
+    final body = content.trim();
+    if (body.isEmpty) throw Exception('Enter a message');
+
+    final requestId = _supportReplyRequestTracker.requestIdFor(
+      body,
+      scope: conversationId,
+    );
+    await _functions.callFunction(
+      'sendAdminSupportReply',
+      parameters: {
+        'conversationId': conversationId,
+        'content': body,
+        'requestId': requestId,
+      },
+    );
+    _supportReplyRequestTracker.markSucceeded(body, scope: conversationId);
+  }
+
   /// Creates an idempotency key for one administrator message.
   ///
   /// The key must be reused when the **same** send is retried after a lost
@@ -243,6 +457,26 @@ class ConversationRepository {
 
     final ref = _firestore.collection('conversations').doc(conversationId);
     try {
+      final preliminarySnapshot = await ref.get();
+      if (!preliminarySnapshot.exists) return;
+      final preliminaryData = preliminarySnapshot.data();
+      final isAdminSupport =
+          preliminaryData?['conversationType'] == 'adminSupport' &&
+          preliminaryData?['adminId'] == adminSupportIdentity;
+
+      // A support channel is written by trusted callables only. The trusted
+      // server clears exactly the caller's own counter: the opaque
+      // administrator key for the mapped administrator and the ordinary uid
+      // key for the support target.
+      if (isAdminSupport) {
+        await _callInteraction(
+          'markAdminSupportConversationRead',
+          parameters: {'conversationId': conversationId},
+          fallbackMessage: 'Could not mark the administrator message as read',
+        );
+        return;
+      }
+
       await _firestore.runTransaction((transaction) async {
         final snapshot = await transaction.get(ref);
         if (!snapshot.exists) return;
@@ -370,6 +604,32 @@ class ConversationRepository {
     return UserBlockResult.fromJson(data);
   }
 
+  /// Loads the support conversations mapped to the current administrator.
+  ///
+  /// It is public so that a test can replace the discovery of the trusted
+  /// server with a deterministic list of ids.
+  Future<List<String>> listAdminSupportConversationIds() async {
+    final data = await _callInteraction(
+      'listAdminSupportConversations',
+      parameters: const {},
+      fallbackMessage: 'Could not load administrator conversations',
+    );
+    final rawIds = data['conversationIds'];
+    if (rawIds is! List) {
+      throw Exception('The server returned an invalid administrator inbox.');
+    }
+
+    final ids = <String>[];
+    final seen = <String>{};
+    for (final value in rawIds) {
+      if (value is! String) continue;
+      final id = value.trim();
+      if (id.isEmpty || !seen.add(id)) continue;
+      ids.add(id);
+    }
+    return ids;
+  }
+
   /// Calls an interaction callable and converts Firebase failures into the
   /// readable [Exception] used by the screens.
   Future<Map<String, dynamic>> _callInteraction(
@@ -413,15 +673,9 @@ class ConversationRepository {
           .get();
       if (!snapshot.exists) return null;
 
-      final participants =
-          (snapshot.data()?['participantIds'] as List<dynamic>?)
-              ?.whereType<String>()
-              .toList() ??
-          const <String>[];
-      for (final participant in participants) {
-        if (participant != uid) return participant;
-      }
-      return null;
+      final conversation = _parseConversation(snapshot);
+      final peerId = conversation?.getPeerForViewer(uid);
+      return peerId?.isNotEmpty == true ? peerId : null;
     } catch (e) {
       AppLogger.warning('Could not read the conversation', error: e);
       return null;

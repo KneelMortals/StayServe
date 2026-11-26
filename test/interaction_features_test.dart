@@ -1079,8 +1079,9 @@ class _MutableConversationRepository extends ConversationRepository {
   bool get canSend => !blockedByMe && !blockedMe;
 
   @override
-  Stream<List<ConversationModel>> watchConversations() =>
-      Stream.value(const []);
+  Stream<List<ConversationModel>> watchConversations({
+    bool includeAdminSupport = false,
+  }) => Stream.value(const []);
 
   @override
   Stream<List<MessageModel>> watchMessages(String conversationId) =>

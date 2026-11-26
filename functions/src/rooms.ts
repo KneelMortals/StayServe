@@ -21,10 +21,18 @@ import {
 import { isActiveBookingStatus } from './bookings';
 import {
   isValidCurrentOccupancy,
+  isValidMonthlyRent,
   isValidRoomCapacity,
 } from './roomValidation';
 import { PAGE_SIZE } from './batches';
 import { notify } from './notifications';
+import {
+  cleanupExpiredRoomPhotoUploads,
+  pendingRoomPhotoCount,
+  releaseRoomPhotoReservationsForDeletedListing,
+  roomHasPendingPhotoUploads,
+  ROOM_PHOTO_BUCKET,
+} from './roomMedia';
 import {
   readReviewNotificationDependencyRefs,
   reviewInstanceIdFor,
@@ -97,37 +105,75 @@ function roomListingGeneration(room: Record<string, any>): string {
  * expected room prefix before it is ever deleted.
  */
 export function storageObjectPathFromDownloadUrl(value: unknown): string | null {
+  return storageObjectReferenceFromDownloadUrl(value)?.objectPath || null;
+}
+
+/** The bucket and object path encoded by a Firebase Storage URL. */
+export interface StorageObjectReference {
+  bucket: string;
+  objectPath: string;
+}
+
+/**
+ * Parses both Firebase Storage download-URL formats without discarding the
+ * bucket identity.
+ *
+ * The bucket is a security boundary: two projects can contain the same object
+ * path. Cleanup must therefore never turn a foreign-bucket URL into a delete
+ * against StayServe's trusted bucket.
+ */
+export function storageObjectReferenceFromDownloadUrl(
+  value: unknown,
+): StorageObjectReference | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   try {
     const url = new URL(value.trim());
     const host = url.hostname.toLowerCase();
+    let bucket = '';
     let objectPath = '';
 
     if (host === 'firebasestorage.googleapis.com') {
-      const marker = '/o/';
-      const markerIndex = url.pathname.indexOf(marker);
-      if (markerIndex < 0) return null;
-      objectPath = decodeURIComponent(url.pathname.substring(markerIndex + marker.length));
+      const bucketMarker = '/b/';
+      const bucketStart = url.pathname.indexOf(bucketMarker);
+      if (bucketStart < 0) return null;
+      const bucketEnd = url.pathname.indexOf('/o/', bucketStart + bucketMarker.length);
+      if (bucketEnd < 0) return null;
+      bucket = decodeURIComponent(
+        url.pathname.substring(bucketStart + bucketMarker.length, bucketEnd),
+      );
+      objectPath = decodeURIComponent(
+        url.pathname.substring(bucketEnd + '/o/'.length),
+      );
     } else if (host === 'storage.googleapis.com') {
-      const marker = '/o/';
-      const markerIndex = url.pathname.indexOf(marker);
-      if (markerIndex >= 0) {
-        objectPath = decodeURIComponent(url.pathname.substring(markerIndex + marker.length));
-      } else {
-        // Legacy format: https://storage.googleapis.com/{bucket}/{objectPath}
-        const segments = url.pathname.split('/').filter(Boolean);
-        if (segments.length < 2) return null;
-        objectPath = decodeURIComponent(segments.slice(1).join('/'));
-      }
+      const segments = url.pathname.split('/').filter(Boolean);
+      if (segments.length < 2) return null;
+      bucket = decodeURIComponent(segments[0]);
+      objectPath = decodeURIComponent(segments.slice(1).join('/'));
     } else {
       return null;
     }
 
+    bucket = bucket.trim();
     objectPath = objectPath.replace(/^\/+/, '').trim();
-    return objectPath || null;
+    if (!bucket || !objectPath) return null;
+    return { bucket, objectPath };
   } catch (_) {
     return null;
   }
+}
+
+/**
+ * Returns an object path only when the URL belongs to the trusted room-photo
+ * bucket. A foreign URL with a matching path suffix is never treated as a
+ * reference to an object in StayServe's bucket.
+ */
+export function trustedRoomPhotoPathFromDownloadUrl(
+  value: unknown,
+  bucket = ROOM_PHOTO_BUCKET,
+): string | null {
+  const reference = storageObjectReferenceFromDownloadUrl(value);
+  if (!reference || reference.bucket !== bucket) return null;
+  return reference.objectPath;
 }
 
 /** Reads a list of non-empty strings from a Firestore value. */
@@ -153,7 +199,7 @@ function referencedRoomPhotoPaths(
   if (!snapshot.exists) return paths;
 
   for (const url of stringList(snapshot.get('images'))) {
-    const path = storageObjectPathFromDownloadUrl(url);
+    const path = trustedRoomPhotoPathFromDownloadUrl(url);
     if (path) paths.add(path);
   }
   return paths;
@@ -373,7 +419,7 @@ async function processRoomPhotoCleanupJob(
       );
     }
 
-    const bucket = storage.getStorage().bucket();
+    const bucket = storage.getStorage().bucket(ROOM_PHOTO_BUCKET);
     let processedPaths: string[] = [];
 
     if (type === 'roomPhotoPrefix') {
@@ -408,25 +454,16 @@ async function processRoomPhotoCleanupJob(
         const roomSnapshot = await transaction.get(roomRef);
         const currentPaths = stringList(latest.get('paths'));
         const referencedPaths = referencedRoomPhotoPaths(roomSnapshot);
-        const currentGeneration = String(
-          roomSnapshot.get('listingGeneration') || '',
-        ).trim();
-        if (
-          roomSnapshot.exists &&
-          currentGeneration &&
-          currentGeneration !== listingGeneration
-        ) {
-          // This cleanup belongs to an earlier lifetime of the room id. The
-          // prefix cleanup of that listing removed its files; touching them
-          // now could delete a photo of the current listing.
-          transaction.delete(jobRef);
-          processedPaths = [];
-          return;
-        }
-
         // A path which the room references again is live data, not an
-        // orphan. It is removed from the cleanup job without deleting the
+        // orphan. It is removed from the cleanup job without deleting its
         // Storage object.
+        //
+        // The reference check is also the protection for a job of an earlier
+        // lifetime of the room id: the **current** listing decides which
+        // objects are live. The job used to be discarded as soon as the
+        // listing generation differed, which left the old object in Storage
+        // forever — a path cleanup job has no prefix cleanup which could
+        // have removed it.
         const safePaths = currentPaths.filter(
           (path) => !referencedPaths.has(path),
         );
@@ -683,6 +720,16 @@ export const processRoomPhotoCleanupJobs = functions.pubsub
       if (jobs.size < 100) break;
     }
 
+    // Staged uploads which were never committed to a listing are a separate
+    // durable inventory. They are swept in the same scheduled run so an
+    // abandoned upload cannot occupy quota or Storage indefinitely.
+    const uploadCleanup = await cleanupExpiredRoomPhotoUploads();
+    if (uploadCleanup.failed > 0) {
+      throw new Error(
+        `${uploadCleanup.failed} staged room-photo cleanup(s) failed`,
+      );
+    }
+
     if (failed > 0) {
       // The jobs remain durable, and the failed invocation is also retried by
       // the scheduler so a transient Storage outage is visible immediately.
@@ -690,7 +737,9 @@ export const processRoomPhotoCleanupJobs = functions.pubsub
     }
 
     console.log(
-      `Room cleanup jobs completed: ${completed}/${inspected}`,
+      `Room cleanup jobs completed: ${completed}/${inspected}; ` +
+        `staged photos cleaned: ${uploadCleanup.cleaned}, ` +
+        `referenced: ${uploadCleanup.referenced}`,
     );
     return null;
   });
@@ -980,6 +1029,15 @@ export const setRoomListingAvailability = callableHttps.onCall(
           'You can only change your own listings',
         );
       }
+      if (String(room.status || '').trim() === ROOM_DRAFT_STATUS) {
+        // A draft is published by `publishRoomListing`, which verifies that
+        // the listing is complete. The availability toggle must never publish
+        // an incomplete listing.
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This listing is not published yet.',
+        );
+      }
 
       const occupancy = room.occupancy;
       const currentOccupancy = room.currentOccupancy;
@@ -1050,6 +1108,216 @@ export const setRoomListingAvailability = callableHttps.onCall(
       releasedRequests: outcome.release?.releasedRequests || 0,
       releasedStudents: outcome.release?.releasedStudents || 0,
     };
+  },
+);
+
+/**
+ * The status of a listing which is not published yet.
+ *
+ * A new listing is created as a draft. It is invisible to the student search
+ * (which only offers `available` listings) and it cannot be booked, because
+ * the booking state machine requires the same status.
+ */
+export const ROOM_DRAFT_STATUS = 'draft';
+
+/**
+ * Publishes a finished draft listing.
+ *
+ * A listing is created as a draft and published only when it is complete:
+ * its private exact location exists and every staged photo was committed.
+ * The publication is server-owned — a client can neither set the status nor
+ * publish a listing of somebody else.
+ *
+ * The status change happens in a transaction which re-reads the listing, so a
+ * concurrent deletion or a concurrent publication cannot be overwritten.
+ */
+export const publishRoomListing = callableHttps.onCall(
+  async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError(
+        'unauthenticated',
+        'Please sign in first',
+      );
+    }
+
+    const uid = context.auth.uid;
+    const roomId = String(data?.roomId || '').trim();
+    if (!roomId || roomId.length > 160) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'Invalid room',
+      );
+    }
+
+    // The custom claim may be stale. The live server-side profile decides
+    // whether this user is still a registered, active owner.
+    await assertLiveOwner(uid);
+
+    const roomRef = db.collection('rooms').doc(roomId);
+    const privateRef = db.collection('roomPrivate').doc(roomId);
+    const roomPhotoQuotaRef = db
+      .collection('roomPhotoRoomQuotas')
+      .doc(roomId);
+
+    const roomSnapshot = await roomRef.get();
+    if (!roomSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'not-found',
+        'That room no longer exists',
+      );
+    }
+
+    const room = roomSnapshot.data() as Record<string, any>;
+    if (String(room.ownerId || '').trim() !== uid) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'You can only publish your own listings',
+      );
+    }
+    if (room.deletionInProgress === true) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This listing is being deleted and cannot be published',
+      );
+    }
+
+    const status = String(room.status || '').trim();
+    if (status === 'available') {
+      // The listing is already published. The retry is idempotent.
+      return { success: true, roomId, status, alreadyPublished: true };
+    }
+    if (status !== ROOM_DRAFT_STATUS) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This listing is not waiting to be published.',
+      );
+    }
+
+    // The listing is complete only when its exact location exists. A listing
+    // without it could be booked by a student who would never receive an
+    // address, so the publication fails closed.
+    const privateSnapshot = await privateRef.get();
+    if (!privateSnapshot.exists) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The exact location of this listing is not saved yet.',
+      );
+    }
+    const privateLocation = privateSnapshot.data() as Record<string, any>;
+    if (
+      String(privateLocation.ownerId || '').trim() !== uid ||
+      String(privateLocation.roomId || '').trim() !== roomId
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The exact location of this listing is malformed.',
+      );
+    }
+
+    // Every staged photo has to be committed before the listing is published.
+    const pendingPhotos = await roomHasPendingPhotoUploads({
+      ownerId: uid,
+      roomId,
+      listingGeneration: String(room.listingGeneration || '').trim(),
+    });
+    if (pendingPhotos) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'The photos of this listing are not saved yet.',
+      );
+    }
+
+    // The advertised capacity and rent are checked again. The rules enforced
+    // them when the listing was created, but the publication is the moment
+    // where the listing becomes visible.
+    if (
+      !isValidMonthlyRent(room.monthlyRent) ||
+      !isValidRoomCapacity(room.occupancy) ||
+      !isValidCurrentOccupancy(room.currentOccupancy)
+    ) {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This listing has invalid details and cannot be published.',
+      );
+    }
+
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(roomRef);
+      if (!snapshot.exists) {
+        throw new functions.https.HttpsError(
+          'not-found',
+          'That room no longer exists',
+        );
+      }
+      const current = snapshot.data() as Record<string, any>;
+      if (String(current.ownerId || '').trim() !== uid) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'You can only publish your own listings',
+        );
+      }
+
+      // The live owner role is checked in the same transaction as the
+      // publication. A concurrent demotion or ban cannot publish a listing
+      // with a stale claim.
+      const ownerProfile = await transaction.get(
+        db.collection('users').doc(uid),
+      );
+      if (
+        !canActAsRoomOwner({
+          exists: ownerProfile.exists,
+          registrationCompleted: ownerProfile.get('registrationCompleted'),
+          isActive: ownerProfile.get('isActive'),
+          role: ownerProfile.get('role'),
+        })
+      ) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'Only a live owner account can publish this listing.',
+        );
+      }
+
+      // The pending-photo counter is read **inside** the transaction. A
+      // concurrent stage, commit or discard writes the same document, so the
+      // transaction is aborted and retried: the publication can never commit
+      // on a stale "no pending photo" state.
+      const roomPhotoQuota = await transaction.get(roomPhotoQuotaRef);
+      if (
+        pendingRoomPhotoCount(roomPhotoQuota, {
+          ownerId: uid,
+          listingGeneration: String(current.listingGeneration || '').trim(),
+        }) > 0
+      ) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'The photos of this listing are not saved yet.',
+        );
+      }
+
+      if (current.deletionInProgress === true) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This listing is being deleted and cannot be published',
+        );
+      }
+      const currentStatus = String(current.status || '').trim();
+      if (currentStatus === 'available') return;
+      if (currentStatus !== ROOM_DRAFT_STATUS) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This listing is not waiting to be published.',
+        );
+      }
+
+      transaction.update(roomRef, {
+        status: 'available',
+        currentOccupancy: 0,
+        publishedAt: firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    return { success: true, roomId, status: 'available', alreadyPublished: false };
   },
 );
 
@@ -1466,6 +1734,9 @@ async function finalizeRoomDeletion(
         'paths',
       ),
     );
+  const roomPhotoQuotaRef = db
+    .collection('roomPhotoRoomQuotas')
+    .doc(operation.roomId);
   const prefixCleanupRef = db
     .collection('cleanupJobs')
     .doc(
@@ -1496,6 +1767,10 @@ async function finalizeRoomDeletion(
     // The exact address belongs to the listing. It must not survive as an
     // orphan after the public room document is removed.
     transaction.delete(privateLocationRef);
+    // Pending room-photo reservations belong to this listing lifetime. The
+    // durable upload operations remain until their own cleanup runs, but the
+    // room-level slot counter must not survive the listing.
+    transaction.delete(roomPhotoQuotaRef);
     // The prefix cleanup supersedes every individual path cleanup of this
     // listing generation.
     transaction.delete(pathCleanupRef);
@@ -1571,6 +1846,29 @@ async function executeRoomDeletionOperation(
 
     const cancelledRequests = await cancelOpenRoomRequestsForDeletion(operation);
     const prefixCleanupRef = await finalizeRoomDeletion(operation, jobRef);
+
+    // The staged photos of the deleted listing can never be committed. Their
+    // owner quota is released right away, so the owner is not blocked from
+    // staging new photos until the 24 hour expiry cleanup runs.
+    try {
+      const released = await releaseRoomPhotoReservationsForDeletedListing({
+        ownerId: operation.ownerId,
+        roomId: operation.roomId,
+        listingGeneration: operation.listingGeneration,
+      });
+      if (released.releasedCount > 0) {
+        console.log(
+          `Released ${released.releasedCount} room-photo reservation(s) of the deleted room ${operation.roomId}.`,
+        );
+      }
+    } catch (error) {
+      // A failed release does not undo the successful room deletion. The
+      // durable expiry cleanup releases the same reservations later.
+      console.error(
+        `Could not release the room-photo reservations of the deleted room ${operation.roomId}:`,
+        error,
+      );
+    }
 
     // Start the Storage cleanup immediately. A failure does not undo the
     // successful room deletion: the durable cleanup job remains and the
@@ -1925,7 +2223,7 @@ export const onRoomUpdated = functions.firestore
 
     const removedPaths: string[] = [];
     for (const url of removedUrls) {
-      const path = storageObjectPathFromDownloadUrl(url);
+      const path = trustedRoomPhotoPathFromDownloadUrl(url);
       if (!path || !path.startsWith(expectedPrefix)) {
         console.warn(
           `Could not derive the Storage path of a removed photo in room ${roomId}.`,

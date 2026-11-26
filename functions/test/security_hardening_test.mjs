@@ -124,7 +124,7 @@ async function seedOwner(uid, overrides = {}) {
 }
 
 async function testLivePhoneIsAuthoritative() {
-  section('live Firebase Auth is authoritative for the verified phone');
+  section('live Firebase Auth and the server proof are authoritative for the verified phone');
 
   await reset();
   await seedStudent('legacy-student');
@@ -135,13 +135,17 @@ async function testLivePhoneIsAuthoritative() {
     email: `${uid}@example.test`,
     emailVerified: true,
     phoneNumber: '+919876500001',
-    providerData: [{ providerId: 'password' }, { providerId: 'phone' }],
+    customClaims: { stayServeVerifiedPhone: '+919876500001' },
+    providerData: [
+      { providerId: 'password' },
+      { providerId: 'phone', phoneNumber: '+919876500001' },
+    ],
   });
   try {
     await assertLiveStudent('legacy-student');
     const backfilled = await db.collection('users').doc('legacy-student').get();
     check(
-      'a legacy profile with a live phone is authorized',
+      'a legacy profile with a proven live phone is authorized',
       backfilled.get('phoneVerified'),
       true,
     );
@@ -151,11 +155,54 @@ async function testLivePhoneIsAuthoritative() {
       '+919876500001',
     );
 
+    // A number which an administrator attached with the Admin SDK is not a
+    // verification proof: the SMS challenge never happened.
+    auth.getUser = async (uid) => ({
+      uid,
+      email: `${uid}@example.test`,
+      emailVerified: true,
+      phoneNumber: '+919876500009',
+      customClaims: {},
+      providerData: [
+        { providerId: 'password' },
+        { providerId: 'phone', phoneNumber: '+919876500009' },
+      ],
+    });
+    await expectDenied(
+      'an administrator-provisioned phone is not a verified phone',
+      () => assertLiveStudent('legacy-student'),
+    );
+    const unproven = await db.collection('users').doc('legacy-student').get();
+    check(
+      'the unproven phone does not keep the cached grant',
+      unproven.get('phoneVerified'),
+      false,
+    );
+
+    // A number which was replaced after the proof was recorded no longer
+    // matches the proof, so it cannot inherit the old grant.
+    auth.getUser = async (uid) => ({
+      uid,
+      email: `${uid}@example.test`,
+      emailVerified: true,
+      phoneNumber: '+919876500010',
+      customClaims: { stayServeVerifiedPhone: '+919876500001' },
+      providerData: [
+        { providerId: 'password' },
+        { providerId: 'phone', phoneNumber: '+919876500010' },
+      ],
+    });
+    await expectDenied(
+      'a replaced phone number cannot inherit the old proof',
+      () => assertLiveStudent('legacy-student'),
+    );
+
     auth.getUser = async (uid) => ({
       uid,
       email: `${uid}@example.test`,
       emailVerified: true,
       phoneNumber: null,
+      customClaims: {},
       providerData: [{ providerId: 'password' }],
     });
     await expectDenied(
@@ -192,7 +239,11 @@ async function testLiveOwnerAndAdminState() {
     email: `${uid}@example.test`,
     emailVerified: true,
     phoneNumber: '+919876500004',
-    providerData: [{ providerId: 'password' }, { providerId: 'phone' }],
+    customClaims: { stayServeVerifiedPhone: '+919876500004' },
+    providerData: [
+      { providerId: 'password' },
+      { providerId: 'phone', phoneNumber: '+919876500004' },
+    ],
   });
   try {
     await assertLiveOwner('live-owner');

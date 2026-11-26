@@ -41,6 +41,7 @@ import '../../features/admin/presentation/screens/admin_payments_screen.dart';
 import '../../features/admin/presentation/screens/admin_analytics_screen.dart';
 import '../../features/admin/presentation/screens/admin_settings_screen.dart';
 import '../../features/admin/presentation/screens/admin_launch_areas_screen.dart';
+import '../../features/admin/presentation/screens/admin_messages_screen.dart';
 import '../../features/messaging/presentation/screens/conversations_screen.dart';
 import '../../features/messaging/presentation/screens/chat_screen.dart';
 import '../../features/invoices/presentation/screens/invoice_detail_screen.dart';
@@ -360,6 +361,14 @@ final routerProvider = Provider<GoRouter>((ref) {
             path: '/admin/launch-areas',
             name: 'admin-launch-areas',
             builder: (context, state) => const AdminLaunchAreasScreen(),
+          ),
+          GoRoute(
+            path: '/admin/messages',
+            name: 'admin-messages',
+            // The support inbox uses the frame of the admin area, so the
+            // drawer, the notification bell and the log out button are there
+            // on a phone as well.
+            builder: (context, state) => const AdminMessagesScreen(),
           ),
         ],
       ),

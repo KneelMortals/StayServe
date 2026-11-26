@@ -96,6 +96,26 @@ still edit the real visit address.
 - Finalization writes a durable `system/locationPrivacy.finalized` latch. A
   finalized database cannot reopen the legacy exact-write window.
 
+### What the room photos do and do not expose
+
+A room photo is **public media**: every prospective tenant has to see the
+picture of a room before a booking is accepted. The photo therefore does not
+carry the privacy boundary of this document — the exact address does.
+
+- The photo URL is a bearer URL with a per-object, high-entropy token. It is
+  not derived from the room id, the owner id or the file name, so it cannot be
+  reconstructed from a listing and the objects cannot be enumerated.
+- The address is **not** part of the photo's metadata and does not travel
+  with it. It lives in `roomPrivate/{roomId}` and is released only to an
+  accepted student.
+- The photo object is written by the Admin SDK only (`stageRoomPhoto` /
+  `commitRoomPhotoChanges`); a client write below `rooms/{ownerId}/…` is
+  denied by the Storage rules.
+- Removing a photo removes its Storage object, which revokes the URL with it.
+
+The complete protocol is described in
+[`DEPLOYMENT.md`](../DEPLOYMENT.md#57-room-photo-access-policy).
+
 ## The three rollout controls
 
 The migration has three server-owned controls.
@@ -438,10 +458,15 @@ The staged production rollout completed on **18 November 2026 (UTC)** for
   counterparts and reports `publicExactRemaining = 0`;
 - the tightened Firestore rules and 29 indexes are deployed, and the deployed
   Firestore and Storage rules match the tested local files;
-- the isolated production core-flow smoke test passes 25 assertions covering
-  owner create/edit, photo upload, private location, booking, accepted-student
-  visit details, messaging, listing deletion and account deletion, with no
-  disposable residue left behind.
+- the isolated production core-flow smoke test passed 25 assertions in that
+  rollout, covering owner create/edit, the then-current direct photo-upload
+  path, private location, booking, accepted-student visit details, messaging,
+  listing deletion and account deletion, with no disposable residue left
+  behind;
+- the current source replaces that direct client upload with the
+  server-mediated `stageRoomPhoto` / `commitRoomPhotoChanges` protocol. That
+  source change is not part of the completed 18 November production rollout
+  and must not be inferred from the historical result above.
 
 The source diff remains local, unstaged and uncommitted. A minimum-version or
 force-update transition is still required before old clients are retired; the

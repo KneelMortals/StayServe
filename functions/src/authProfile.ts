@@ -10,6 +10,11 @@ import {
   legacyEmailProofMatches,
   LEGACY_EMAIL_PROOF_SOURCE,
 } from './authIdentity';
+import { recordPhoneVerificationProof } from './phoneVerification';
+import {
+  readPhoneVerificationProof,
+  verifiedPhoneForUser,
+} from './verifiedPhone';
 import {
   assertOtpChallenge,
   emailOtpDocumentId,
@@ -987,13 +992,26 @@ export const syncAuthProfile = callableHttps.onCall(async (_data, context) => {
   const userRef = db.collection('users').doc(uid);
 
   // Firebase only exposes `phoneNumber` on a user record after the phone
-  // provider has been linked and verified. Reading the record directly makes
-  // an unlink effective immediately, even when the caller still presents an
-  // older — but cryptographically valid — ID token.
+  // provider has been linked. Reading the record directly makes an unlink
+  // effective immediately, even when the caller still presents an older —
+  // but cryptographically valid — ID token.
+  //
+  // A linked number is not a verification proof on its own: the Admin SDK can
+  // attach one without the SMS challenge. A session which was authenticated by
+  // the phone provider *is* a proof, because Firebase issues such a token only
+  // after the challenge was completed. The proof is recorded here, before the
+  // identity facts are copied into the profile.
   let identity: FirebaseAuthIdentity;
   try {
     const firebaseUser = await auth.getAuth().getUser(uid);
-    identity = firebaseIdentityFromAuthUser(firebaseUser);
+    const recordedPhone = await recordPhoneVerificationProof({
+      uid,
+      token: context.auth.token,
+    });
+    const proofPhone = await readPhoneVerificationProof(uid);
+    const verifiedPhone =
+      recordedPhone || verifiedPhoneForUser(firebaseUser, proofPhone);
+    identity = firebaseIdentityFromAuthUser(firebaseUser, verifiedPhone);
   } catch (error) {
     const code = String((error as { code?: unknown })?.code || '').trim();
     console.error('Could not read the live Firebase Auth identity:', error);
