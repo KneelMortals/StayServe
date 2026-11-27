@@ -220,7 +220,11 @@ class RecordingAuthRepository implements AuthRepository {
   }
 
   @override
-  Future<void> updateProfile({String? displayName, String? photoURL}) async {
+  Future<void> updateProfile({
+    String? displayName,
+    String? photoURL,
+    bool removePhotoURL = false,
+  }) async {
     calls.add('updateAuthProfile');
     final error = updateProfileError;
     if (error != null) throw error;

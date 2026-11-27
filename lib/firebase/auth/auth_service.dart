@@ -391,17 +391,29 @@ class AuthRepository {
     await _auth.sendPasswordResetEmail(email: email.trim());
   }
 
-  Future<void> updateProfile({String? displayName, String? photoURL}) async {
+  /// Updates the profile of the signed-in account in Firebase Auth.
+  ///
+  /// `updateProfile` on Firebase Auth accepts nullable values. Passing a
+  /// null display name therefore clears the name even when the caller only
+  /// wanted to remove a photo. Only fields explicitly supplied by the
+  /// caller may be changed.
+  ///
+  /// The picture is removed with [removePhotoURL]. An **empty** address is
+  /// not a valid URL and the Auth service refuses it with
+  /// `auth/invalid-photo-url`; a null address is the way to delete it.
+  Future<void> updateProfile({
+    String? displayName,
+    String? photoURL,
+    bool removePhotoURL = false,
+  }) async {
     final user = _auth.currentUser;
     if (user != null) {
-      // `updateProfile` on Firebase Auth accepts nullable values. Passing a
-      // null display name therefore clears the name even when the caller only
-      // wanted to remove a photo. Only fields explicitly supplied by the
-      // caller may be changed.
       if (displayName != null) {
         await user.updateDisplayName(displayName);
       }
-      if (photoURL != null) {
+      if (removePhotoURL) {
+        await user.updatePhotoURL(null);
+      } else if (photoURL != null) {
         await user.updatePhotoURL(photoURL);
       }
     }

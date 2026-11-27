@@ -75,12 +75,7 @@ class _FailingProfileController extends AuthController {
   Future<void> build() async {}
 
   @override
-  Future<void> updateProfile({
-    String? name,
-    String? phone,
-    String? profileImage,
-    bool removeProfileImage = false,
-  }) async {
+  Future<void> updateProfile({String? name}) async {
     throw Exception('the write was refused');
   }
 }
@@ -93,12 +88,7 @@ class _WorkingProfileController extends AuthController {
   Future<void> build() async {}
 
   @override
-  Future<void> updateProfile({
-    String? name,
-    String? phone,
-    String? profileImage,
-    bool removeProfileImage = false,
-  }) async {
+  Future<void> updateProfile({String? name}) async {
     savedName = name;
   }
 }

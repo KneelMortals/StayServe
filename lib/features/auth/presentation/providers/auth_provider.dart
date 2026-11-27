@@ -1222,11 +1222,14 @@ class AuthController extends AsyncNotifier<void> {
     });
   }
 
-  Future<void> updateProfile({
-    String? name,
-    String? profileImage,
-    bool removeProfileImage = false,
-  }) {
+  /// Writes the self-service part of the profile of the signed-in account.
+  ///
+  /// Only the name may be changed here. The picture is owned by the server:
+  /// it is written by `uploadProfilePicture` and cleared by
+  /// `removeProfilePicture`, because the Firestore rules do not even allow a
+  /// client to write the `profileImage` field. The phone number is owned by
+  /// Firebase Phone Auth as well.
+  Future<void> updateProfile({String? name}) {
     return _runProfileOperation(
       ProfileMutationOperation.updateDetails,
       () async {
@@ -1238,20 +1241,13 @@ class AuthController extends AsyncNotifier<void> {
         final authRepo = ref.read(authRepositoryProvider);
         final updates = <String, dynamic>{};
         if (name != null) updates['name'] = name;
-        if (profileImage != null) updates['profileImage'] = profileImage;
-        // The old code skipped the update when the picture was removed, so a
-        // user could never get rid of their profile photo again.
-        if (removeProfileImage) updates['profileImage'] = '';
 
         if (updates.isNotEmpty) {
           await authRepo.updateUserProfile(user.uid, updates);
           // Pass only the fields which were explicitly changed. In
-          // particular, removing a photo must not clear the Auth display
-          // name.
-          await authRepo.updateProfile(
-            displayName: name,
-            photoURL: removeProfileImage ? '' : profileImage,
-          );
+          // particular, the picture of the account must not be touched by a
+          // change of the name.
+          await authRepo.updateProfile(displayName: name);
         }
       },
     );
@@ -1295,7 +1291,10 @@ class AuthController extends AsyncNotifier<void> {
         }
         final authRepo = ref.read(authRepositoryProvider);
         await authRepo.removeProfilePicture();
-        await authRepo.updateProfile(photoURL: '');
+        // The picture is removed from the Auth record with a null address —
+        // an empty address is not a valid URL and the Auth service refuses
+        // it.
+        await authRepo.updateProfile(removePhotoURL: true);
       },
     );
   }

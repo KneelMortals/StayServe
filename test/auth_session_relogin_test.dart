@@ -52,7 +52,11 @@ class _ControllableAuthRepository implements AuthRepository {
   Future<void> sendPasswordResetEmail(String email) async {}
 
   @override
-  Future<void> updateProfile({String? displayName, String? photoURL}) async {}
+  Future<void> updateProfile({
+    String? displayName,
+    String? photoURL,
+    bool removePhotoURL = false,
+  }) async {}
 
   @override
   Future<void> createUserProfile(UserModel user) async {}

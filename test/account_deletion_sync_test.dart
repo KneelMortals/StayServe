@@ -71,7 +71,11 @@ class _ControllableAuthRepository implements AuthRepository {
   Future<void> sendPasswordResetEmail(String email) async {}
 
   @override
-  Future<void> updateProfile({String? displayName, String? photoURL}) async {}
+  Future<void> updateProfile({
+    String? displayName,
+    String? photoURL,
+    bool removePhotoURL = false,
+  }) async {}
 
   @override
   Future<void> createUserProfile(UserModel user) async {}
@@ -143,6 +147,58 @@ class _FakeFirebaseFunctions implements FirebaseFunctions {
   @override
   dynamic noSuchMethod(Invocation invocation) =>
       throw UnimplementedError('Functions are not available in the test');
+}
+
+/// A user which remembers every change of the name and of the picture.
+///
+/// The mock of the Firebase Auth returns a placeholder address for a user
+/// without a picture, so a test which checks the removal of a picture has
+/// to look at the calls and not at the address.
+class _RecordingUser implements User {
+  _RecordingUser({required this.uid, this.email, this.photoURL});
+
+  @override
+  final String uid;
+
+  @override
+  final String? email;
+
+  @override
+  String? displayName;
+
+  @override
+  String? photoURL;
+
+  final List<String?> photoUpdates = [];
+  final List<String?> nameUpdates = [];
+
+  @override
+  Future<void> updatePhotoURL(String? value) async {
+    photoUpdates.add(value);
+    photoURL = value;
+  }
+
+  @override
+  Future<void> updateDisplayName(String? value) async {
+    nameUpdates.add(value);
+    displayName = value;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// A Firebase Auth which hands out one prepared user.
+class _AuthWithUser implements FirebaseAuth {
+  _AuthWithUser(this.user);
+
+  final User user;
+
+  @override
+  User? get currentUser => user;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 UserModel _profile(
@@ -364,6 +420,52 @@ void main() {
       expect(functions.calls, hasLength(1));
       expect(functions.calls.single.name, 'removeProfilePicture');
     });
+
+    test(
+      'the picture of the Auth record is removed with a null address',
+      () async {
+        // An empty address is not a valid URL and the Auth service refuses it
+        // with `auth/invalid-photo-url`. Only a null address deletes the
+        // picture.
+        final functions = _RecordingFunctionsService({
+          'removeProfilePicture': {'success': true},
+        });
+        final user = _RecordingUser(
+          uid: 'user-1',
+          email: 'user-1@example.com',
+          photoURL: 'https://firebasestorage.googleapis.com/v0/b/demo/o/p.jpg',
+        );
+        final auth = _AuthWithUser(user);
+        final repository = AuthRepository(auth, _FakeFirestore(), functions);
+
+        await repository.updateProfile(removePhotoURL: true);
+
+        expect(user.photoUpdates, hasLength(1));
+        expect(user.photoUpdates.single, isNull);
+        // The name of the account must not be touched by the removal.
+        expect(user.nameUpdates, isEmpty);
+      },
+    );
+
+    test(
+      'the picture of the Auth record is written with its address',
+      () async {
+        final functions = _RecordingFunctionsService({});
+        final user = _RecordingUser(uid: 'user-1', email: 'user-1@example.com');
+        final auth = _AuthWithUser(user);
+        final repository = AuthRepository(auth, _FakeFirestore(), functions);
+
+        await repository.updateProfile(
+          photoURL: 'https://firebasestorage.googleapis.com/v0/b/demo/o/p.jpg',
+        );
+
+        expect(
+          user.photoURL,
+          'https://firebasestorage.googleapis.com/v0/b/demo/o/p.jpg',
+        );
+        expect(user.nameUpdates, isEmpty);
+      },
+    );
   });
 
   group('the profile screen', () {

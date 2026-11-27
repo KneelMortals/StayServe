@@ -125,7 +125,15 @@ auth.getUser = async (uid) => {
 // The Auth record of the account which holds the imported picture.
 const authPhotos = new Map();
 auth.updateUser = async (uid, properties) => {
-  authPhotos.set(uid, properties?.photoURL || '');
+  // The value is stored as it was passed, so that a `null` (which deletes the
+  // picture) can be told apart from an empty address (which the Auth service
+  // refuses).
+  authPhotos.set(
+    uid,
+    properties && Object.prototype.hasOwnProperty.call(properties, 'photoURL')
+      ? properties.photoURL
+      : undefined,
+  );
   return { uid };
 };
 
@@ -404,7 +412,7 @@ async function main() {
   check(
     'the Auth record no longer shows the picture',
     authPhotos.get('profile-media'),
-    '',
+    null,
   );
 
   section('the Google profile picture');

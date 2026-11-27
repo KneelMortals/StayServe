@@ -691,8 +691,12 @@ export const removeProfilePicture = callableHttps.onCall(async (_data, context) 
   // The Auth record carries the picture as well, so the other Firebase
   // surfaces — the account switcher of the operating system for example —
   // would still show it. A failure here does not affect the profile.
+  //
+  // The picture is deleted with a **null** address: an empty string is not
+  // a valid URL and the Auth service refuses it with
+  // `auth/invalid-photo-url`.
   try {
-    await auth.getAuth().updateUser(uid, { photoURL: '' });
+    await auth.getAuth().updateUser(uid, { photoURL: null });
   } catch (error) {
     console.warn(
       'Could not clear the profile picture on the Auth record:',
