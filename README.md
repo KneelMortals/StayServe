@@ -288,6 +288,31 @@ In short: a room photo is public content with an unguessable URL, while the
 address of the room is not. The detailed protocol is described in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#57-room-photo-access-policy).
 
+### Profile-picture policy
+
+The picture of a profile is **server-owned**, like the contact facts:
+
+* the user picks a photo in the app and **crops** it. The cropper reads
+  JPEG, PNG, GIF, BMP and WebP; a modern format such as HEIF is converted by
+  the platform first. The result is scaled to at most 1024 pixels and encoded
+  as a JPEG, because a PNG is far too large for a profile picture;
+* the client sends the cropped bytes to `uploadProfilePicture`. The server
+  validates the live account and the bytes, writes the object with the Admin
+  SDK into `profile-images/{uid}/…` and publishes the download URL itself. A
+  client can neither create an object in the namespace nor point its own
+  profile at an address of the internet — the Firestore rules do not even
+  allow a client to write the `profileImage` field;
+* a **Google account brings its own picture**. The server copies it into the
+  same namespace when the account is created and when the profile is
+  synchronised. Only `*.googleusercontent.com` addresses are downloaded, the
+  download is bounded (two megabytes, ten seconds) and a picture which Google
+  serves as HEIF is asked for again with a size directive, so that Google
+  itself delivers a JPEG;
+* a picture which the user chose by hand is never replaced, and a picture
+  which the user removed stays removed — the removal is remembered on the
+  profile (`profileImageSource: 'removed'`);
+* the picture of a deleted account is removed with the account.
+
 > **Rotate the mailbox token.** A live bearer token for the OTP mailbox was
 > committed to the repository in `.mail_inbox.json`. The file has been deleted
 > and is now git-ignored, but the token itself is still valid in the mail
