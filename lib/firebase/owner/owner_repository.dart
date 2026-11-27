@@ -9,6 +9,7 @@ import 'package:uuid/uuid.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/constants/enums.dart';
 import '../../../core/utils/app_logger.dart';
+import '../../../core/utils/combine_latest.dart';
 import '../../../core/utils/safe_document_parser.dart';
 import '../../../models/join_request_model.dart';
 import '../../../models/owned_room_model.dart';
@@ -142,74 +143,118 @@ class OwnerRepository {
 
   String? get _uid => _auth.currentUser?.uid;
 
+  /// The collection which holds the **published** listings.
+  ///
+  /// A published listing is the only kind of listing which a student may
+  /// read. The documents are created by the server.
+  static const String publishedRoomsCollection = 'rooms';
+
+  /// The collection which holds the **unfinished** listings.
+  ///
+  /// The drafts live in their own owner-scoped collection because a
+  /// Firestore query cannot be filtered by the rules: a draft which shared
+  /// the public collection would be returned by every query of it and would
+  /// therefore be readable by every registered account.
+  static const String roomDraftsCollection = 'roomDrafts';
+
   /// Rooms listed by the current owner.
   ///
   /// The public listing contains only coarse location data after the privacy
   /// migration. The owner view joins the server-owned private location back
   /// in so the edit form can still show and change the exact address.
+  ///
+  /// The published listings and the unfinished drafts live in two separate
+  /// owner-scoped collections, so both of them are watched and merged. A
+  /// draft which survived an interrupted publication has to stay visible to
+  /// its owner — otherwise it could never be completed or removed.
   Stream<List<OwnedRoomModel>> watchMyRooms() {
     final uid = _uid;
     if (uid == null) return Stream.value([]);
 
-    return _firestore
-        .collection('rooms')
+    final published = _firestore
+        .collection(publishedRoomsCollection)
         .where('ownerId', isEqualTo: uid)
         .orderBy('createdAt', descending: true)
-        .snapshots()
-        .asyncMap((snapshot) async {
-          final rooms = <OwnedRoomModel>[];
-          for (final doc in snapshot.docs) {
-            RoomModel listing;
-            try {
-              listing = RoomModel.fromJson(doc.data(), documentId: doc.id);
-            } catch (_) {
-              // One malformed listing must not break the whole list.
-              continue;
-            }
+        .snapshots();
+    final drafts = _firestore
+        .collection(roomDraftsCollection)
+        .where('ownerId', isEqualTo: uid)
+        .orderBy('createdAt', descending: true)
+        .snapshots();
 
-            RoomPrivateLocation? privateLocation;
-            try {
-              final privateSnapshot = await _firestore
-                  .collection('roomPrivate')
-                  .doc(doc.id)
-                  .get();
-              if (privateSnapshot.exists) {
-                final candidate = RoomPrivateLocation.fromJson(
-                  privateSnapshot.data() ?? const <String, dynamic>{},
-                );
-                if (candidate.roomId == doc.id && candidate.ownerId == uid) {
-                  privateLocation = candidate;
-                }
-              }
-            } catch (error) {
-              // A missing private document is a normal state during the
-              // staged migration. Some older deployed rule versions deny
-              // that read; the owner-facing legacy fallback keeps the edit
-              // form usable until the compatible rules are deployed.
-              AppLogger.warning(
-                'Could not read the private room location for ${doc.id}',
-                error: error,
-              );
-            }
+    return combineLatest2<
+          QuerySnapshot<Map<String, dynamic>>,
+          QuerySnapshot<Map<String, dynamic>>,
+          List<QueryDocumentSnapshot<Map<String, dynamic>>>
+        >(
+          published,
+          drafts,
+          (publishedSnapshot, draftSnapshot) =>
+              <QueryDocumentSnapshot<Map<String, dynamic>>>[
+                ...publishedSnapshot.docs,
+                ...draftSnapshot.docs,
+              ],
+        )
+        .asyncMap((documents) => _mapOwnerRooms(documents, uid));
+  }
 
-            // Only the owner-facing view reads the legacy exact fields, and
-            // it keeps them in the private-location model. The public room
-            // model continues to expose coarse data only.
-            privateLocation ??= RoomPrivateLocation.fromLegacyRoomJson(
-              doc.data(),
-              roomId: doc.id,
-              ownerId: uid,
-            );
+  /// Joins the server-owned private location back into the owner's listings.
+  Future<List<OwnedRoomModel>> _mapOwnerRooms(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> documents,
+    String uid,
+  ) async {
+    final rooms = <OwnedRoomModel>[];
+    for (final doc in documents) {
+      RoomModel listing;
+      try {
+        listing = RoomModel.fromJson(doc.data(), documentId: doc.id);
+      } catch (_) {
+        // One malformed listing must not break the whole list.
+        continue;
+      }
 
-            rooms.add(
-              OwnedRoomModel(
-                listing: listing,
-                privateLocation: privateLocation,
-              ),
-            );
+      RoomPrivateLocation? privateLocation;
+      try {
+        final privateSnapshot = await _firestore
+            .collection('roomPrivate')
+            .doc(doc.id)
+            .get();
+        if (privateSnapshot.exists) {
+          final candidate = RoomPrivateLocation.fromJson(
+            privateSnapshot.data() ?? const <String, dynamic>{},
+          );
+          if (candidate.roomId == doc.id && candidate.ownerId == uid) {
+            privateLocation = candidate;
           }
-          return rooms;
-        });
+        }
+      } catch (error) {
+        // A missing private document is a normal state during the
+        // staged migration. Some older deployed rule versions deny
+        // that read; the owner-facing legacy fallback keeps the edit
+        // form usable until the compatible rules are deployed.
+        AppLogger.warning(
+          'Could not read the private room location for ${doc.id}',
+          error: error,
+        );
+      }
+
+      // Only the owner-facing view reads the legacy exact fields, and
+      // it keeps them in the private-location model. The public room
+      // model continues to expose coarse data only.
+      privateLocation ??= RoomPrivateLocation.fromLegacyRoomJson(
+        doc.data(),
+        roomId: doc.id,
+        ownerId: uid,
+      );
+
+      rooms.add(
+        OwnedRoomModel(listing: listing, privateLocation: privateLocation),
+      );
+    }
+
+    // The two collections are merged, so the order is restored here.
+    rooms.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return rooms;
   }
 
   /// Join requests addressed to the current owner's rooms.
@@ -350,7 +395,10 @@ class OwnerRepository {
     }
     _pendingRoomCreations[attemptKey] = _PendingRoomCreation(roomId);
 
-    final roomRef = _firestore.collection('rooms').doc(roomId);
+    // The unfinished listing is written into the owner-scoped draft
+    // collection. It is not part of any public collection query, so no other
+    // account can read it while it is being prepared.
+    final roomRef = _firestore.collection(roomDraftsCollection).doc(roomId);
     final document = draft.room.copyWith(
       roomId: roomId,
       ownerId: uid,
@@ -371,6 +419,9 @@ class OwnerRepository {
     // not publish the listing by itself, and a listing without a status is
     // invisible to the student search anyway, because a Firestore equality
     // query never matches a document that does not have the field.
+    //
+    // The draft lives in its own collection, so no query of the public
+    // listings can ever return it.
     final createPayload = document.toCreateJson()..['status'] = 'draft';
 
     var upload = const _RoomImageUpload(
@@ -490,7 +541,9 @@ class OwnerRepository {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
 
-    final roomRef = _firestore.collection('rooms').doc(draft.room.roomId);
+    // The listing is either a published listing or an unfinished draft. The
+    // edit has to address the document which really holds it.
+    final roomRef = await _resolveOwnerListingRef(draft.room.roomId, uid);
 
     // The live listing is validated **before** anything is committed.
     //
@@ -566,6 +619,37 @@ class OwnerRepository {
     // job for every removed photo. The client deliberately does not delete
     // those objects: a stale client snapshot must never remove a photo which
     // a newer edit still references.
+  }
+
+  /// The document which holds the listing of one room id.
+  ///
+  /// The published listing wins over the draft: the publication moves the
+  /// draft into the public collection, so both only exist at the same time
+  /// when a stale draft survived an interrupted publication.
+  Future<DocumentReference<Map<String, dynamic>>> _resolveOwnerListingRef(
+    String roomId,
+    String ownerId,
+  ) async {
+    final published = await _firestore
+        .collection(publishedRoomsCollection)
+        .doc(roomId)
+        .get();
+    if (published.exists) {
+      if (published.data()?['ownerId'] != ownerId) {
+        throw Exception('You can only edit your own listings');
+      }
+      return _firestore.collection(publishedRoomsCollection).doc(roomId);
+    }
+
+    final draft = await _firestore
+        .collection(roomDraftsCollection)
+        .doc(roomId)
+        .get();
+    if (!draft.exists) throw Exception('Room not found');
+    if (draft.data()?['ownerId'] != ownerId) {
+      throw Exception('You can only edit your own listings');
+    }
+    return _firestore.collection(roomDraftsCollection).doc(roomId);
   }
 
   /// The number of people who live in the listing right now.
@@ -768,11 +852,11 @@ class OwnerRepository {
     List<String> removedUrls,
   ) async {
     try {
-      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
-      if (!snapshot.exists) return false;
-      final images = _safeImageUrls(snapshot.data()?['images']).toSet();
-      final additionsPresent = uploadedUrls.every(images.contains);
-      final removalsAbsent = removedUrls.every((url) => !images.contains(url));
+      final images = await _readListingImages(roomId);
+      if (images == null) return false;
+      final known = images.toSet();
+      final additionsPresent = uploadedUrls.every(known.contains);
+      final removalsAbsent = removedUrls.every((url) => !known.contains(url));
       return additionsPresent && removalsAbsent;
     } catch (error) {
       AppLogger.warning(
@@ -781,6 +865,27 @@ class OwnerRepository {
       );
       return false;
     }
+  }
+
+  /// The photo list of the listing which currently owns a room id.
+  ///
+  /// The listing is either a published listing or an unfinished draft. The
+  /// published one wins, because the publication moves the draft into the
+  /// public collection.
+  Future<List<String>?> _readListingImages(String roomId) async {
+    final published = await _firestore
+        .collection(publishedRoomsCollection)
+        .doc(roomId)
+        .get();
+    if (published.exists) {
+      return _safeImageUrls(published.data()?['images']);
+    }
+    final draft = await _firestore
+        .collection(roomDraftsCollection)
+        .doc(roomId)
+        .get();
+    if (!draft.exists) return null;
+    return _safeImageUrls(draft.data()?['images']);
   }
 
   /// Asks the server to remove staged objects which were never referenced.
@@ -826,14 +931,30 @@ class OwnerRepository {
   ///
   /// The document id alone is not proof that this owner created the room:
   /// both the stored owner id and the stored room id must match the attempt.
+  /// The listing may be an unpublished draft or an already published
+  /// listing — both are the result of this attempt.
   Future<_RoomCreationState> _reconcileRoomCreation(
     String roomId,
     String ownerId,
   ) async {
     try {
-      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
-      if (!snapshot.exists) return _RoomCreationState.absent;
-      final data = snapshot.data();
+      final published = await _firestore
+          .collection(publishedRoomsCollection)
+          .doc(roomId)
+          .get();
+      if (published.exists) {
+        final data = published.data();
+        if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
+          return _RoomCreationState.mismatched;
+        }
+        return _RoomCreationState.matching;
+      }
+      final draft = await _firestore
+          .collection(roomDraftsCollection)
+          .doc(roomId)
+          .get();
+      if (!draft.exists) return _RoomCreationState.absent;
+      final data = draft.data();
       if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
         return _RoomCreationState.mismatched;
       }
@@ -855,14 +976,28 @@ class OwnerRepository {
   /// and stays, so the live status is checked here as well.
   Future<bool> _roomIsUnpublishedAndEmpty(String roomId, String ownerId) async {
     try {
-      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
-      if (!snapshot.exists) return true;
-      final data = snapshot.data();
-      if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
-        return false;
+      final published = await _firestore
+          .collection(publishedRoomsCollection)
+          .doc(roomId)
+          .get();
+      if (published.exists) {
+        final data = published.data();
+        if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
+          return false;
+        }
+        if (data?['status'] == 'available') {
+          // The server published this listing. It is complete and must stay.
+          return false;
+        }
+        return _safeImageUrls(data?['images']).isEmpty;
       }
-      if (data?['status'] == 'available') {
-        // The server published this listing. It is complete and must stay.
+      final draft = await _firestore
+          .collection(roomDraftsCollection)
+          .doc(roomId)
+          .get();
+      if (!draft.exists) return true;
+      final data = draft.data();
+      if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {
         return false;
       }
       return _safeImageUrls(data?['images']).isEmpty;
@@ -885,7 +1020,10 @@ class OwnerRepository {
     String ownerId,
   ) async {
     try {
-      final snapshot = await _firestore.collection('rooms').doc(roomId).get();
+      final snapshot = await _firestore
+          .collection(publishedRoomsCollection)
+          .doc(roomId)
+          .get();
       if (!snapshot.exists) return _PublicationState.notPublished;
       final data = snapshot.data();
       if (data?['ownerId'] != ownerId || data?['roomId'] != roomId) {

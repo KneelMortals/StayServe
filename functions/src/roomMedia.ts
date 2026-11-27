@@ -12,6 +12,11 @@ import {
   assertLiveOwner,
   assertLiveOwnerProfileSnapshot,
 } from './accounts';
+import {
+  readRoomListingPair,
+  resolveRoomListing,
+  roomListingDocuments,
+} from './roomListings';
 
 /**
  * The only bucket which may hold StayServe room photos.
@@ -382,11 +387,11 @@ function roomPhotoCleanupRetryDelay(attempts: number): number {
 }
 
 function assertRoomBelongsToOwner(
-  snapshot: firestore.DocumentSnapshot,
+  snapshot: firestore.DocumentSnapshot | null | undefined,
   ownerId: string,
   roomId: string,
 ): Record<string, any> {
-  if (!snapshot.exists) {
+  if (!snapshot || !snapshot.exists) {
     throw new functions.https.HttpsError(
       'not-found',
       'That room listing no longer exists.',
@@ -589,12 +594,14 @@ function releasePendingRoomQuota(
   quotaSnapshot: firestore.DocumentSnapshot,
   ownerId: string,
   listingGeneration: string,
-  roomSnapshot: firestore.DocumentSnapshot,
+  roomSnapshot: firestore.DocumentSnapshot | null | undefined,
   releasedCount: number,
   releasedBytes: number,
 ): void {
   if (releasedCount <= 0 && releasedBytes <= 0) return;
-  if (!ownerId || !listingGeneration || !roomSnapshot.exists) return;
+  if (!ownerId || !listingGeneration || !roomSnapshot || !roomSnapshot.exists) {
+    return;
+  }
 
   const storedOwnerId = String(quotaSnapshot.get('ownerId') || '').trim();
   const storedGeneration = String(
@@ -674,16 +681,20 @@ async function quarantineMalformedRoomPhotoOperation(
   const roomQuotaRef = roomTrustworthy
     ? db.collection('roomPhotoRoomQuotas').doc(roomId)
     : null;
-  const roomRef = roomTrustworthy
-    ? db.collection('rooms').doc(roomId)
+  const roomDocuments = roomTrustworthy
+    ? roomListingDocuments(roomId)
     : null;
 
   let didQuarantine = false;
   try {
     await db.runTransaction(async (transaction) => {
-      const roomSnapshot = roomRef
-        ? await transaction.get(roomRef)
+      const roomSnapshot = roomDocuments
+        ? await transaction.get(roomDocuments.draft)
         : undefined;
+      const publishedSnapshot = roomDocuments
+        ? await transaction.get(roomDocuments.published)
+        : undefined;
+      const listing = resolveRoomListing(roomSnapshot, publishedSnapshot);
       const operationSnapshot = await transaction.get(operationRef);
       if (!operationSnapshot.exists) return;
       const current = operationSnapshot.data() as Record<string, any>;
@@ -723,7 +734,7 @@ async function quarantineMalformedRoomPhotoOperation(
           nonNegativeInteger(current.byteLength),
         );
       }
-      if (roomQuotaRef && roomSnapshot) {
+      if (roomQuotaRef && listing) {
         const roomQuotaSnapshot = await transaction.get(roomQuotaRef);
         releasePendingRoomQuota(
           transaction,
@@ -731,7 +742,7 @@ async function quarantineMalformedRoomPhotoOperation(
           roomQuotaSnapshot,
           currentOwner,
           String(current.listingGeneration || '').trim(),
-          roomSnapshot,
+          listing.snapshot,
           1,
           nonNegativeInteger(current.byteLength),
         );
@@ -888,7 +899,7 @@ export const stageRoomPhoto = callableHttps.onCall(async (data, context) => {
   const operationRef = db
     .collection('roomPhotoUploadOperations')
     .doc(operationDocumentId(ownerId, uploadId));
-  const roomRef = db.collection('rooms').doc(roomId);
+  const roomDocuments = roomListingDocuments(roomId);
   const ownerRef = db.collection('users').doc(ownerId);
   const quotaRef = db
     .collection('roomPhotoUploadQuotas')
@@ -899,8 +910,20 @@ export const stageRoomPhoto = callableHttps.onCall(async (data, context) => {
     // Every room-media transaction locks the room and the live owner profile
     // first. This keeps stage, commit and discard in one deadlock-free order
     // and closes the demotion/ban race before any write can commit.
-    const roomSnapshot = await transaction.get(roomRef);
-    const room = assertRoomBelongsToOwner(roomSnapshot, ownerId, roomId);
+    //
+    // The listing may still be an unpublished draft: it lives in its own
+    // collection until the owner publishes it.
+    const { draft, published } = await readRoomListingPair(
+      transaction,
+      roomId,
+    );
+    const listing = resolveRoomListing(draft, published);
+    const room = assertRoomBelongsToOwner(
+      listing ? listing.snapshot : null,
+      ownerId,
+      roomId,
+    );
+    const roomRef = listing ? listing.ref : roomDocuments.published;
     const ownerSnapshot = await transaction.get(ownerRef);
     assertLiveOwnerProfileSnapshot(ownerSnapshot, ownerId);
     const hadListingGeneration = Boolean(
@@ -1243,7 +1266,12 @@ export const stageRoomPhoto = callableHttps.onCall(async (data, context) => {
     // was being written must not leave that object behind.
     await assertLiveOwner(ownerId);
     await db.runTransaction(async (transaction) => {
-      const roomSnapshot = await transaction.get(roomRef);
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const listing = resolveRoomListing(draft, published);
+      const roomSnapshot = listing ? listing.snapshot : null;
       const room = assertRoomBelongsToOwner(roomSnapshot, ownerId, roomId);
       const ownerSnapshot = await transaction.get(ownerRef);
       assertLiveOwnerProfileSnapshot(ownerSnapshot, ownerId);
@@ -1337,10 +1365,17 @@ export const stageRoomPhoto = callableHttps.onCall(async (data, context) => {
     let recoveryFailed = false;
     try {
       recovered = await db.runTransaction(async (transaction) => {
-        const roomSnapshot = await transaction.get(roomRef);
+        const { draft, published } = await readRoomListingPair(
+          transaction,
+          roomId,
+        );
+        const listing = resolveRoomListing(draft, published);
+        const roomSnapshot = listing ? listing.snapshot : null;
         const ownerSnapshot = await transaction.get(ownerRef);
         const operationSnapshot = await transaction.get(operationRef);
-        if (!operationSnapshot.exists || !roomSnapshot.exists) return null;
+        if (!operationSnapshot.exists || !roomSnapshot || !roomSnapshot.exists) {
+          return null;
+        }
         const operation = operationSnapshot.data() as Record<string, any>;
         const room = roomSnapshot.data() as Record<string, any>;
         const status = String(operation.status || '');
@@ -1488,7 +1523,7 @@ export const commitRoomPhotoChanges = callableHttps.onCall(
       )
       .digest('hex');
 
-    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDocuments = roomListingDocuments(roomId);
     const ownerRef = db.collection('users').doc(ownerId);
     const commitRef = db
       .collection('roomPhotoCommitOperations')
@@ -1504,12 +1539,18 @@ export const commitRoomPhotoChanges = callableHttps.onCall(
     );
 
     return db.runTransaction(async (transaction) => {
-      const roomSnapshot = await transaction.get(roomRef);
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const listing = resolveRoomListing(draft, published);
+      const roomSnapshot = listing ? listing.snapshot : null;
       const room = assertRoomBelongsToOwner(
         roomSnapshot,
         ownerId,
         roomId,
       );
+      const roomRef = listing ? listing.ref : roomDocuments.published;
       const ownerSnapshot = await transaction.get(ownerRef);
       assertLiveOwnerProfileSnapshot(ownerSnapshot, ownerId);
       const hadListingGeneration = Boolean(
@@ -1723,7 +1764,7 @@ export const discardRoomPhotoUpload = callableHttps.onCall(
       );
     }
 
-    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDocuments = roomListingDocuments(roomId);
     const ownerRef = db.collection('users').doc(ownerId);
     const operationRef = db
       .collection('roomPhotoUploadOperations')
@@ -1738,7 +1779,12 @@ export const discardRoomPhotoUpload = callableHttps.onCall(
     let quarantined = false;
     let operationExists = false;
     await db.runTransaction(async (transaction) => {
-      const roomSnapshot = await transaction.get(roomRef);
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const listing = resolveRoomListing(draft, published);
+      const roomSnapshot = listing ? listing.snapshot : null;
       const ownerSnapshot = await transaction.get(ownerRef);
       const operationSnapshot = await transaction.get(operationRef);
       const quotaSnapshot = await transaction.get(quotaRef);
@@ -1785,7 +1831,7 @@ export const discardRoomPhotoUpload = callableHttps.onCall(
       }
 
       const url = String(operation.url || '').trim();
-      const room = roomSnapshot.exists
+      const room = roomSnapshot && roomSnapshot.exists
         ? (roomSnapshot.data() as Record<string, any>)
         : null;
       if (roomReferencesUrl(room, url)) {
@@ -1845,7 +1891,12 @@ export const discardRoomPhotoUpload = callableHttps.onCall(
     }
 
     await db.runTransaction(async (transaction) => {
-      const roomSnapshot = await transaction.get(roomRef);
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const listing = resolveRoomListing(draft, published);
+      const roomSnapshot = listing ? listing.snapshot : null;
       const operationSnapshot = await transaction.get(operationRef);
       const quotaSnapshot = await transaction.get(quotaRef);
       const roomQuotaSnapshot = await transaction.get(roomQuotaRef);
@@ -1956,14 +2007,19 @@ export async function cleanupExpiredRoomPhotoUploads(): Promise<{
         .collection('roomPhotoUploadQuotas')
         .doc(quotaDocumentId(ownerId));
       const roomQuotaRef = db.collection('roomPhotoRoomQuotas').doc(roomId);
-      const roomRef = db.collection('rooms').doc(roomId);
+      const roomDocuments = roomListingDocuments(roomId);
 
       let keep = false;
       let keepAsReferenced = false;
       let quarantine = false;
       try {
         await db.runTransaction(async (transaction) => {
-          const roomSnapshot = await transaction.get(roomRef);
+          const { draft, published } = await readRoomListingPair(
+            transaction,
+            roomId,
+          );
+          const listing = resolveRoomListing(draft, published);
+          const roomSnapshot = listing ? listing.snapshot : null;
           const operationSnapshot = await transaction.get(operationRef);
           const quotaSnapshot = await transaction.get(quotaRef);
           const roomQuotaSnapshot = await transaction.get(roomQuotaRef);
@@ -2015,7 +2071,7 @@ export async function cleanupExpiredRoomPhotoUploads(): Promise<{
           }
 
           const url = String(current.url || '').trim();
-          const room = roomSnapshot.exists
+          const room = roomSnapshot && roomSnapshot.exists
             ? (roomSnapshot.data() as Record<string, any>)
             : null;
           if (roomReferencesUrl(room, url)) {
@@ -2065,7 +2121,12 @@ export async function cleanupExpiredRoomPhotoUploads(): Promise<{
 
         await deleteStorageObject(ownerId, roomId, uploadId);
         await db.runTransaction(async (transaction) => {
-          const roomSnapshot = await transaction.get(roomRef);
+          const { draft, published } = await readRoomListingPair(
+            transaction,
+            roomId,
+          );
+          const listing = resolveRoomListing(draft, published);
+          const roomSnapshot = listing ? listing.snapshot : null;
           const operationSnapshot = await transaction.get(operationRef);
           const quotaSnapshot = await transaction.get(quotaRef);
           const roomQuotaSnapshot = await transaction.get(roomQuotaRef);

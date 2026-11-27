@@ -260,6 +260,7 @@ class _AdminRoomCard extends ConsumerWidget {
         statusColor = Colors.orange;
         break;
       case RoomStatus.inactive:
+      case RoomStatus.draft:
         statusColor = Colors.grey;
         break;
     }
@@ -412,6 +413,10 @@ class _AdminRoomCard extends ConsumerWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: RoomStatus.values
+                // A draft is published by the owner through the server. An
+                // administrator may delete it, but may not turn it into a
+                // published listing.
+                .where((status) => status != RoomStatus.draft)
                 .map(
                   (status) => RadioListTile<RoomStatus>(
                     title: Text(status.label),

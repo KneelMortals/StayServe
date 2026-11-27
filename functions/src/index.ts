@@ -419,6 +419,7 @@ export {
   publishRoomListing,
   onRoomCreated,
   onRoomUpdated,
+  onRoomDraftUpdated,
   processRoomPhotoCleanupJobs,
 } from './rooms';
 

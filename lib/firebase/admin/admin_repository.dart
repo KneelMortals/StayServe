@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/constants/app_constants.dart';
 import '../../core/constants/enums.dart';
 import '../../core/utils/app_logger.dart';
+import '../../core/utils/combine_latest.dart';
 import '../../models/user_model.dart';
 import '../../models/room_model.dart';
 import '../../models/join_request_model.dart';
@@ -274,13 +275,36 @@ class AdminRepository {
   /// equality query never matches a document that does not have the field,
   /// so a listing whose `status` is missing (an older document) would be
   /// invisible in the admin list even though it is a valid listing.
+  ///
+  /// The published listings and the unfinished drafts live in two separate
+  /// collections. An administrator may read both, so both are watched and
+  /// merged: an abandoned draft stays visible to the administrator who has
+  /// to clean it up.
   Stream<List<RoomModel>> watchAllRooms({RoomStatus? statusFilter}) {
-    return _firestore
+    final published = _firestore
         .collection('rooms')
         .orderBy('createdAt', descending: true)
-        .snapshots()
-        .map((snapshot) {
-          var rooms = snapshot.docs
+        .snapshots();
+    final drafts = _firestore
+        .collection('roomDrafts')
+        .orderBy('createdAt', descending: true)
+        .snapshots();
+
+    return combineLatest2<
+          QuerySnapshot<Map<String, dynamic>>,
+          QuerySnapshot<Map<String, dynamic>>,
+          List<QueryDocumentSnapshot<Map<String, dynamic>>>
+        >(
+          published,
+          drafts,
+          (publishedSnapshot, draftSnapshot) =>
+              <QueryDocumentSnapshot<Map<String, dynamic>>>[
+                ...publishedSnapshot.docs,
+                ...draftSnapshot.docs,
+              ],
+        )
+        .map((documents) {
+          var rooms = documents
               .map((doc) {
                 try {
                   return RoomModel.fromJson(doc.data(), documentId: doc.id);
@@ -290,6 +314,8 @@ class AdminRepository {
               })
               .whereType<RoomModel>()
               .toList();
+
+          rooms.sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
           if (statusFilter != null) {
             rooms = rooms.where((room) => room.status == statusFilter).toList();

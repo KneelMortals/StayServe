@@ -131,6 +131,21 @@ class RecordingAuthRepository implements AuthRepository {
   /// Optional asynchronous work for a profile synchronisation.
   Future<void> Function()? syncAuthProfileAction;
 
+  /// The verification facts which the server reports after a sync.
+  ///
+  /// The server owns these facts: it re-reads the live Firebase Auth record
+  /// together with the durable phone-verification proof. The fake therefore
+  /// has to be able to answer "the phone is **not** verified" so that the
+  /// client gate can be tested.
+  bool syncPhoneVerified = true;
+  bool syncEmailVerified = true;
+
+  /// Whether the server answer omits the `phoneVerified` field entirely.
+  ///
+  /// A missing field is a failure too: the client must never infer a
+  /// verification from an absent answer.
+  bool syncOmitsPhoneVerified = false;
+
   /// Optional asynchronous work for a verified-email link.
   Future<void> Function()? linkVerifiedEmailAction;
   Object? updateProfileError;
@@ -341,8 +356,8 @@ class RecordingAuthRepository implements AuthRepository {
     if (action != null) await action();
     return <String, dynamic>{
       'success': true,
-      'phoneVerified': true,
-      'emailVerified': true,
+      if (!syncOmitsPhoneVerified) 'phoneVerified': syncPhoneVerified,
+      'emailVerified': syncEmailVerified,
     };
   }
 

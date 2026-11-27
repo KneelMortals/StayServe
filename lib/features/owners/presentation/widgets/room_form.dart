@@ -34,6 +34,15 @@ class RoomForm extends ConsumerStatefulWidget {
   final Future<void> Function(RoomDraft draft) onSubmit;
   final String submitLabel;
 
+  /// Creates the id of a brand-new home.
+  ///
+  /// The id is generated **once** per form session, so that a retry of the
+  /// same submission keeps the same attempt key and therefore completes the
+  /// **same** listing instead of publishing a second one under a second
+  /// home. The default derives the id from the current time; a test injects
+  /// a deterministic factory.
+  final String Function()? newHomeIdFactory;
+
   const RoomForm({
     required this.onSubmit,
     this.initialRoom,
@@ -41,6 +50,7 @@ class RoomForm extends ConsumerStatefulWidget {
     this.homes = const [],
     this.initialHomeId,
     this.submitLabel = 'Save Listing',
+    this.newHomeIdFactory,
     super.key,
   });
 
@@ -79,6 +89,14 @@ class _RoomFormState extends ConsumerState<RoomForm> {
   ///
   /// `null` means "a brand new home".
   String? _selectedHomeId;
+
+  /// The id of the home which this form created.
+  ///
+  /// The id is generated **once** per form session. A retry of the same
+  /// submission therefore uses the same id, so the retry key of the listing
+  /// stays stable: the same form must never create a second listing under a
+  /// second home.
+  String? _generatedHomeId;
 
   /// The coordinates of the listing.
   double? _latitude;
@@ -154,6 +172,19 @@ class _RoomFormState extends ConsumerState<RoomForm> {
     super.dispose();
   }
 
+  /// The home which the listing belongs to.
+  ///
+  /// A selected home is used as it is. A **new** home receives an id which
+  /// is generated once and then kept for the whole lifetime of this form, so
+  /// that a retry of the same submission is recognised as the same attempt.
+  String? _resolveHomeId(String homeName) {
+    if (_selectedHomeId != null) return _selectedHomeId;
+    if (homeName.isEmpty) return null;
+    return _generatedHomeId ??=
+        widget.newHomeIdFactory?.call() ??
+        'HOME-${DateTime.now().millisecondsSinceEpoch}';
+  }
+
   Future<void> _submit() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
 
@@ -163,11 +194,7 @@ class _RoomFormState extends ConsumerState<RoomForm> {
     final now = DateTime.now();
 
     final homeName = _homeNameController.text.trim();
-    final homeId =
-        _selectedHomeId ??
-        (homeName.isEmpty
-            ? null
-            : 'HOME-${DateTime.now().millisecondsSinceEpoch}');
+    final homeId = _resolveHomeId(homeName);
 
     final room = RoomModel(
       roomId: existing?.roomId ?? '',

@@ -23,7 +23,18 @@
 //   STAYSERVE_LIVE_PHONE_CAPTCHA        an optional reCAPTCHA response
 //
 // `node tools/live_test_identity.mjs request-code --phone +919876543210`
-// sends a fresh code and prints the session which belongs to it.
+// sends a fresh code and stores the session which belongs to it in a
+// private file. The session handle is a bearer credential for the pending
+// SMS challenge, so it is never written to stdout.
+
+import {
+  maskPhoneNumber,
+  maskSensitiveText,
+} from './mask_pii.mjs';
+
+import nodeFs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const AUTH_BASE = 'https://identitytoolkit.googleapis.com/v1';
 
@@ -111,7 +122,7 @@ export async function attachVerifiedPhone({
   if (signIn.status !== 200 || !signIn.body?.idToken) {
     throw new Error(
       `Could not sign the disposable live identity in: HTTP ${signIn.status} ` +
-        JSON.stringify(signIn.body),
+        maskSensitiveText(JSON.stringify(signIn.body)),
     );
   }
   if (signIn.body.localId && signIn.body.localId !== uid) {
@@ -136,7 +147,7 @@ export async function attachVerifiedPhone({
     if (sent.status !== 200 || !sent.body?.sessionInfo) {
       throw new Error(
         `Could not request the phone verification code: HTTP ${sent.status} ` +
-          JSON.stringify(sent.body),
+          maskSensitiveText(JSON.stringify(sent.body)),
       );
     }
     sessionInfo = String(sent.body.sessionInfo);
@@ -144,12 +155,14 @@ export async function attachVerifiedPhone({
 
   const code = String(verificationCode || '').trim();
   if (!code) {
+    // The session handle is a bearer credential for the pending SMS
+    // challenge. It is never part of an error message: the operator reads it
+    // from the private file which `request-code` writes.
     throw new Error(
       'The live probe needs the SMS code of the test number. ' +
-        `A verification code was requested for ${phoneNumber}; ` +
-        're-run with STAYSERVE_LIVE_PHONE_SESSION_INFO=' +
-        sessionInfo +
-        ' and STAYSERVE_LIVE_PHONE_CODE=<code>.',
+        `A verification code was requested for ${maskPhoneNumber(phoneNumber)}; ` +
+        're-run with STAYSERVE_LIVE_PHONE_SESSION_INFO=<session> ' +
+        'and STAYSERVE_LIVE_PHONE_CODE=<code>.',
     );
   }
 
@@ -168,7 +181,7 @@ export async function attachVerifiedPhone({
   if (linked.status !== 200 || !linked.body?.idToken) {
     throw new Error(
       `Could not link the verified phone identity: HTTP ${linked.status} ` +
-        JSON.stringify(linked.body),
+        maskSensitiveText(JSON.stringify(linked.body)),
     );
   }
 
@@ -214,7 +227,7 @@ export async function refreshIdentityToken({ apiKey, email, password }) {
   if (signIn.status !== 200 || !signIn.body?.idToken) {
     throw new Error(
       `Could not refresh the disposable live identity: HTTP ${signIn.status} ` +
-        JSON.stringify(signIn.body),
+        maskSensitiveText(JSON.stringify(signIn.body)),
     );
   }
   return {
@@ -260,7 +273,7 @@ export async function syncVerifiedPhoneProfile({
   if (response.status !== 200) {
     throw new Error(
       `Could not record the verified-phone proof: HTTP ${response.status} ` +
-        JSON.stringify(response.body),
+        maskSensitiveText(JSON.stringify(response.body)),
     );
   }
   const result = response.body?.result || {};
@@ -356,7 +369,7 @@ export async function requestPhoneVerificationCode({
   if (sent.status !== 200 || !sent.body?.sessionInfo) {
     throw new Error(
       `Could not request the phone verification code: HTTP ${sent.status} ` +
-        JSON.stringify(sent.body),
+        maskSensitiveText(JSON.stringify(sent.body)),
     );
   }
   return { sessionInfo: String(sent.body.sessionInfo) };
@@ -379,13 +392,29 @@ if (
   }
   requestPhoneVerificationCode({ apiKey, phoneNumber })
     .then(({ sessionInfo }) => {
-      console.log('STAYSERVE_LIVE_PHONE_SESSION_INFO=' + sessionInfo);
+      // The session handle is a bearer credential for the pending SMS
+      // challenge. It is written to a private file instead of stdout, so it
+      // never reaches a shell history, a pipe or a CI log.
+      const target = path.join(
+        os.tmpdir(),
+        `stayserve-live-phone-session-${process.pid}`,
+      );
+      nodeFs.writeFileSync(target, sessionInfo, { mode: 0o600 });
+      try {
+        nodeFs.chmodSync(target, 0o600);
+      } catch {
+        // A file system which does not support the mode is still better than
+        // printing the handle into a log.
+      }
+      console.log(`STAYSERVE_LIVE_PHONE_SESSION_INFO_FILE=${target}`);
       console.log(
-        'Enter the code from the SMS as STAYSERVE_LIVE_PHONE_CODE=<code>.',
+        'Read the session from that file and export it as ' +
+          'STAYSERVE_LIVE_PHONE_SESSION_INFO, then enter the code from the ' +
+          'SMS as STAYSERVE_LIVE_PHONE_CODE=<code>.',
       );
     })
     .catch((error) => {
-      console.error(String(error?.message || error));
+      console.error(maskSensitiveText(String(error?.message || error)));
       process.exit(1);
     });
 }

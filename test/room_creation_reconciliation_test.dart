@@ -94,14 +94,26 @@ class _FakeCallableResult implements HttpsCallableResult<dynamic> {
   dynamic noSuchMethod(Invocation invocation) => null;
 }
 
-/// A Firestore double for the room collection.
+/// A Firestore double for the room collections.
+///
+/// The published listings live in `rooms` and the unfinished drafts live in
+/// `roomDrafts`. A draft has its own collection because a Firestore query
+/// cannot be filtered by the rules: a draft which shared the public
+/// collection would be returned by every query of it.
 class _FakeFirestore implements FirebaseFirestore {
-  /// The stored rooms, keyed by their id.
+  /// The stored published listings, keyed by their id.
   final Map<String, Map<String, dynamic>> rooms =
+      <String, Map<String, dynamic>>{};
+
+  /// The stored draft listings, keyed by their id.
+  final Map<String, Map<String, dynamic>> drafts =
       <String, Map<String, dynamic>>{};
 
   /// The ids of the documents which were written.
   final List<String> writes = <String>[];
+
+  /// The collection of every write, in order.
+  final List<String> writeCollections = <String>[];
 
   /// The payloads of the documents which were written.
   final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
@@ -127,12 +139,18 @@ class _FakeFirestore implements FirebaseFirestore {
   /// Runs after every read. It models a concurrent change of the listing.
   void Function(String id)? afterGet;
 
+  /// The store which belongs to a collection path.
+  Map<String, Map<String, dynamic>> storeOf(String path) {
+    if (path == 'rooms') return rooms;
+    if (path == 'roomDrafts') return drafts;
+    throw StateError('Unexpected collection: $path');
+  }
+
   @override
   CollectionReference<Map<String, dynamic>> collection(String path) {
-    if (path != 'rooms') {
-      throw StateError('Unexpected collection: $path');
-    }
-    return _FakeRoomCollection(this);
+    // Touch the store so that an unknown collection fails immediately.
+    storeOf(path);
+    return _FakeRoomCollection(this, path);
   }
 
   @override
@@ -149,7 +167,7 @@ class _FakeFirestore implements FirebaseFirestore {
       throw StateError('Firestore is not available in this test');
 }
 
-/// A transaction double for the room collection.
+/// A transaction double for the room collections.
 class _FakeTransaction implements Transaction {
   _FakeTransaction(this.firestore);
 
@@ -167,8 +185,10 @@ class _FakeTransaction implements Transaction {
       throw failed;
     }
     final id = documentReference.id;
-    final snapshot =
-        _FakeRoomSnapshot(id, firestore.rooms[id]) as DocumentSnapshot<T>;
+    final path = documentReference.path;
+    final collectionPath = path.split('/').first;
+    final store = firestore.storeOf(collectionPath);
+    final snapshot = _FakeRoomSnapshot(id, store[id]) as DocumentSnapshot<T>;
     firestore.afterGet?.call(id);
     return snapshot;
   }
@@ -179,9 +199,13 @@ class _FakeTransaction implements Transaction {
     Map<String, dynamic> data,
   ) {
     final id = documentReference.id;
+    final path = documentReference.path;
+    final collectionPath = path.split('/').first;
+    final store = firestore.storeOf(collectionPath);
     firestore.writes.add(id);
+    firestore.writeCollections.add(collectionPath);
     firestore.payloads.add(Map<String, dynamic>.from(data));
-    firestore.rooms[id] = <String, dynamic>{...?firestore.rooms[id], ...data};
+    store[id] = <String, dynamic>{...?store[id], ...data};
     return this;
   }
 
@@ -191,20 +215,23 @@ class _FakeTransaction implements Transaction {
 }
 
 class _FakeRoomCollection implements CollectionReference<Map<String, dynamic>> {
-  _FakeRoomCollection(this.firestore);
+  _FakeRoomCollection(this.firestore, this.collectionPath);
 
   @override
   final _FakeFirestore firestore;
 
-  @override
-  String get id => 'rooms';
+  /// The collection which this reference addresses.
+  final String collectionPath;
 
   @override
-  String get path => 'rooms';
+  String get id => collectionPath;
+
+  @override
+  String get path => collectionPath;
 
   @override
   DocumentReference<Map<String, dynamic>> doc([String? path]) {
-    return _FakeRoomDocument(firestore, path ?? '');
+    return _FakeRoomDocument(firestore, collectionPath, path ?? '');
   }
 
   @override
@@ -213,16 +240,19 @@ class _FakeRoomCollection implements CollectionReference<Map<String, dynamic>> {
 }
 
 class _FakeRoomDocument implements DocumentReference<Map<String, dynamic>> {
-  _FakeRoomDocument(this.firestore, this.id);
+  _FakeRoomDocument(this.firestore, this.collectionPath, this.id);
 
   @override
   final _FakeFirestore firestore;
+
+  /// The collection which this document belongs to.
+  final String collectionPath;
 
   @override
   final String id;
 
   @override
-  String get path => 'rooms/$id';
+  String get path => '$collectionPath/$id';
 
   @override
   CollectionReference<Map<String, dynamic>> collection(String collectionPath) {
@@ -231,19 +261,22 @@ class _FakeRoomDocument implements DocumentReference<Map<String, dynamic>> {
 
   @override
   Future<void> set(Map<String, dynamic> data, [SetOptions? options]) async {
+    final store = firestore.storeOf(collectionPath);
     final failed = firestore.failedWrite;
     if (failed != null) {
       firestore.failedWrite = null;
       firestore.writes.add(id);
+      firestore.writeCollections.add(collectionPath);
       throw failed;
     }
 
     firestore.writes.add(id);
+    firestore.writeCollections.add(collectionPath);
     firestore.payloads.add(Map<String, dynamic>.from(data));
     if (options is SetOptions && options.merge == true) {
-      firestore.rooms[id] = <String, dynamic>{...?firestore.rooms[id], ...data};
+      store[id] = <String, dynamic>{...?store[id], ...data};
     } else {
-      firestore.rooms[id] = Map<String, dynamic>.from(data);
+      store[id] = Map<String, dynamic>.from(data);
     }
     final lost = firestore.lostAcknowledgement;
     if (lost != null) {
@@ -263,7 +296,8 @@ class _FakeRoomDocument implements DocumentReference<Map<String, dynamic>> {
       firestore.failNextGet = null;
       throw failed;
     }
-    final snapshot = _FakeRoomSnapshot(id, firestore.rooms[id]);
+    final store = firestore.storeOf(collectionPath);
+    final snapshot = _FakeRoomSnapshot(id, store[id]);
     firestore.afterGet?.call(id);
     return snapshot;
   }
@@ -389,6 +423,17 @@ OwnerRepository _repository({
   );
 }
 
+/// Models the server-side publication of a draft.
+///
+/// The publication **moves** the draft into the public collection and marks
+/// the copy as available. A draft which stayed behind would still be
+/// invisible, but the listing would exist twice.
+void _simulatePublishedListing(_FakeFirestore firestore, String roomId) {
+  final draft = firestore.drafts.remove(roomId);
+  if (draft == null) return;
+  firestore.rooms[roomId] = <String, dynamic>{...draft, 'status': 'available'};
+}
+
 void main() {
   group('the room-create acknowledgement is reconciled', () {
     test('a lost acknowledgement completes the same listing', () async {
@@ -402,9 +447,11 @@ void main() {
         functions: functions,
       ).createRoom(_draft());
 
-      expect(firestore.rooms.length, 1);
-      expect(firestore.rooms.containsKey(roomId), isTrue);
+      expect(firestore.drafts.length, 1);
+      expect(firestore.drafts.containsKey(roomId), isTrue);
+      expect(firestore.rooms.containsKey(roomId), isFalse);
       expect(firestore.writes, <String>[roomId]);
+      expect(firestore.writeCollections, <String>['roomDrafts']);
       expect(functions.parameters['setRoomPrivateLocation']?['roomId'], roomId);
       // The retry must not publish a second listing.
       expect(firestore.writes.length, 1);
@@ -435,8 +482,8 @@ void main() {
       final roomId = await repository.createRoom(_draft());
 
       expect(roomId, firstRoomId);
-      expect(firestore.rooms.length, 1);
-      expect(firestore.rooms.keys.single, firstRoomId);
+      expect(firestore.drafts.length, 1);
+      expect(firestore.drafts.keys.single, firstRoomId);
     });
 
     test('a listing of another owner is never reused', () async {
@@ -457,7 +504,7 @@ void main() {
 
       // Somebody else owns the document under the pending id.
       firestore.unreadable = null;
-      firestore.rooms[firstRoomId] = <String, dynamic>{
+      firestore.drafts[firstRoomId] = <String, dynamic>{
         'roomId': firstRoomId,
         'ownerId': 'owner-2',
       };
@@ -465,7 +512,7 @@ void main() {
       final roomId = await repository.createRoom(_draft());
 
       expect(roomId, isNot(firstRoomId));
-      expect(firestore.rooms[roomId]?['ownerId'], 'owner-1');
+      expect(firestore.drafts[roomId]?['ownerId'], 'owner-1');
     });
 
     test('a failed private location removes the incomplete listing', () async {
@@ -524,13 +571,7 @@ void main() {
         // The server published the listing, but the acknowledgement was lost.
         functions.onFailingCall = (name, parameters) {
           if (name != 'publishRoomListing') return;
-          final roomId = parameters['roomId'] as String;
-          final room = firestore.rooms[roomId];
-          if (room == null) return;
-          firestore.rooms[roomId] = <String, dynamic>{
-            ...room,
-            'status': 'available',
-          };
+          _simulatePublishedListing(firestore, parameters['roomId'] as String);
         };
 
         final roomId = await _repository(
@@ -541,6 +582,7 @@ void main() {
         // The listing is complete: it must not be removed by the failed
         // acknowledgement.
         expect(firestore.rooms[roomId]?['status'], 'available');
+        expect(firestore.drafts.containsKey(roomId), isFalse);
         expect(functions.calls, isNot(contains('deleteRoomListing')));
       },
     );
@@ -601,13 +643,7 @@ void main() {
         // never learned about it.
         functions.onFailingCall = (name, parameters) {
           if (name != 'publishRoomListing') return;
-          final roomId = parameters['roomId'] as String;
-          final room = firestore.rooms[roomId];
-          if (room == null) return;
-          firestore.rooms[roomId] = <String, dynamic>{
-            ...room,
-            'status': 'available',
-          };
+          _simulatePublishedListing(firestore, parameters['roomId'] as String);
         };
         // The publication state cannot be read, so it stays unknown.
         firestore.failNextGet = Exception('The document is unavailable.');
@@ -711,6 +747,46 @@ void main() {
 
       expect(secondRoomId, isNot(firstRoomId));
     });
+
+    test(
+      'a retry which keeps the same home completes the same listing',
+      () async {
+        final firestore = _FakeFirestore();
+        final functions = _RecordingFunctionsService();
+        // The private location and the cleanup of the incomplete listing both
+        // fail, so the attempt stays pending.
+        functions.failing.add('setRoomPrivateLocation');
+        functions.failing.add('deleteRoomListing');
+        final repository = _repository(
+          firestore: firestore,
+          functions: functions,
+        );
+
+        // The home id of a **new** home is generated once per form session, so
+        // the retry of the same form carries the same id.
+        final draft = _draft(
+          room: _draft().room.copyWith(
+            homeId: 'HOME-1',
+            homeName: 'Sunrise Apartments',
+          ),
+        );
+
+        await expectLater(
+          repository.createRoom(draft),
+          throwsA(isA<Exception>()),
+        );
+        final firstRoomId = firestore.writes.single;
+
+        functions.failing.clear();
+        final roomId = await repository.createRoom(draft);
+
+        // The same home keeps the same attempt key, so the retry completes the
+        // listing of the first attempt instead of publishing a second one.
+        expect(roomId, firstRoomId);
+        expect(firestore.drafts.length, 1);
+        expect(firestore.drafts[roomId]?['homeId'], 'HOME-1');
+      },
+    );
   });
 
   group('a rejected owner edit changes nothing', () {

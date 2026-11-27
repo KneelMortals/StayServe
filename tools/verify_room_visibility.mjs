@@ -34,6 +34,7 @@ import {
   appCheckHeaders,
   assertAppCheckConfigured,
 } from './app_check.mjs';
+import { safeErrorText } from './mask_pii.mjs';
 
 const KEY = 'AIzaSyDXm8VBnXgwKHajc-0GRwVHb5mk95agIUM';
 const PROJ = 'myfirstapp-fa30f52b';
@@ -347,8 +348,9 @@ async function main() {
   tokens.set(student.uid, student.token);
 
   // -----------------------------------------------------------------------
-  // 1. A listing **without** the server-owned state is refused. The old
-  //    compatibility window is closed: the status is server-owned.
+  // 1. The **published** collection is server-owned. A client may never put
+  //    a document into it, so an unfinished listing can never appear in a
+  //    query of the public listings.
   // -----------------------------------------------------------------------
   const legacyRoomId = `${owner.uid}-legacy`;
   created.roomIds.push(legacyRoomId);
@@ -363,32 +365,63 @@ async function main() {
     },
   });
   check(
-    'an owner may NOT create a listing without the server-owned draft state',
+    'an owner may NOT write into the published collection',
     legacyCreate.status >= 400,
     `HTTP ${legacyCreate.status}`,
   );
 
   // -----------------------------------------------------------------------
-  // 2. The listing of the **current** app: it is created as a draft.
+  // 2. The listing of the **current** app: it is created as a draft in its
+  //    own owner-scoped collection.
   // -----------------------------------------------------------------------
   const currentRoomId = `${owner.uid}-current`;
   created.roomIds.push(currentRoomId);
-  const currentCreate = await clientFs(owner.token, 'PATCH', `/rooms/${currentRoomId}`, {
-    fields: {
-      roomId: { stringValue: currentRoomId },
-      ownerId: { stringValue: owner.uid },
-      title: { stringValue: 'Visibility check (current payload)' },
-      monthlyRent: { doubleValue: 7000 },
-      occupancy: { integerValue: '2' },
-      status: { stringValue: 'draft' },
-      currentOccupancy: { integerValue: '0' },
-      createdAt: { timestampValue: new Date().toISOString() },
+  const currentCreate = await clientFs(
+    owner.token,
+    'PATCH',
+    `/roomDrafts/${currentRoomId}`,
+    {
+      fields: {
+        roomId: { stringValue: currentRoomId },
+        ownerId: { stringValue: owner.uid },
+        title: { stringValue: 'Visibility check (current payload)' },
+        monthlyRent: { doubleValue: 7000 },
+        occupancy: { integerValue: '2' },
+        status: { stringValue: 'draft' },
+        currentOccupancy: { integerValue: '0' },
+        createdAt: { timestampValue: new Date().toISOString() },
+      },
     },
-  });
+  );
   check(
     'an owner may create a listing as a draft',
     currentCreate.status === 200,
     `HTTP ${currentCreate.status}`,
+  );
+
+  // -----------------------------------------------------------------------
+  // 2a. The draft is private to its owner. A student may neither read it
+  //     nor list it.
+  // -----------------------------------------------------------------------
+  const draftRead = await clientFs(
+    student.token,
+    'GET',
+    `/roomDrafts/${currentRoomId}`,
+  );
+  check(
+    'a student may NOT read a foreign draft listing',
+    draftRead.status >= 400,
+    `HTTP ${draftRead.status}`,
+  );
+  const draftList = await clientFs(
+    student.token,
+    'GET',
+    '/roomDrafts',
+  );
+  check(
+    'a student may NOT list the draft listings',
+    draftList.status >= 400,
+    `HTTP ${draftList.status}`,
   );
 
   // -----------------------------------------------------------------------
@@ -459,7 +492,9 @@ async function main() {
 }
 
 main().catch(async (error) => {
-  console.error('ERROR:', error);
+  // The error of a Firebase call can carry the phone number, the API key or
+  // an identity token. Only the masked message is printed.
+  console.error('ERROR:', safeErrorText(error));
   try { await cleanup(); } catch (_) { /* ignore */ }
   process.exit(2);
 });

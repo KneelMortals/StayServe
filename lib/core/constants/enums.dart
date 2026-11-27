@@ -19,7 +19,13 @@ enum FurnishingType { unfurnished, semi, fully }
 
 enum GenderPreference { male, female, any }
 
-enum RoomStatus { available, occupied, inactive }
+/// The publication state of a room listing.
+///
+/// A [RoomStatus.draft] listing is an **unfinished** listing. It lives in
+/// the owner-only `roomDrafts` collection and is never offered to a student.
+/// The server moves it into the public `rooms` collection once it is
+/// complete.
+enum RoomStatus { available, occupied, inactive, draft }
 
 enum JoinRequestStatus {
   pending,
@@ -105,6 +111,7 @@ extension RoomStatusX on RoomStatus {
     RoomStatus.available => 'Available',
     RoomStatus.occupied => 'Occupied',
     RoomStatus.inactive => 'Inactive',
+    RoomStatus.draft => 'Draft',
   };
   static RoomStatus fromString(String value) => RoomStatus.values.firstWhere(
     (e) => e.name == value,

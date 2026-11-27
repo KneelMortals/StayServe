@@ -25,6 +25,10 @@ import {
 } from './notifications';
 import { isValidCurrentOccupancy } from './roomValidation';
 import {
+  ROOM_DRAFTS_COLLECTION,
+  ROOM_LISTINGS_COLLECTION,
+} from './roomListings';
+import {
   ADMIN_MESSAGE_NOTIFICATION_OPERATIONS,
   ADMIN_SUPPORT_CONVERSATION_OPERATIONS,
   ADMIN_SUPPORT_REPLY_NOTIFICATION_OPERATIONS,
@@ -230,37 +234,43 @@ async function assertAccountDeletionIsSafe(uid: string): Promise<void> {
  * The private document is addressed by the room's Firestore document id, not
  * only by its `ownerId` field. A corrupt owner id therefore cannot leave an
  * exact address orphaned after the listing is removed.
+ *
+ * The unpublished drafts are removed as well. They live in their own
+ * collection, so a published-only cleanup would leave the unfinished
+ * listings of a deleted account behind.
  */
 async function deleteOwnerRoomsAndPrivateLocations(uid: string): Promise<void> {
-  let cursor: firestore.QueryDocumentSnapshot | undefined;
+  for (const collection of [ROOM_LISTINGS_COLLECTION, ROOM_DRAFTS_COLLECTION]) {
+    let cursor: firestore.QueryDocumentSnapshot | undefined;
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    let query = db
-      .collection('rooms')
-      .where('ownerId', '==', uid)
-      .orderBy(firestore.FieldPath.documentId());
-    if (cursor) query = query.startAfter(cursor);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      let query = db
+        .collection(collection)
+        .where('ownerId', '==', uid)
+        .orderBy(firestore.FieldPath.documentId());
+      if (cursor) query = query.startAfter(cursor);
 
-    const snapshot = await query.limit(PAGE_SIZE).get();
-    if (snapshot.empty) break;
+      const snapshot = await query.limit(PAGE_SIZE).get();
+      if (snapshot.empty) break;
 
-    const roomsPerBatch = Math.max(1, Math.floor(BATCH_SIZE / 2));
-    for (
-      let index = 0;
-      index < snapshot.docs.length;
-      index += roomsPerBatch
-    ) {
-      const batch = db.batch();
-      for (const room of snapshot.docs.slice(index, index + roomsPerBatch)) {
-        batch.delete(room.ref);
-        batch.delete(db.collection('roomPrivate').doc(room.id));
+      const roomsPerBatch = Math.max(1, Math.floor(BATCH_SIZE / 2));
+      for (
+        let index = 0;
+        index < snapshot.docs.length;
+        index += roomsPerBatch
+      ) {
+        const batch = db.batch();
+        for (const room of snapshot.docs.slice(index, index + roomsPerBatch)) {
+          batch.delete(room.ref);
+          batch.delete(db.collection('roomPrivate').doc(room.id));
+        }
+        await batch.commit();
       }
-      await batch.commit();
-    }
 
-    cursor = snapshot.docs[snapshot.docs.length - 1];
-    if (snapshot.size < PAGE_SIZE) break;
+      cursor = snapshot.docs[snapshot.docs.length - 1];
+      if (snapshot.size < PAGE_SIZE) break;
+    }
   }
 }
 

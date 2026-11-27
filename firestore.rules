@@ -325,12 +325,24 @@ service cloud.firestore {
     // Whether an unpublished (draft) listing may be read by the caller.
     //
     // A draft belongs to its owner.  A live administrator may inspect it
-    // (for example after `adminSetRoomListingStatus` is used to publish a
-    // listing by hand).  Every other account is refused.
+    // (for example to remove an abandoned listing).  Every other account is
+    // refused.
+    //
+    // The unfinished listings live in their own collection now, so this
+    // helper only guards the published collection against a stray draft.
     function roomDraftIsVisibleToCaller() {
       return resource.data.get('status', '') != 'draft' ||
         resource.data.get('ownerId', '') == request.auth.uid ||
         isAdmin();
+    }
+
+    // Whether a published listing already uses this room id.
+    //
+    // The room id identifies one immutable listing lifetime. A draft may not
+    // take the id of a published listing, otherwise the two documents would
+    // describe two different listings under one id.
+    function roomListingExists(roomId) {
+      return exists(/databases/$(database)/documents/rooms/$(roomId));
     }
 
     // ----------------------------------------------------------------------
@@ -512,6 +524,16 @@ service cloud.firestore {
           resource.data.get('roomId', '');
     }
 
+    // The same edit policy for an unpublished draft.
+    //
+    // A draft may never change into a published listing through a client
+    // write: the publication is a server operation which copies the draft
+    // into the public collection.
+    function ownerMayUpdateRoomDraft() {
+      return ownerMayUpdateRoom() &&
+        resource.data.get('status', '') == 'draft';
+    }
+
     // ======================================================================
     // Users collection
     // ======================================================================
@@ -546,14 +568,19 @@ service cloud.firestore {
     // ======================================================================
     // Rooms collection
     // ======================================================================
+    //
+    // This collection holds the **published** listings only. An unfinished
+    // listing lives in `roomDrafts`, which is owner-scoped — see below.
+    //
+    // The split is a security requirement, not a convenience: Firestore
+    // rules cannot filter a collection query. A draft which shared this
+    // collection would be returned by every query of it — including the
+    // student search — and the single-document `get` rule could not hide it
+    // from a collection query.
     match /rooms/{roomId} {
       // Listing and searching rooms is available to live, registered
       // accounts.  Public, pre-registration configuration lives in
       // publicSettings and is handled separately.
-      //
-      // A **draft** is an unpublished listing.  It is readable by its owner
-      // and by a live administrator only, so a single-document read of
-      // somebody else's unfinished listing is refused.
       allow get: if isLiveRegisteredAccount() &&
         roomDraftIsVisibleToCaller();
 
@@ -561,10 +588,60 @@ service cloud.firestore {
       // search deliberately pages through the collection without a status
       // filter (the status is applied in Dart, because a listing without the
       // field is still a valid listing).  The list therefore stays open for
-      // live, registered accounts.  An unfinished listing is never
-      // bookable: the server-side booking check requires the `available`
-      // status, and the draft carries no exact address.
+      // live, registered accounts.  Every document of this collection is a
+      // published listing, so an unfinished listing is never part of the
+      // result.
       allow list: if isLiveRegisteredAccount();
+
+      // A published listing is created by the **server**. The owner writes an
+      // unfinished listing into `roomDrafts`, and `publishRoomListing` moves
+      // it here once it is complete. A client may therefore never put a
+      // document into the public collection — which is what keeps an
+      // unfinished listing out of every collection query.
+      allow create: if false;
+
+      // Only the owner may edit the legitimate listing fields.  There is no
+      // client path for status, currentOccupancy or any admin room update.
+      allow update: if ownerMayUpdateRoom();
+
+      // Listing deletion is exclusively a server operation.  The
+      // deleteRoomListing callable verifies live owner/admin authority,
+      // cancels open requests and removes the room with the Admin SDK.
+      allow delete: if false;
+    }
+
+    // ======================================================================
+    // Room drafts collection
+    // ======================================================================
+    //
+    // An **unfinished** listing. It belongs to its owner and to nobody else.
+    //
+    // The document carries the complete listing payload, but it is never
+    // offered to a student: it lives in its own collection, so no query of
+    // the public `rooms` collection can return it, and the list rule below
+    // refuses every query which does not filter by the caller's own id.
+    match /roomDrafts/{roomId} {
+      // A draft is readable by its owner and by a live administrator. Every
+      // other account is refused.
+      allow get: if isLiveRegisteredAccount() &&
+        (
+          resource.data.get('ownerId', '') == request.auth.uid ||
+          isAdmin()
+        );
+
+      // The list is owner-scoped. The rule compares the stored owner id with
+      // the signed-in account, so a query which does not filter by the
+      // caller's own id can never be proven safe by the rules engine and is
+      // refused.
+      allow list: if isLiveOwner() &&
+        resource.data.get('ownerId', '') == request.auth.uid;
+
+      // A live administrator may list every draft. The rule does not depend
+      // on the document at all, so the rules engine can prove it for any
+      // query. It is a separate statement on purpose: combining it with the
+      // owner-scoped rule through `||` would make the query analysis of the
+      // owner query depend on the behaviour of the disjunction.
+      allow list: if isAdmin();
 
       // A room is created by its live owner.  The owner id is the signed-in
       // owner and cannot be forged, and the advertised capacity must be a
@@ -574,11 +651,12 @@ service cloud.firestore {
       // the listing exists**.  A new listing is created as a `draft`: it is
       // invisible to the student search and it cannot be booked while its
       // photos and its private exact location are still missing.  The
-      // `publishRoomListing` callable flips it to `available` once the
-      // listing is complete, so a client can never publish a half-finished
+      // `publishRoomListing` callable moves it into the public collection
+      // once it is complete, so a client can never publish a half-finished
       // listing by itself.
       allow create: if isLiveOwner() &&
         roomIdHasNoDeletionTombstone(roomId) &&
+        !roomListingExists(roomId) &&
         roomCreateHasNoClientImages() &&
         publicRoomCreateLocationIsAllowed(request.resource.data) &&
         roomCreateCannotForgeServerLocationFields() &&
@@ -591,13 +669,11 @@ service cloud.firestore {
         request.resource.data.get('currentOccupancy', 0) == 0 &&
         request.resource.data.get('roomId', roomId) == roomId;
 
-      // Only the owner may edit the legitimate listing fields.  There is no
-      // client path for status, currentOccupancy or any admin room update.
-      allow update: if ownerMayUpdateRoom();
+      // The owner may correct the editable fields of their own draft. The
+      // status stays `draft` and the server-owned fields stay untouched.
+      allow update: if ownerMayUpdateRoomDraft();
 
-      // Listing deletion is exclusively a server operation.  The
-      // deleteRoomListing callable verifies live owner/admin authority,
-      // cancels open requests and removes the room with the Admin SDK.
+      // A draft is removed by the server, which also cleans up its photos.
       allow delete: if false;
     }
 
@@ -609,10 +685,23 @@ service cloud.firestore {
     }
 
     function liveOwnerOfRoom(roomId) {
+      // The listing may be an unpublished draft: it lives in its own
+      // collection until the owner publishes it. The exact address belongs to
+      // the listing, so the owner of either collection may read it.
       return request.auth != null &&
         isLiveOwner() &&
-        get(/databases/$(database)/documents/rooms/$(roomId))
-          .data.get('ownerId', '') == request.auth.uid;
+        (
+          (
+            exists(/databases/$(database)/documents/rooms/$(roomId)) &&
+            get(/databases/$(database)/documents/rooms/$(roomId))
+              .data.get('ownerId', '') == request.auth.uid
+          ) ||
+          (
+            exists(/databases/$(database)/documents/roomDrafts/$(roomId)) &&
+            get(/databases/$(database)/documents/roomDrafts/$(roomId))
+              .data.get('ownerId', '') == request.auth.uid
+          )
+        );
     }
 
     // ======================================================================

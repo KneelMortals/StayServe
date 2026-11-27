@@ -392,6 +392,7 @@ class _StatusBadge extends StatelessWidget {
       RoomStatus.available => theme.colorScheme.primary,
       RoomStatus.occupied => theme.colorScheme.tertiary,
       RoomStatus.inactive => theme.colorScheme.outline,
+      RoomStatus.draft => theme.colorScheme.outline,
     };
 
     return Container(

@@ -980,7 +980,18 @@ class AuthController extends AsyncNotifier<void> {
         );
       }
 
-      await authRepo.syncAuthProfile();
+      final syncedProfile = await authRepo.syncAuthProfile();
+      // The server owns the verification facts. It re-reads the live Firebase
+      // Auth record together with the durable phone-verification proof, so it
+      // is the only authority on whether the number really completed the SMS
+      // challenge. A missing or false flag is a failure: the client must
+      // never announce a verified phone which the server did not confirm.
+      final serverPhoneVerified = syncedProfile['phoneVerified'] == true;
+      if (!serverPhoneVerified) {
+        throw StateError(
+          'The phone number could not be verified. Please try again.',
+        );
+      }
       final uid = liveUser?.uid ?? authRepo.currentUser?.uid;
       if (uid != null) {
         ref.read(authProfileTransitionProvider.notifier).state =

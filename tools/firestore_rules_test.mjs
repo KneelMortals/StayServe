@@ -758,7 +758,7 @@ async function main() {
   );
   check(
     'pending account cannot create a room',
-    await create(TOKENS.pending, 'rooms', 'pending-room', {
+    await create(TOKENS.pending, 'roomDrafts', 'pending-room', {
       ownerId: string('pending1'),
       currentOccupancy: integer(0),
       status: string('available'),
@@ -767,7 +767,7 @@ async function main() {
   );
   check(
     'inactive account cannot create a room',
-    await create(TOKENS.inactive, 'rooms', 'inactive-room', {
+    await create(TOKENS.inactive, 'roomDrafts', 'inactive-room', {
       ownerId: string('inactive1'),
       currentOccupancy: integer(0),
       status: string('available'),
@@ -929,7 +929,7 @@ async function main() {
   );
   check(
     'an administrator-provisioned phone cannot create a listing',
-    await create(TOKENS.adminProvisionedPhone, 'rooms', 'room-admin-provisioned', {
+    await create(TOKENS.adminProvisionedPhone, 'roomDrafts', 'room-admin-provisioned', {
       roomId: string('room-admin-provisioned'),
       ownerId: string('admin-provisioned'),
       title: string('Admin provisioned room'),
@@ -1180,13 +1180,15 @@ async function main() {
 
   // ------------------------------------------------------------------
   // An unpublished draft is private to its owner and to a live admin.
-  // A direct single-document read of somebody else's draft is refused;
-  // the collection query stays open because the student search pages
-  // through the collection without a status filter.
+  //
+  // The draft lives in its **own** collection. Firestore rules cannot
+  // filter a collection query, so a draft which shared the public `rooms`
+  // collection would be returned by every query of it — including the
+  // student search — and no single-document rule could hide it there.
   // ------------------------------------------------------------------
   check(
     'the live owner can create a draft listing for the draft-visibility checks',
-    await create(TOKENS.owner, 'rooms', 'owner-draft-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-draft-room', {
       roomId: string('owner-draft-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1199,47 +1201,138 @@ async function main() {
   );
   check(
     'the owner can read their own draft listing',
-    await call(TOKENS.owner, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.owner, 'GET', '/roomDrafts/owner-draft-room'),
     true,
   );
   check(
     'a live student cannot read a foreign draft listing',
-    await call(TOKENS.student, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.student, 'GET', '/roomDrafts/owner-draft-room'),
     false,
   );
   check(
     'a signed-in stranger cannot read a foreign draft listing',
-    await call(TOKENS.stranger, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.stranger, 'GET', '/roomDrafts/owner-draft-room'),
     false,
   );
   check(
     'an anonymous caller cannot read a draft listing',
-    await callAnon('GET', '/rooms/owner-draft-room'),
+    await callAnon('GET', '/roomDrafts/owner-draft-room'),
     false,
   );
   check(
     'a live admin can read a draft listing',
-    await call(TOKENS.admin, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.admin, 'GET', '/roomDrafts/owner-draft-room'),
     true,
   );
   check(
     'a forged admin claim without a live admin profile cannot read a draft listing',
-    await call(TOKENS.fakeAdmin, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.fakeAdmin, 'GET', '/roomDrafts/owner-draft-room'),
     false,
   );
   check(
     'a pending registration cannot read a draft listing',
-    await call(TOKENS.pending, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.pending, 'GET', '/roomDrafts/owner-draft-room'),
     false,
   );
   check(
     'a tenant without a verified phone cannot read a draft listing',
-    await call(TOKENS.unverifiedPhone, 'GET', '/rooms/owner-draft-room'),
+    await call(TOKENS.unverifiedPhone, 'GET', '/roomDrafts/owner-draft-room'),
+    false,
+  );
+
+  // The collection query of the drafts is owner-scoped. A query which does
+  // not filter by the caller's own id can never be proven safe by the rules
+  // engine and is refused.
+  check(
+    'the owner can list their own draft listings',
+    await filteredList(TOKENS.owner, 'roomDrafts', 'ownerId', 'owner1'),
+    true,
+  );
+  check(
+    'a live student cannot list the draft listings',
+    await filteredList(TOKENS.student, 'roomDrafts', 'ownerId', 'owner1'),
+    false,
+  );
+  check(
+    'a signed-in stranger cannot list the draft listings',
+    await filteredList(TOKENS.stranger, 'roomDrafts', 'ownerId', 'owner1'),
+    false,
+  );
+  check(
+    'an anonymous caller cannot list the draft listings',
+    await callAnon('GET', '/roomDrafts?pageSize=50'),
+    false,
+  );
+  check(
+    'a live admin can list the draft listings',
+    await call(TOKENS.admin, 'GET', '/roomDrafts?pageSize=50'),
+    true,
+  );
+  check(
+    'a forged admin claim without a live admin profile cannot list the draft listings',
+    await call(TOKENS.fakeAdmin, 'GET', '/roomDrafts?pageSize=50'),
+    false,
+  );
+
+  // The published collection is server-owned: a client may never put a
+  // document into it, so an unfinished listing can never appear in a query
+  // of the public listings.
+  check(
+    'the live owner cannot create a document in the published collection',
+    await create(TOKENS.owner, 'rooms', 'client-published-room', {
+      roomId: string('client-published-room'),
+      ownerId: string('owner1'),
+      status: string('available'),
+      title: string('Client published listing'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      currentOccupancy: integer(0),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'a live student cannot create a document in the published collection',
+    await create(TOKENS.student, 'rooms', 'student-published-room', {
+      roomId: string('student-published-room'),
+      ownerId: string('student1'),
+      status: string('available'),
+      title: string('Student published listing'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      currentOccupancy: integer(0),
+      createdAt: timestamp(),
+    }),
+    false,
+  );
+  check(
+    'the live owner cannot delete their own draft listing',
+    await call(TOKENS.owner, 'DELETE', '/roomDrafts/owner-draft-room'),
+    false,
+  );
+  check(
+    'the live owner cannot publish their own draft through a client write',
+    await update(TOKENS.owner, 'roomDrafts', 'owner-draft-room', {
+      status: string('available'),
+    }),
+    false,
+  );
+  check(
+    'the live owner cannot take the room id of a published listing',
+    await create(TOKENS.owner, 'roomDrafts', 'room1', {
+      roomId: string('room1'),
+      ownerId: string('owner1'),
+      status: string('draft'),
+      title: string('Shadow of a published listing'),
+      monthlyRent: double(10000),
+      occupancy: integer(2),
+      createdAt: timestamp(),
+    }),
     false,
   );
   check(
     'live owner can create a room without server-owned state fields',
-    await create(TOKENS.owner, 'rooms', 'owner-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room', {
       roomId: string('owner-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1252,7 +1345,7 @@ async function main() {
   );
   check(
     'live owner can create a room as a draft',
-    await create(TOKENS.owner, 'rooms', 'owner-room-with-state', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-with-state', {
       roomId: string('owner-room-with-state'),
       ownerId: string('owner1'),
       title: string('New room with state'),
@@ -1266,7 +1359,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room which publishes itself',
-    await create(TOKENS.owner, 'rooms', 'owner-room-published', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-published', {
       roomId: string('owner-room-published'),
       ownerId: string('owner1'),
       title: string('Room which publishes itself'),
@@ -1280,7 +1373,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room without a status',
-    await create(TOKENS.owner, 'rooms', 'owner-room-without-status', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-without-status', {
       roomId: string('owner-room-without-status'),
       ownerId: string('owner1'),
       title: string('Room without a status'),
@@ -1292,7 +1385,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a forged photo-cleanup lock',
-    await create(TOKENS.owner, 'rooms', 'owner-room-forged-cleanup-lock', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-forged-cleanup-lock', {
       roomId: string('owner-room-forged-cleanup-lock'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1309,7 +1402,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a forged listing generation',
-    await create(TOKENS.owner, 'rooms', 'owner-room-forged-generation', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-forged-generation', {
       roomId: string('owner-room-forged-generation'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1330,7 +1423,7 @@ async function main() {
   );
   check(
     'live owner cannot create a listing which reuses a deleted room id',
-    await create(TOKENS.owner, 'rooms', 'room-reserved', {
+    await create(TOKENS.owner, 'roomDrafts', 'room-reserved', {
       roomId: string('room-reserved'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1354,7 +1447,7 @@ async function main() {
   await call('owner', 'DELETE', '/roomDeletionTombstones/room-reserved');
   check(
     'the room id can be reused after its cleanup tombstone is removed',
-    await create(TOKENS.owner, 'rooms', 'room-reserved', {
+    await create(TOKENS.owner, 'roomDrafts', 'room-reserved', {
       roomId: string('room-reserved'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1368,7 +1461,7 @@ async function main() {
 
   check(
     'live owner can create a room with coarse public location data',
-    await create(TOKENS.owner, 'rooms', 'owner-room-coarse-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-coarse-location', {
       roomId: string('owner-room-coarse-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1385,7 +1478,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a string location',
-    await create(TOKENS.owner, 'rooms', 'owner-room-string-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-string-location', {
       roomId: string('owner-room-string-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1398,7 +1491,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a numeric location',
-    await create(TOKENS.owner, 'rooms', 'owner-room-number-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-number-location', {
       roomId: string('owner-room-number-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1411,7 +1504,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a null location',
-    await create(TOKENS.owner, 'rooms', 'owner-room-null-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-null-location', {
       roomId: string('owner-room-null-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1424,7 +1517,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with an exact public address',
-    await create(TOKENS.owner, 'rooms', 'owner-room-exact-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-exact-location', {
       roomId: string('owner-room-exact-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1449,7 +1542,7 @@ async function main() {
   });
   check(
     'the transitional switch permits a legacy exact-location create',
-    await create(TOKENS.owner, 'rooms', 'owner-room-legacy-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-legacy-location', {
       roomId: string('owner-room-legacy-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1468,7 +1561,7 @@ async function main() {
   );
   check(
     'the transitional switch still rejects a non-map public location',
-    await create(TOKENS.owner, 'rooms', 'owner-room-legacy-string-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-legacy-string-location', {
       roomId: string('owner-room-legacy-string-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1489,7 +1582,7 @@ async function main() {
   });
   check(
     'the finalization latch rejects a legacy exact-location create',
-    await create(TOKENS.owner, 'rooms', 'owner-room-latched-location', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-latched-location', {
       roomId: string('owner-room-latched-location'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1512,7 +1605,7 @@ async function main() {
   });
   check(
     'closing the transitional switch rejects exact-location creates again',
-    await create(TOKENS.owner, 'rooms', 'owner-room-exact-location-2', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-exact-location-2', {
       roomId: string('owner-room-exact-location-2'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1530,7 +1623,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a client-supplied image URL',
-    await create(TOKENS.owner, 'rooms', 'owner-room-client-image', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-client-image', {
       roomId: string('owner-room-client-image'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1545,7 +1638,7 @@ async function main() {
   );
   check(
     'live owner cannot create a room with a malformed image list',
-    await create(TOKENS.owner, 'rooms', 'owner-room-invalid-images', {
+    await create(TOKENS.owner, 'roomDrafts', 'owner-room-invalid-images', {
       roomId: string('owner-room-invalid-images'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1561,7 +1654,7 @@ async function main() {
   );
   check(
     'owner cannot create a room that already has tenants',
-    await create(TOKENS.owner, 'rooms', 'room-with-occupancy', {
+    await create(TOKENS.owner, 'roomDrafts', 'room-with-occupancy', {
       roomId: string('room-with-occupancy'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1574,7 +1667,7 @@ async function main() {
   );
   check(
     'owner cannot create a room that is already occupied',
-    await create(TOKENS.owner, 'rooms', 'room-with-status', {
+    await create(TOKENS.owner, 'roomDrafts', 'room-with-status', {
       roomId: string('room-with-status'),
       ownerId: string('owner1'),
       title: string('Client status'),
@@ -1586,7 +1679,7 @@ async function main() {
   );
   check(
     'owner cannot create a room that is already inactive',
-    await create(TOKENS.owner, 'rooms', 'room-with-inactive-status', {
+    await create(TOKENS.owner, 'roomDrafts', 'room-with-inactive-status', {
       roomId: string('room-with-inactive-status'),
       ownerId: string('owner1'),
       title: string('Client inactive status'),
@@ -1598,7 +1691,7 @@ async function main() {
   );
   check(
     'owner cannot create a room with non-positive capacity',
-    await create(TOKENS.owner, 'rooms', 'zero-capacity-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'zero-capacity-room', {
       roomId: string('zero-capacity-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1610,7 +1703,7 @@ async function main() {
   );
   check(
     'owner cannot create a room without a monthly rent',
-    await create(TOKENS.owner, 'rooms', 'missing-rent-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'missing-rent-room', {
       roomId: string('missing-rent-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1622,7 +1715,7 @@ async function main() {
   );
   check(
     'owner cannot create a room with a rent below the lower limit',
-    await create(TOKENS.owner, 'rooms', 'low-rent-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'low-rent-room', {
       roomId: string('low-rent-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1635,7 +1728,7 @@ async function main() {
   );
   check(
     'owner cannot create a room with a numeric-string rent',
-    await create(TOKENS.owner, 'rooms', 'string-rent-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'string-rent-room', {
       roomId: string('string-rent-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1648,7 +1741,7 @@ async function main() {
   );
   check(
     'owner cannot create a room with a fractional capacity',
-    await create(TOKENS.owner, 'rooms', 'fractional-capacity-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'fractional-capacity-room', {
       roomId: string('fractional-capacity-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1661,7 +1754,7 @@ async function main() {
   );
   check(
     'owner cannot create a room with a capacity above the limit',
-    await create(TOKENS.owner, 'rooms', 'oversized-capacity-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'oversized-capacity-room', {
       roomId: string('oversized-capacity-room'),
       ownerId: string('owner1'),
       status: string('draft'),
@@ -1688,7 +1781,7 @@ async function main() {
   );
   check(
     'a live student cannot create a room',
-    await create(TOKENS.student, 'rooms', 'student-room', {
+    await create(TOKENS.student, 'roomDrafts', 'student-room', {
       roomId: string('student-room'),
       ownerId: string('student1'),
       title: string('Not an owner room'),
@@ -1699,7 +1792,7 @@ async function main() {
   );
   check(
     'owner cannot create a room with non-zero occupancy',
-    await create(TOKENS.owner, 'rooms', 'occupied-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'occupied-room', {
       roomId: string('occupied-room'),
       ownerId: string('owner1'),
       title: string('Bad occupancy'),
@@ -1710,7 +1803,7 @@ async function main() {
   );
   check(
     'owner cannot create a room for another uid',
-    await create(TOKENS.owner, 'rooms', 'forged-room', {
+    await create(TOKENS.owner, 'roomDrafts', 'forged-room', {
       roomId: string('forged-room'),
       ownerId: string('student1'),
       title: string('Forged room'),

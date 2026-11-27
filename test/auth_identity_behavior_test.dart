@@ -438,6 +438,84 @@ void main() {
     );
 
     test(
+      'a phone link the server does not confirm does not announce a verified phone',
+      () async {
+        final repository = RecordingAuthRepository(
+          currentUser: MockUser(uid: 'user-1', phoneNumber: '+919876543210'),
+        )..syncPhoneVerified = false;
+        final container = ProviderContainer(
+          overrides: [authRepositoryProvider.overrideWithValue(repository)],
+        );
+        addTearDown(container.dispose);
+        await container.read(authControllerProvider.future);
+
+        await expectLater(
+          () => container
+              .read(authControllerProvider.notifier)
+              .linkPhoneCredential(
+                _phoneCredential(),
+                phoneNumber: '+919876543210',
+              ),
+          throwsA(
+            isA<ProfileOperationException>().having(
+              (error) => error.mutationOperation,
+              'mutationOperation',
+              ProfileMutationOperation.linkPhone,
+            ),
+          ),
+        );
+
+        // The server is the only authority on the verification fact. The
+        // client must not publish a "verified phone" transition when the
+        // server refused to confirm it.
+        expect(
+          container.read(authProfileTransitionProvider),
+          isNot(
+            const AuthProfileTransition(uid: 'user-1', phoneVerified: true),
+          ),
+        );
+        expect(repository.calls, ['linkPhone', 'syncAuthProfile']);
+      },
+    );
+
+    test(
+      'a phone link without a server answer does not announce a verified phone',
+      () async {
+        final repository = RecordingAuthRepository(
+          currentUser: MockUser(uid: 'user-1', phoneNumber: '+919876543210'),
+        )..syncOmitsPhoneVerified = true;
+        final container = ProviderContainer(
+          overrides: [authRepositoryProvider.overrideWithValue(repository)],
+        );
+        addTearDown(container.dispose);
+        await container.read(authControllerProvider.future);
+
+        await expectLater(
+          () => container
+              .read(authControllerProvider.notifier)
+              .linkPhoneCredential(
+                _phoneCredential(),
+                phoneNumber: '+919876543210',
+              ),
+          throwsA(
+            isA<ProfileOperationException>().having(
+              (error) => error.mutationOperation,
+              'mutationOperation',
+              ProfileMutationOperation.linkPhone,
+            ),
+          ),
+        );
+
+        expect(
+          container.read(authProfileTransitionProvider),
+          isNot(
+            const AuthProfileTransition(uid: 'user-1', phoneVerified: true),
+          ),
+        );
+      },
+    );
+
+    test(
       'a conflicting phone link does not synchronize another number',
       () async {
         final repository =

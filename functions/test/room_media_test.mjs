@@ -207,6 +207,7 @@ async function reset() {
   const collections = [
     'users',
     'rooms',
+    'roomDrafts',
     'roomPhotoUploadOperations',
     'roomPhotoUploadQuotas',
     'roomPhotoRoomQuotas',

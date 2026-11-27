@@ -13,6 +13,11 @@ import {
 } from './accounts';
 import { callableHttps } from './appCheck';
 import {
+  readRoomListingPair,
+  resolveRoomListing,
+  roomListingDocuments,
+} from './roomListings';
+import {
   ExactRoomLocation,
   configuredRoomLocationStage,
   coarsePublicRoomLocation,
@@ -276,26 +281,30 @@ export const setRoomPrivateLocation = callableHttps.onCall(
     const location = readOwnerLocationInput(
       (data || {}) as Record<string, any>,
     );
-    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDocuments = roomListingDocuments(roomId);
     const privateRef = db.collection('roomPrivate').doc(roomId);
     const userRef = db.collection('users').doc(uid);
     let stage = configuredRoomLocationStage();
     const locationRevision = crypto.randomUUID();
 
     await db.runTransaction(async (transaction) => {
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const listing = resolveRoomListing(draft, published);
+      const roomSnapshot = listing ? listing.snapshot : null;
       const [
-        roomSnapshot,
         privateSnapshot,
         userSnapshot,
         privacyConfigSnapshot,
       ] = await Promise.all([
-        transaction.get(roomRef),
         transaction.get(privateRef),
         transaction.get(userRef),
         transaction.get(locationPrivacyConfigRef),
       ]);
 
-      if (!roomSnapshot.exists) {
+      if (!roomSnapshot || !roomSnapshot.exists) {
         throw new functions.https.HttpsError(
           'not-found',
           'That room no longer exists',
@@ -364,7 +373,7 @@ export const setRoomPrivateLocation = callableHttps.onCall(
         { merge: true },
       );
 
-      transaction.update(roomRef, {
+      transaction.update(listing!.ref, {
         ...publicLocationPatch(location, stage, locationRevision),
         locationUpdatedAt: now,
       });

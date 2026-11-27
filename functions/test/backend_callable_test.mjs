@@ -422,6 +422,7 @@ async function reset() {
     'adminSupportConversationOperations',
     'adminSupportReplyNotificationOperations',
     'rooms',
+    'roomDrafts',
     'roomPrivate',
     'roomReviews',
     'reviewDeletionAudit',
@@ -9722,7 +9723,12 @@ async function testDraftListingsArePublishedByTheServer() {
 
   // A new listing starts as a draft. It is not offered to students and it
   // cannot be booked while its photos and its private location are missing.
-  await db.collection('rooms').doc('RM-DRAFT').set({
+  //
+  // The draft lives in its **own** collection. Firestore rules cannot filter
+  // a collection query, so an unpublished listing which shared the public
+  // collection would be returned by every query of it and would therefore be
+  // readable by every registered account.
+  await db.collection('roomDrafts').doc('RM-DRAFT').set({
     roomId: 'RM-DRAFT',
     ownerId: 'owner-1',
     title: 'Draft room',
@@ -9733,6 +9739,11 @@ async function testDraftListingsArePublishedByTheServer() {
     listingGeneration: 'generation-draft',
     images: [],
   });
+  check(
+    'the draft does not exist in the public collection',
+    (await db.collection('rooms').doc('RM-DRAFT').get()).exists,
+    false,
+  );
 
   await expectDenied(
     'a draft without its private location cannot be published',
@@ -9762,6 +9773,21 @@ async function testDraftListingsArePublishedByTheServer() {
     (await db.collection('rooms').doc('RM-DRAFT').get()).get('status'),
     'available',
   );
+  check(
+    'the publication moved the draft into the public collection',
+    (await db.collection('roomDrafts').doc('RM-DRAFT').get()).exists,
+    false,
+  );
+  check(
+    'the published listing keeps the payload of the draft',
+    (await db.collection('rooms').doc('RM-DRAFT').get()).get('title'),
+    'Draft room',
+  );
+  check(
+    'the published listing is owned by its owner',
+    (await db.collection('rooms').doc('RM-DRAFT').get()).get('ownerId'),
+    'owner-1',
+  );
 
   const retried = await invoke(
     publishRoomListing,
@@ -9787,9 +9813,52 @@ async function testDraftListingsArePublishedByTheServer() {
     'permission-denied',
   );
 
+  // A foreign **draft** is refused before the publication is attempted. The
+  // draft of another owner is invisible in the public collection, so the
+  // refusal has to come from the owner check.
+  await db.collection('roomDrafts').doc('RM-DRAFT-FOREIGN').set({
+    roomId: 'RM-DRAFT-FOREIGN',
+    ownerId: 'owner-2',
+    title: 'Foreign draft',
+    monthlyRent: 6000,
+    occupancy: 2,
+    currentOccupancy: 0,
+    status: 'draft',
+    listingGeneration: 'generation-draft-foreign',
+    images: [],
+  });
+  await db.collection('roomPrivate').doc('RM-DRAFT-FOREIGN').set({
+    roomId: 'RM-DRAFT-FOREIGN',
+    ownerId: 'owner-2',
+    address: '46 Test Street',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560001',
+    latitude: 12.9716,
+    longitude: 77.5946,
+  });
+  await expectDenied(
+    'another owner cannot publish a foreign draft',
+    () =>
+      invoke(publishRoomListing, { roomId: 'RM-DRAFT-FOREIGN' }, 'owner-1'),
+    'permission-denied',
+  );
+  check(
+    'the foreign draft was not published',
+    (await db.collection('rooms').doc('RM-DRAFT-FOREIGN').get()).exists,
+    false,
+  );
+  check(
+    'the foreign draft is still a draft',
+    (await db.collection('roomDrafts').doc('RM-DRAFT-FOREIGN').get()).get(
+      'status',
+    ),
+    'draft',
+  );
+
   // The live role is authoritative: a demoted owner cannot publish a
   // listing with a stale custom claim.
-  await db.collection('rooms').doc('RM-DRAFT-3').set({
+  await db.collection('roomDrafts').doc('RM-DRAFT-3').set({
     roomId: 'RM-DRAFT-3',
     ownerId: 'owner-1',
     title: 'Draft room of a demoted owner',
@@ -9818,13 +9887,18 @@ async function testDraftListingsArePublishedByTheServer() {
   );
   check(
     'the demoted draft stays unpublished',
-    (await db.collection('rooms').doc('RM-DRAFT-3').get()).get('status'),
+    (await db.collection('roomDrafts').doc('RM-DRAFT-3').get()).get('status'),
     'draft',
+  );
+  check(
+    'the demoted draft never reached the public collection',
+    (await db.collection('rooms').doc('RM-DRAFT-3').get()).exists,
+    false,
   );
   await db.collection('users').doc('owner-1').update({ role: 'owner' });
 
   // A staged photo which was never committed keeps the listing unpublished.
-  await db.collection('rooms').doc('RM-DRAFT-2').set({
+  await db.collection('roomDrafts').doc('RM-DRAFT-2').set({
     roomId: 'RM-DRAFT-2',
     ownerId: 'owner-1',
     title: 'Draft room with a staged photo',
@@ -9860,14 +9934,19 @@ async function testDraftListingsArePublishedByTheServer() {
   );
   check(
     'the incomplete draft stays unpublished',
-    (await db.collection('rooms').doc('RM-DRAFT-2').get()).get('status'),
+    (await db.collection('roomDrafts').doc('RM-DRAFT-2').get()).get('status'),
     'draft',
+  );
+  check(
+    'the incomplete draft never reached the public collection',
+    (await db.collection('rooms').doc('RM-DRAFT-2').get()).exists,
+    false,
   );
 
   // The transactional counter is authoritative inside the publication
   // transaction: a listing whose room quota still holds a pending upload is
   // not published, even when the operation records were already swept.
-  await db.collection('rooms').doc('RM-DRAFT-4').set({
+  await db.collection('roomDrafts').doc('RM-DRAFT-4').set({
     roomId: 'RM-DRAFT-4',
     ownerId: 'owner-1',
     title: 'Draft room with a pending quota',
@@ -9902,7 +9981,7 @@ async function testDraftListingsArePublishedByTheServer() {
   );
   check(
     'the draft with a pending quota stays unpublished',
-    (await db.collection('rooms').doc('RM-DRAFT-4').get()).get('status'),
+    (await db.collection('roomDrafts').doc('RM-DRAFT-4').get()).get('status'),
     'draft',
   );
 
@@ -9936,7 +10015,31 @@ async function testDraftListingsArePublishedByTheServer() {
   );
   check(
     'the availability toggle left the draft alone',
-    (await db.collection('rooms').doc('RM-DRAFT-2').get()).get('status'),
+    (await db.collection('roomDrafts').doc('RM-DRAFT-2').get()).get('status'),
+    'draft',
+  );
+  check(
+    'the availability toggle did not publish the draft',
+    (await db.collection('rooms').doc('RM-DRAFT-2').get()).exists,
+    false,
+  );
+
+  // An administrator cannot publish a draft through the status setter
+  // either.
+  await db.collection('users').doc('admin-1').set(profile('admin-1', 'admin'));
+  await expectDenied(
+    'an administrator cannot publish a draft through the status setter',
+    () =>
+      invoke(
+        adminSetRoomListingStatus,
+        { roomId: 'RM-DRAFT-2', status: 'available' },
+        'admin-1',
+      ),
+    'failed-precondition',
+  );
+  check(
+    'the status setter left the draft alone',
+    (await db.collection('roomDrafts').doc('RM-DRAFT-2').get()).get('status'),
     'draft',
   );
 }

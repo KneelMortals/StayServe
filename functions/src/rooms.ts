@@ -3,6 +3,7 @@ import * as functions from 'firebase-functions/v1';
 import { callableHttps } from './appCheck';
 import * as storage from 'firebase-admin/storage';
 import * as crypto from 'crypto';
+import { Change } from 'firebase-functions/v1/common/change';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
@@ -26,6 +27,14 @@ import {
 } from './roomValidation';
 import { PAGE_SIZE } from './batches';
 import { notify } from './notifications';
+import {
+  publishedListingPayload,
+  readRoomListingPair,
+  resolveRoomListing,
+  ROOM_DRAFTS_COLLECTION,
+  ROOM_LISTINGS_COLLECTION,
+  roomListingDocuments,
+} from './roomListings';
 import {
   cleanupExpiredRoomPhotoUploads,
   pendingRoomPhotoCount,
@@ -193,10 +202,10 @@ const ROOM_PHOTO_CLEANUP_LOCK_MS = 2 * 60 * 1000;
 
 /** The Storage paths which the current room document still references. */
 function referencedRoomPhotoPaths(
-  snapshot: firestore.DocumentSnapshot,
+  snapshot: firestore.DocumentSnapshot | null | undefined,
 ): Set<string> {
   const paths = new Set<string>();
-  if (!snapshot.exists) return paths;
+  if (!snapshot || !snapshot.exists) return paths;
 
   for (const url of stringList(snapshot.get('images'))) {
     const path = trustedRoomPhotoPathFromDownloadUrl(url);
@@ -444,14 +453,22 @@ async function processRoomPhotoCleanupJob(
         }
       }
 
-      const roomRef = db.collection('rooms').doc(roomId);
+      const roomDocuments = roomListingDocuments(roomId);
       const lockToken = crypto.randomUUID();
 
       await db.runTransaction(async (transaction) => {
         const latest = await transaction.get(jobRef);
         if (!latest.exists) return;
 
-        const roomSnapshot = await transaction.get(roomRef);
+        // The listing may be an unpublished draft. The current listing — in
+        // whichever collection it lives — decides which objects are live.
+        const { draft, published } = await readRoomListingPair(
+          transaction,
+          roomId,
+        );
+        const listing = resolveRoomListing(draft, published);
+        const roomSnapshot = listing ? listing.snapshot : null;
+        const roomRef = listing ? listing.ref : roomDocuments.published;
         const currentPaths = stringList(latest.get('paths'));
         const referencedPaths = referencedRoomPhotoPaths(roomSnapshot);
         // A path which the room references again is live data, not an
@@ -478,7 +495,7 @@ async function processRoomPhotoCleanupJob(
         // would then remove the path from the job without deleting its file.
         cleanupLock.roomRef = roomRef;
 
-        if (roomSnapshot.exists && currentPaths.length > 0) {
+        if (roomSnapshot && roomSnapshot.exists && currentPaths.length > 0) {
           const existingLock = roomSnapshot.get('photoCleanupLock');
           const lockExpiresAt =
             existingLock &&
@@ -984,18 +1001,25 @@ export const setRoomListingAvailability = callableHttps.onCall(
     // whether this user is still a registered, active owner.
     await assertLiveOwner(uid);
 
-    const roomRef = db.collection('rooms').doc(roomId);
-
     const outcome = await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(roomRef);
-      if (!snapshot.exists) {
+      // The listing may be a draft or a published listing. A draft is
+      // resolved as well, so the caller receives the precise reason why the
+      // toggle refused to publish it instead of a bare "not found".
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const resolved = resolveRoomListing(draft, published);
+      if (!resolved) {
         throw new functions.https.HttpsError(
           'not-found',
           'That room no longer exists',
         );
       }
 
-      const room = snapshot.data() as Record<string, any>;
+      const roomRef = resolved.ref;
+      const snapshot = resolved.snapshot;
+      const room = resolved.data;
 
       // The live owner role is checked in the same transaction as the status
       // change. A concurrent demotion or ban cannot be overwritten by this
@@ -1128,8 +1152,14 @@ export const ROOM_DRAFT_STATUS = 'draft';
  * The publication is server-owned — a client can neither set the status nor
  * publish a listing of somebody else.
  *
- * The status change happens in a transaction which re-reads the listing, so a
- * concurrent deletion or a concurrent publication cannot be overwritten.
+ * The publication **moves** the draft into the public collection. The draft
+ * lives in its own collection because a Firestore query cannot be filtered by
+ * the rules: an unpublished listing which shared the public collection would
+ * be returned by every query of that collection and would therefore be
+ * readable by every registered account.
+ *
+ * The status change happens in a transaction which re-reads both documents, so
+ * a concurrent deletion or a concurrent publication cannot be overwritten.
  */
 export const publishRoomListing = callableHttps.onCall(
   async (data, context) => {
@@ -1153,21 +1183,46 @@ export const publishRoomListing = callableHttps.onCall(
     // whether this user is still a registered, active owner.
     await assertLiveOwner(uid);
 
-    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDocuments = roomListingDocuments(roomId);
     const privateRef = db.collection('roomPrivate').doc(roomId);
     const roomPhotoQuotaRef = db
       .collection('roomPhotoRoomQuotas')
       .doc(roomId);
 
-    const roomSnapshot = await roomRef.get();
-    if (!roomSnapshot.exists) {
+    const [draftSnapshot, publishedSnapshot] = await Promise.all([
+      roomDocuments.draft.get(),
+      roomDocuments.published.get(),
+    ]);
+
+    // The published listing wins: a retry after a lost acknowledgement finds
+    // the listing which the previous attempt published.
+    if (publishedSnapshot.exists) {
+      const published = publishedSnapshot.data() as Record<string, any>;
+      if (String(published.ownerId || '').trim() !== uid) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'You can only publish your own listings',
+        );
+      }
+      const publishedStatus = String(published.status || '').trim();
+      if (publishedStatus === 'available') {
+        // The listing is already published. The retry is idempotent.
+        return { success: true, roomId, status: publishedStatus, alreadyPublished: true };
+      }
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This listing is not waiting to be published.',
+      );
+    }
+
+    if (!draftSnapshot.exists) {
       throw new functions.https.HttpsError(
         'not-found',
         'That room no longer exists',
       );
     }
 
-    const room = roomSnapshot.data() as Record<string, any>;
+    const room = draftSnapshot.data() as Record<string, any>;
     if (String(room.ownerId || '').trim() !== uid) {
       throw new functions.https.HttpsError(
         'permission-denied',
@@ -1182,10 +1237,6 @@ export const publishRoomListing = callableHttps.onCall(
     }
 
     const status = String(room.status || '').trim();
-    if (status === 'available') {
-      // The listing is already published. The retry is idempotent.
-      return { success: true, roomId, status, alreadyPublished: true };
-    }
     if (status !== ROOM_DRAFT_STATUS) {
       throw new functions.https.HttpsError(
         'failed-precondition',
@@ -1242,14 +1293,30 @@ export const publishRoomListing = callableHttps.onCall(
     }
 
     await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(roomRef);
-      if (!snapshot.exists) {
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      if (published.exists) {
+        // The publication committed while this transaction was prepared. The
+        // listing is already live, so there is nothing left to do.
+        const currentPublished = published.data() as Record<string, any>;
+        if (String(currentPublished.ownerId || '').trim() !== uid) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'You can only publish your own listings',
+          );
+        }
+        return;
+      }
+      if (!draft.exists) {
         throw new functions.https.HttpsError(
           'not-found',
           'That room no longer exists',
         );
       }
-      const current = snapshot.data() as Record<string, any>;
+
+      const current = draft.data() as Record<string, any>;
       if (String(current.ownerId || '').trim() !== uid) {
         throw new functions.https.HttpsError(
           'permission-denied',
@@ -1301,7 +1368,6 @@ export const publishRoomListing = callableHttps.onCall(
         );
       }
       const currentStatus = String(current.status || '').trim();
-      if (currentStatus === 'available') return;
       if (currentStatus !== ROOM_DRAFT_STATUS) {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -1309,12 +1375,13 @@ export const publishRoomListing = callableHttps.onCall(
         );
       }
 
-      transaction.update(roomRef, {
-        status: 'available',
-        currentOccupancy: 0,
-        publishedAt: firestore.FieldValue.serverTimestamp(),
-        updatedAt: firestore.FieldValue.serverTimestamp(),
-      });
+      // The draft becomes the public listing and disappears from the
+      // owner-only collection in the same transaction.
+      transaction.set(
+        roomDocuments.published,
+        publishedListingPayload(current),
+      );
+      transaction.delete(roomDocuments.draft);
     });
 
     return { success: true, roomId, status: 'available', alreadyPublished: false };
@@ -1509,6 +1576,24 @@ interface RoomDeletionOperation {
   deletionOperationId: string;
   requestedBy: string;
   previousStatus: string;
+
+  /**
+   * The collection which holds the listing.
+   *
+   * A published listing lives in `rooms`, an unpublished draft lives in
+   * `roomDrafts`. The deletion has to address the same document which the
+   * operation started on, otherwise a draft would survive its own deletion.
+   */
+  listingCollection: string;
+}
+
+/** The collection which holds a listing of a deletion operation. */
+function roomListingCollectionOf(
+  operation: RoomDeletionOperation,
+): string {
+  return operation.listingCollection === ROOM_DRAFTS_COLLECTION
+    ? ROOM_DRAFTS_COLLECTION
+    : ROOM_LISTINGS_COLLECTION;
 }
 
 /** Reads and validates the durable state of a listing-deletion job. */
@@ -1530,6 +1615,9 @@ function roomDeletionOperationFromSnapshot(
     deletionOperationId: String(data.deletionOperationId || '').trim(),
     requestedBy: String(data.deletionRequestedBy || '').trim(),
     previousStatus: String(data.previousStatus || 'available').trim(),
+    listingCollection: String(
+      data.listingCollection || ROOM_LISTINGS_COLLECTION,
+    ).trim(),
   };
   if (
     !operation.roomId ||
@@ -1557,7 +1645,9 @@ async function restoreRoomDeletion(
   operation: RoomDeletionOperation,
   jobRef: firestore.DocumentReference,
 ): Promise<void> {
-  const roomRef = db.collection('rooms').doc(operation.roomId);
+  const roomRef = db
+    .collection(roomListingCollectionOf(operation))
+    .doc(operation.roomId);
   const tombstoneRef = db
     .collection('roomDeletionTombstones')
     .doc(operation.roomId);
@@ -1619,7 +1709,9 @@ async function restoreRoomDeletion(
 async function cancelOpenRoomRequestsForDeletion(
   operation: RoomDeletionOperation,
 ): Promise<number> {
-  const roomRef = db.collection('rooms').doc(operation.roomId);
+  const roomRef = db
+    .collection(roomListingCollectionOf(operation))
+    .doc(operation.roomId);
   let cancelledRequests = 0;
   let requestCursor: firestore.QueryDocumentSnapshot | undefined;
 
@@ -1720,7 +1812,9 @@ async function finalizeRoomDeletion(
   operation: RoomDeletionOperation,
   jobRef: firestore.DocumentReference,
 ): Promise<firestore.DocumentReference> {
-  const roomRef = db.collection('rooms').doc(operation.roomId);
+  const roomRef = db
+    .collection(roomListingCollectionOf(operation))
+    .doc(operation.roomId);
   const privateLocationRef = db
     .collection('roomPrivate')
     .doc(operation.roomId);
@@ -1807,7 +1901,9 @@ async function executeRoomDeletionOperation(
 ): Promise<{ cancelledRequests: number }> {
   const jobSnapshot = await jobRef.get();
   const operation = roomDeletionOperationFromSnapshot(jobSnapshot);
-  const roomRef = db.collection('rooms').doc(operation.roomId);
+  const roomRef = db
+    .collection(roomListingCollectionOf(operation))
+    .doc(operation.roomId);
 
   try {
     const roomSnapshot = await roomRef.get();
@@ -1998,7 +2094,7 @@ export const deleteRoomListing = callableHttps.onCall(
     }
 
     await assertLiveOwnerOrAdmin(uid);
-    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDocuments = roomListingDocuments(roomId);
     const tombstoneRef = db
       .collection('roomDeletionTombstones')
       .doc(roomId);
@@ -2013,15 +2109,24 @@ export const deleteRoomListing = callableHttps.onCall(
     // marker, so a terminated function can always be resumed safely.
     const deletionOperationId = crypto.randomUUID();
     await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(roomRef);
-      if (!snapshot.exists) {
+      // The listing may be an unpublished draft. The collection which holds
+      // it is recorded in the durable job so that a resumed deletion removes
+      // exactly the document which the operation started on.
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const listing = resolveRoomListing(draft, published);
+      if (!listing) {
         throw new functions.https.HttpsError(
           'not-found',
           'That room no longer exists',
         );
       }
+      const roomRef = listing.ref;
+      const listingCollection = listing.collection;
 
-      const room = snapshot.data() as Record<string, any>;
+      const room = listing.data;
       const ownerId = String(room.ownerId || '').trim();
 
       // Recompute the caller's live authority inside the marker
@@ -2097,6 +2202,7 @@ export const deleteRoomListing = callableHttps.onCall(
           roomId,
           ownerId,
           listingGeneration,
+          listingCollection,
           deletionOperationId,
           deletionRequestedBy: uid,
           previousStatus,
@@ -2197,81 +2303,92 @@ export const onRoomCreated = functions.firestore
  * object paths and written to a durable cleanup job. The client does not
  * have to delete the files, and a Storage outage is retried by the
  * scheduled worker instead of leaving an orphan forever.
+ *
+ * The handler runs for the published listings **and** for the unpublished
+ * drafts: a photo which the owner removed from a draft is an orphan too.
  */
+async function handleRoomListingUpdated(
+  change: Change<firestore.DocumentSnapshot>,
+): Promise<void> {
+  const before = change.before.data() as Record<string, any> | undefined;
+  const after = change.after.data() as Record<string, any> | undefined;
+  if (!before || !after) return;
+
+  const roomId = change.after.id;
+  const ownerId = String(after.ownerId || before.ownerId || '').trim();
+  const listingGeneration = roomListingGeneration({
+    ...before,
+    ...after,
+    roomId,
+    ownerId,
+  });
+  const expectedPrefix = `rooms/${ownerId}/${roomId}/`;
+  if (!ownerId) return;
+
+  const beforeImages = stringList(before.images);
+  const afterImages = new Set(stringList(after.images));
+  const removedUrls = beforeImages.filter((url) => !afterImages.has(url));
+  if (removedUrls.length === 0) return;
+
+  const removedPaths: string[] = [];
+  for (const url of removedUrls) {
+    const path = trustedRoomPhotoPathFromDownloadUrl(url);
+    if (!path || !path.startsWith(expectedPrefix)) {
+      console.warn(
+        `Could not derive the Storage path of a removed photo in room ${roomId}.`,
+      );
+      continue;
+    }
+    if (!removedPaths.includes(path)) removedPaths.push(path);
+  }
+  if (removedPaths.length === 0) return;
+
+  const cleanupJobRef = db
+    .collection('cleanupJobs')
+    .doc(
+      roomPhotoCleanupJobId(
+        ownerId,
+        roomId,
+        listingGeneration,
+        'paths',
+      ),
+    );
+
+  // The paths are merged in a transaction. Two owners editing the same
+  // room on two devices cannot overwrite each other's pending cleanup.
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(cleanupJobRef);
+    const existing = snapshot.exists
+      ? stringList(snapshot.get('paths'))
+      : [];
+    const paths = [...existing];
+    for (const path of removedPaths) {
+      if (!paths.includes(path)) paths.push(path);
+    }
+    transaction.set(
+      cleanupJobRef,
+      {
+        type: 'roomPhotoPaths',
+        roomId,
+        ownerId,
+        listingGeneration,
+        paths,
+        createdAt: firestore.FieldValue.serverTimestamp(),
+        updatedAt: firestore.FieldValue.serverTimestamp(),
+        attempts: 0,
+      },
+      { merge: true },
+    );
+  });
+}
+
 export const onRoomUpdated = functions.firestore
   .document('rooms/{roomId}')
-  .onUpdate(async (change) => {
-    const before = change.before.data() as Record<string, any> | undefined;
-    const after = change.after.data() as Record<string, any> | undefined;
-    if (!before || !after) return;
+  .onUpdate(handleRoomListingUpdated);
 
-    const roomId = change.after.id;
-    const ownerId = String(after.ownerId || before.ownerId || '').trim();
-    const listingGeneration = roomListingGeneration({
-      ...before,
-      ...after,
-      roomId,
-      ownerId,
-    });
-    const expectedPrefix = `rooms/${ownerId}/${roomId}/`;
-    if (!ownerId) return;
-
-    const beforeImages = stringList(before.images);
-    const afterImages = new Set(stringList(after.images));
-    const removedUrls = beforeImages.filter((url) => !afterImages.has(url));
-    if (removedUrls.length === 0) return;
-
-    const removedPaths: string[] = [];
-    for (const url of removedUrls) {
-      const path = trustedRoomPhotoPathFromDownloadUrl(url);
-      if (!path || !path.startsWith(expectedPrefix)) {
-        console.warn(
-          `Could not derive the Storage path of a removed photo in room ${roomId}.`,
-        );
-        continue;
-      }
-      if (!removedPaths.includes(path)) removedPaths.push(path);
-    }
-    if (removedPaths.length === 0) return;
-
-    const cleanupJobRef = db
-      .collection('cleanupJobs')
-      .doc(
-        roomPhotoCleanupJobId(
-          ownerId,
-          roomId,
-          listingGeneration,
-          'paths',
-        ),
-      );
-
-    // The paths are merged in a transaction. Two owners editing the same
-    // room on two devices cannot overwrite each other's pending cleanup.
-    await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(cleanupJobRef);
-      const existing = snapshot.exists
-        ? stringList(snapshot.get('paths'))
-        : [];
-      const paths = [...existing];
-      for (const path of removedPaths) {
-        if (!paths.includes(path)) paths.push(path);
-      }
-      transaction.set(
-        cleanupJobRef,
-        {
-          type: 'roomPhotoPaths',
-          roomId,
-          ownerId,
-          listingGeneration,
-          paths,
-          createdAt: firestore.FieldValue.serverTimestamp(),
-          updatedAt: firestore.FieldValue.serverTimestamp(),
-          attempts: 0,
-        },
-        { merge: true },
-      );
-    });
-  });
+export const onRoomDraftUpdated = functions.firestore
+  .document('roomDrafts/{roomId}')
+  .onUpdate(handleRoomListingUpdated);
 
 /**
  * Changes the listing status of any room as a live administrator.
@@ -2307,17 +2424,32 @@ export const adminSetRoomListingStatus = callableHttps.onCall(
 
     await assertLiveAdmin(context.auth.uid);
 
-    const roomRef = db.collection('rooms').doc(roomId);
     const outcome = await db.runTransaction(async (transaction) => {
-      const snapshot = await transaction.get(roomRef);
-      if (!snapshot.exists) {
+      // An administrator may only change the status of a published listing.
+      // A draft is resolved as well so that the refusal is explicit and the
+      // draft cannot be published through this path.
+      const { draft, published } = await readRoomListingPair(
+        transaction,
+        roomId,
+      );
+      const resolved = resolveRoomListing(draft, published);
+      if (!resolved) {
         throw new functions.https.HttpsError(
           'not-found',
           'That room no longer exists',
         );
       }
 
-      const room = snapshot.data() as Record<string, any>;
+      const roomRef = resolved.ref;
+      const snapshot = resolved.snapshot;
+      const room = resolved.data;
+
+      if (String(room.status || '').trim() === ROOM_DRAFT_STATUS) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'This listing is not published yet.',
+        );
+      }
 
       // The live admin role is checked in the same transaction as the
       // listing-status write.
