@@ -887,10 +887,13 @@ The CI uses the same key when the repository has these secrets:
 
 | Secret | Content |
 |---|---|
-| `STAY_SERVE_RELEASE_KEYSTORE_BASE64` | the upload keystore, base64 encoded (`base64 -i stayserve-upload.jks`) |
+| `STAY_SERVE_RELEASE_KEYSTORE_BASE64` | the upload keystore, base64 encoded (`base64 -i stayserve-upload.jks \| tr -d '\n'`) |
 | `STAY_SERVE_RELEASE_STORE_PASSWORD` | the password of the store |
 | `STAY_SERVE_RELEASE_KEY_ALIAS` | the alias of the key (`stayserve-upload`) |
 | `STAY_SERVE_RELEASE_KEY_PASSWORD` | the password of the key |
+
+The prepared base64 file of this project is
+`~/.config/stayserve/stayserve-upload.jks.base64`.
 
 Without them the CI keeps the debug fallback and only validates the size.
 With them the CI also checks that every release APK carries the fingerprint of
