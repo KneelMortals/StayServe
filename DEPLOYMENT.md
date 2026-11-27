@@ -1038,11 +1038,14 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
    optional contact information. This is deliberate: SMS costs roughly
    INR 0.25–7 per message and the feature is not paid for yet. Turning it
    back on is documented in section 3.3.
-2. **Browser App Check is not enabled yet.** The Web Firebase app is
-   registered and the Hosting build uses its own configuration, but a
-   reCAPTCHA v3 site key is still required before browser App Check can be
-   activated. The shared callable-enforcement switch remains `false` until
-   every supported client has a valid token.
+2. **Browser App Check is registered but not enforced.** The Web Firebase app
+   has the reCAPTCHA Enterprise provider
+   (`6LdABDUuAAAAALANiAAsOKmI8DwqXO0G-LHu-4sB`) and the release build
+   activates it, but no service is in enforcement mode and the shared
+   callable-enforcement switch remains `false` until every supported client
+   has a valid token. The Android release build uses Play Integrity, which
+   only returns a token for an app which is installed from Google Play, so
+   the switch must not be turned on before the Play rollout.
 3. **The UPI VPA is duplicated in two places** — the `PLATFORM_UPI_VPA`
    environment variable of the Cloud Function and
    `AppConstants.platformUpiVpa` in the app. The client asserts that both
