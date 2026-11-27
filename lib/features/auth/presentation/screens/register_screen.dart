@@ -247,10 +247,10 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   label: 'Full Name',
                   hint: 'Enter your full name',
                   textInputAction: TextInputAction.next,
-                  validator: (value) =>
-                      AppValidators.validateRequired(value, 'Name'),
+                  validator: AppValidators.validateName,
                   prefixIcon: const Icon(Icons.person_outline),
                   textCapitalization: TextCapitalization.words,
+                  maxLength: AppValidators.maxNameLength,
                 ),
                 const SizedBox(height: AppSpacing.md),
                 AppTextField(

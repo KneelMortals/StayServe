@@ -65,7 +65,7 @@ class _RoomReviewsScreenState extends ConsumerState<RoomReviewsScreen> {
     } catch (error) {
       if (!mounted) return;
       context.showErrorSnackBar(
-        error.toString().replaceFirst('Exception: ', '').trim(),
+        readableAuthError(error),
       );
     } finally {
       if (mounted) setState(() => _deletingReviewId = null);
@@ -337,7 +337,7 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
@@ -381,7 +381,7 @@ class _WriteReviewCardState extends ConsumerState<_WriteReviewCard> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );

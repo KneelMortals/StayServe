@@ -373,7 +373,7 @@ class _RoomManagementCardState extends ConsumerState<_RoomManagementCard> {
       );
     } catch (e) {
       if (!context.mounted) return;
-      context.showErrorSnackBar(e.toString().replaceFirst('Exception: ', ''));
+      context.showErrorSnackBar(readableAuthError(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }

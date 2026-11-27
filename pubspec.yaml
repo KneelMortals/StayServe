@@ -44,6 +44,12 @@ dependencies:
   cached_network_image: ^3.4.1
   image_picker: ^1.1.2
   photo_view: ^0.15.0
+  # The profile picture is cropped before it is uploaded. `crop_your_image`
+  # is a pure-Dart widget (no native code, so the Android and iOS builds stay
+  # small) and `image` re-encodes the cropped picture as a JPEG, which every
+  # phone and every browser can display.
+  crop_your_image: ^2.0.1
+  image: ^4.13.1
 
   # Utils
   intl: ^0.20.3

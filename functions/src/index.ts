@@ -35,6 +35,10 @@ import {
 import { notify } from './notifications';
 import { areNotificationsEnabled } from './platform';
 import { ensureUserProfile } from './profileBootstrap';
+import {
+  googleProfilePictureUrl,
+  importGoogleProfilePicture,
+} from './profileMedia';
 import { processRegistrationRollbackOperations } from './authProfile';
 
 const db = firestore.getFirestore();
@@ -1332,6 +1336,31 @@ export const onUserCreate = functions.auth.user().onCreate(async (user) => {
     // which an older FCM client could create when it won the race with this
     // trigger. A retry of the trigger leaves the complete profile untouched.
     const result = await ensureUserProfile(user);
+
+    // A Google account brings its own name and its own picture. The name is
+    // copied by the bootstrap; the picture is copied here into the trusted
+    // bucket, so the profile shows it everywhere without the client writing
+    // into the storage namespace.
+    //
+    // A failing import never blocks the account: the profile exists and the
+    // user can still pick a picture by hand.
+    const googlePhoto = googleProfilePictureUrl(user);
+    if (googlePhoto) {
+      try {
+        const imported = await importGoogleProfilePicture(
+          user.uid,
+          googlePhoto,
+        );
+        if (imported) {
+          console.log(`Imported the Google profile picture of ${user.uid}`);
+        }
+      } catch (error) {
+        console.error(
+          'Could not import the Google profile picture:',
+          error,
+        );
+      }
+    }
 
     // ---------------------------------------------------------------
     // Custom claims are deliberately **not** written by this trigger.

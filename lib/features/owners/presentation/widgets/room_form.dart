@@ -257,7 +257,7 @@ class _RoomFormState extends ConsumerState<RoomForm> {
       setState(() => _isSaving = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );

@@ -131,7 +131,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       setState(() => _isSaved = previous);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
@@ -776,7 +776,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
@@ -816,7 +816,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Could not open the chat: ${e.toString().replaceFirst('Exception: ', '')}',
+            'Could not open the chat: ${readableAuthError(e)}',
           ),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
@@ -1220,7 +1220,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       setState(() => _busy = false);
       messenger.showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: errorColor,
         ),
       );
@@ -1413,7 +1413,7 @@ class _BookingDialogState extends ConsumerState<_BookingDialog> {
       // to understand — the room page turns the button into "Cancel
       // booking" and shows the request that is already there.
       // -------------------------------------------------------------------
-      final message = e.toString().replaceFirst('Exception: ', '');
+      final message = readableAuthError(e);
       if (message.toLowerCase().contains('already requested')) {
         Navigator.of(context).pop(const _BookingOutcome.duplicateExisting());
         return;

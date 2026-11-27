@@ -971,6 +971,27 @@ async function main() {
     false,
   );
   check(
+    'student cannot point their own profile at an arbitrary picture',
+    await update(TOKENS.student, 'users', 'student1', {
+      profileImage: string('https://example.com/tracker.gif'),
+    }),
+    false,
+  );
+  check(
+    'student can change their own name',
+    await update(TOKENS.student, 'users', 'student1', {
+      name: string('A'.repeat(80)),
+    }),
+    true,
+  );
+  check(
+    'student cannot store a name which does not fit',
+    await update(TOKENS.student, 'users', 'student1', {
+      name: string('A'.repeat(81)),
+    }),
+    false,
+  );
+  check(
     'student cannot forge their own phone verification',
     await update(TOKENS.unverifiedPhone, 'users', 'unverifiedPhone1', {
       phoneVerified: bool(true),

@@ -83,7 +83,10 @@ const {
   MAX_PROFILE_PICTURE_BYTES,
   PROFILE_PICTURE_PREFIX,
   decodeProfilePictureBytes,
+  googleProfilePictureUrl,
+  importGoogleProfilePicture,
   isOwnProfilePictureUrl,
+  isTrustedGooglePhotoUrl,
   profilePictureDownloadToken,
   profilePictureObjectPath,
   uploadProfilePicture,
@@ -117,6 +120,13 @@ auth.getUser = async (uid) => {
       { providerId: 'phone', uid, phoneNumber: '+919876500001' },
     ],
   };
+};
+
+// The Auth record of the account which holds the imported picture.
+const authPhotos = new Map();
+auth.updateUser = async (uid, properties) => {
+  authPhotos.set(uid, properties?.photoURL || '');
+  return { uid };
 };
 
 let pass = 0;
@@ -295,6 +305,16 @@ async function main() {
     profile.get('profileImage'),
     upload.url,
   );
+  check(
+    'the profile records that the user chose the picture',
+    profile.get('profileImageSource'),
+    'upload',
+  );
+  check(
+    'the Auth record shows the same picture',
+    authPhotos.get('profile-media'),
+    upload.url,
+  );
 
   section('a repeated upload');
   const repeated = await invoke(uploadProfilePicture, {
@@ -376,6 +396,113 @@ async function main() {
   check('the stored object was deleted', objects.size, 0);
   const cleared = await db.collection('users').doc('profile-media').get();
   check('the profile no longer has a picture', cleared.get('profileImage'), '');
+  check(
+    'the profile records that the user removed the picture',
+    cleared.get('profileImageSource'),
+    'removed',
+  );
+  check(
+    'the Auth record no longer shows the picture',
+    authPhotos.get('profile-media'),
+    '',
+  );
+
+  section('the Google profile picture');
+  const GOOGLE_PHOTO = 'https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg';
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (!String(url).startsWith('https://lh3.googleusercontent.com/')) {
+      return { ok: false, status: 404, headers: { get: () => '0' } };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => String(JPEG_BYTES.length) },
+      arrayBuffer: async () => JPEG_BYTES.buffer.slice(
+        JPEG_BYTES.byteOffset,
+        JPEG_BYTES.byteOffset + JPEG_BYTES.byteLength,
+      ),
+    };
+  };
+  try {
+    await seedUser('google-media');
+    const imported = await importGoogleProfilePicture('google-media', GOOGLE_PHOTO);
+    check('the picture was imported', typeof imported === 'string', true);
+    check(
+      'the imported picture is owned by the account',
+      isOwnProfilePictureUrl(imported, 'google-media'),
+      true,
+    );
+    check(
+      'the object was written into the account namespace',
+      Array.from(objects.keys()).every((name) =>
+        name.startsWith(`${PROFILE_PICTURE_PREFIX}/google-media/`),
+      ),
+      true,
+    );
+    const googleProfile = await db.collection('users').doc('google-media').get();
+    check(
+      'the profile publishes the imported picture',
+      googleProfile.get('profileImage'),
+      imported,
+    );
+    check(
+      'the profile records the source of the picture',
+      googleProfile.get('profileImageSource'),
+      'google',
+    );
+    check(
+      'the Auth record carries the picture as well',
+      authPhotos.get('google-media'),
+      imported,
+    );
+
+    // A picture which the user chose by hand is never replaced.
+    await seedUser('chosen-media', {
+      profileImage: 'https://firebasestorage.googleapis.com/v0/b/demo/o/chosen.jpg',
+      profileImageSource: 'upload',
+    });
+    const skipped = await importGoogleProfilePicture('chosen-media', GOOGLE_PHOTO);
+    check('the picture of the user was not replaced', skipped, null);
+    const chosen = await db.collection('users').doc('chosen-media').get();
+    check(
+      'the profile still shows the picture of the user',
+      chosen.get('profileImage'),
+      'https://firebasestorage.googleapis.com/v0/b/demo/o/chosen.jpg',
+    );
+
+    // A picture of a foreign host is never downloaded.
+    const foreign = await importGoogleProfilePicture(
+      'google-media',
+      'https://example.com/pic.jpg',
+    );
+    check('a foreign picture is refused', foreign, null);
+
+    // A picture which the user removed on purpose stays removed. Without the
+    // marker the Google picture would reappear at the next start of the app.
+    await seedUser('removed-media', {
+      profileImage: '',
+      profileImageSource: 'removed',
+    });
+    const restored = await importGoogleProfilePicture(
+      'removed-media',
+      GOOGLE_PHOTO,
+    );
+    check('a removed picture is not restored', restored, null);
+    const removedProfile = await db.collection('users').doc('removed-media').get();
+    check(
+      'the profile of the removed picture stays empty',
+      removedProfile.get('profileImage'),
+      '',
+    );
+    check(
+      'the marker of the removed picture is kept',
+      removedProfile.get('profileImageSource'),
+      'removed',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail > 0) {

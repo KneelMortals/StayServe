@@ -20,6 +20,10 @@ import {
   emailOtpDocumentId,
   REGISTRATION_ROLLBACK_OPERATIONS,
 } from './otp';
+import {
+  googleProfilePictureUrl,
+  importGoogleProfilePicture,
+} from './profileMedia';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
@@ -1002,8 +1006,9 @@ export const syncAuthProfile = callableHttps.onCall(async (_data, context) => {
   // after the challenge was completed. The proof is recorded here, before the
   // identity facts are copied into the profile.
   let identity: FirebaseAuthIdentity;
+  let firebaseUser: auth.UserRecord | null = null;
   try {
-    const firebaseUser = await auth.getAuth().getUser(uid);
+    firebaseUser = await auth.getAuth().getUser(uid);
     const recordedPhone = await recordPhoneVerificationProof({
       uid,
       token: context.auth.token,
@@ -1095,6 +1100,19 @@ export const syncAuthProfile = callableHttps.onCall(async (_data, context) => {
       providers,
     };
   });
+
+  // A Google account carries its own picture. The server copies it into the
+  // trusted bucket, so the profile shows it everywhere. A picture which the
+  // user chose by hand is never replaced, and a failing import never fails
+  // the synchronisation itself.
+  const googlePhoto = googleProfilePictureUrl(firebaseUser);
+  if (googlePhoto) {
+    try {
+      await importGoogleProfilePicture(uid, googlePhoto);
+    } catch (error) {
+      console.error('Could not import the Google profile picture:', error);
+    }
+  }
 
   return {
     success: true,

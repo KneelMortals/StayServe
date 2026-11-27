@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../core/constants/enums.dart';
+import '../../../../core/errors/failures.dart';
 import '../../../../firebase/admin/admin_repository.dart';
 import '../../../../firebase/payments/payment_repository.dart';
 import '../../../../models/user_model.dart';
@@ -123,9 +124,7 @@ class AdminController extends AsyncNotifier<void> {
       return null;
     } catch (e) {
       state = AsyncError(e, StackTrace.current);
-      final message = e is Exception
-          ? e.toString().replaceFirst('Exception: ', '').trim()
-          : 'Something went wrong';
+      final message = readableAuthError(e);
       return message.isEmpty ? 'Something went wrong' : message;
     }
   }
@@ -163,9 +162,7 @@ class AdminController extends AsyncNotifier<void> {
       return null;
     } catch (e) {
       state = AsyncError(e, StackTrace.current);
-      final message = e is Exception
-          ? e.toString().replaceFirst('Exception: ', '').trim()
-          : 'Something went wrong';
+      final message = readableAuthError(e);
       return message.isEmpty ? 'Something went wrong' : message;
     }
   }

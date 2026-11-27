@@ -175,6 +175,15 @@ type VerifyOtpResult =
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 /** The maximum length of an email address accepted by Auth and Firestore. */
 const MAX_EMAIL_LENGTH = 320;
+/**
+ * The maximum length of the name of a person.
+ *
+ * The name is written into the profile and is shown in many places of the
+ * app. An unbounded value would break the layout and could even exceed the
+ * size limit of a Firestore document, so the server refuses it. The client
+ * applies the same limit.
+ */
+const MAX_NAME_LENGTH = 80;
 // Accepts 10-digit Indian numbers as well as international numbers with an
 // optional country code (stored in E.164-ish form, e.g. +919876543210).
 const PHONE_RE = /^\+?[1-9]\d{7,14}$/;
@@ -1227,6 +1236,12 @@ export const completeRegistration = callableHttps.onCall(async (data, context) =
 
     if (!name) {
       throw new functions.https.HttpsError('invalid-argument', 'Name is required');
+    }
+    if (name.length > MAX_NAME_LENGTH) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        `Name must be ${MAX_NAME_LENGTH} characters or fewer`,
+      );
     }
     if (role !== 'student' && role !== 'owner') {
       throw new functions.https.HttpsError('invalid-argument', 'Invalid role');

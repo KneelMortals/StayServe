@@ -98,7 +98,7 @@ class _PlatformFeeSheetState extends ConsumerState<PlatformFeeSheet> {
       if (!mounted) return;
       setState(() {
         _loadingIntent = false;
-        _error = e.toString().replaceFirst('Exception: ', '');
+        _error = readableAuthError(e);
       });
     }
   }
@@ -154,7 +154,7 @@ class _PlatformFeeSheetState extends ConsumerState<PlatformFeeSheet> {
       Navigator.pop(context, true);
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+      setState(() => _error = readableAuthError(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -177,7 +177,7 @@ class _PlatformFeeSheetState extends ConsumerState<PlatformFeeSheet> {
       Navigator.pop(context, true);
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+      setState(() => _error = readableAuthError(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }

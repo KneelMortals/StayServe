@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -7,6 +9,7 @@ import '../../../../core/index.dart';
 import '../../../../models/user_model.dart';
 import '../../../../firebase/otp/otp_service.dart';
 import '../../../auth/presentation/providers/auth_provider.dart';
+import '../widgets/profile_picture_cropper.dart';
 
 /// Lets the signed-in user change their name and profile picture and manage
 /// their verified authentication methods.
@@ -66,9 +69,10 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
 
   /// Lets the user pick a profile picture from the gallery of the phone.
   ///
-  /// The bytes are uploaded by the server, which writes the picture into the
-  /// trusted bucket and publishes its URL on the profile. The client cannot
-  /// write the storage namespace directly.
+  /// The picture is cropped first, so the user chooses exactly what the
+  /// other people of the app see. The cropped picture is uploaded by the
+  /// server, which writes it into the trusted bucket and publishes its URL
+  /// on the profile. The client cannot write the storage namespace directly.
   Future<void> _pickProfilePicture() async {
     if (_isUploadingPicture) return;
 
@@ -77,11 +81,14 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
       picked = await _imagePicker.pickImage(
         source: ImageSource.gallery,
         imageQuality: AppConstants.imageCompressionQuality,
-        maxWidth: 1024,
+        maxWidth: 2048,
       );
     } catch (error) {
       if (!mounted) return;
-      context.showErrorSnackBar('Could not open the gallery: $error');
+      context.showErrorSnackBar(
+        'Could not open the gallery. Please check the photo permissions of '
+        'your phone.',
+      );
       return;
     }
     if (picked == null || !mounted) return;
@@ -94,9 +101,19 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
         context.showErrorSnackBar('The selected photo is empty.');
         return;
       }
+
+      // The cropper returns the picture as a JPEG, or `null` when the user
+      // cancelled it.
+      final cropped = await Navigator.of(context).push<Uint8List>(
+        MaterialPageRoute<Uint8List>(
+          builder: (_) => ProfilePictureCropper(bytes: bytes),
+        ),
+      );
+      if (cropped == null || !mounted) return;
+
       await ref
           .read(authControllerProvider.notifier)
-          .uploadProfilePicture(bytes);
+          .uploadProfilePicture(cropped);
       if (!mounted) return;
       context.showSuccessSnackBar('Profile picture updated');
     } catch (error) {
@@ -278,11 +295,11 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                       label: 'Full name',
                       hint: 'Your name',
                       controller: _nameController,
-                      validator: (value) =>
-                          AppValidators.validateRequired(value, 'Name'),
+                      validator: AppValidators.validateName,
                       prefixIcon: const Icon(Icons.person_outline),
                       enabled: !profileBusy,
                       onChanged: (_) => setState(() {}),
+                      maxLength: AppValidators.maxNameLength,
                     ),
                     const SizedBox(height: AppSpacing.lg),
                     Text(

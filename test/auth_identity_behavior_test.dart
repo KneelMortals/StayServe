@@ -270,6 +270,13 @@ void main() {
 
       await tester.tap(find.text('Student'));
       await tester.pump();
+      // A phone number says nothing about the name of its owner, so the
+      // screen asks for it before the registration can be completed.
+      await tester.enterText(
+        find.widgetWithText(TextFormField, 'Full name'),
+        'Phone User',
+      );
+      await tester.pump();
       await tester.tap(find.text('Continue'));
       await tester.pumpAndSettle();
 

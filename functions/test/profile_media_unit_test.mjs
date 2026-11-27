@@ -23,7 +23,9 @@ const {
   MAX_PROFILE_PICTURE_BYTES,
   PROFILE_PICTURE_PREFIX,
   decodeProfilePictureBytes,
+  googleProfilePictureUrl,
   isOwnProfilePictureUrl,
+  isTrustedGooglePhotoUrl,
   profilePictureDownloadToken,
   profilePictureObjectPath,
   validProfilePictureUploadId,
@@ -225,6 +227,74 @@ check(
     Buffer.alloc(MAX_PROFILE_PICTURE_BYTES).toString('base64'),
   ).length,
   MAX_PROFILE_PICTURE_BYTES,
+);
+
+section('the Google profile picture');
+check(
+  'a picture of Google is trusted',
+  isTrustedGooglePhotoUrl('https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg'),
+  true,
+);
+check(
+  'a picture of another Google host is trusted',
+  isTrustedGooglePhotoUrl('https://photos.googleusercontent.com/pic.jpg'),
+  true,
+);
+check(
+  'an insecure address is refused',
+  isTrustedGooglePhotoUrl('http://lh3.googleusercontent.com/pic.jpg'),
+  false,
+);
+check(
+  'a foreign host is refused',
+  isTrustedGooglePhotoUrl('https://example.com/pic.jpg'),
+  false,
+);
+check(
+  'a host which only looks like Google is refused',
+  isTrustedGooglePhotoUrl('https://lh3.googleusercontent.com.evil.example/pic.jpg'),
+  false,
+);
+check(
+  'a host without the dot is refused',
+  isTrustedGooglePhotoUrl('https://notgoogleusercontent.com/pic.jpg'),
+  false,
+);
+check('an empty address is refused', isTrustedGooglePhotoUrl(''), false);
+check(
+  'a malformed address is refused',
+  isTrustedGooglePhotoUrl('not a url'),
+  false,
+);
+check(
+  'the picture of the Google provider is used',
+  googleProfilePictureUrl({
+    photoURL: '',
+    providerData: [
+      { providerId: 'password', photoURL: '' },
+      {
+        providerId: 'google.com',
+        photoURL: 'https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg',
+      },
+    ],
+  }),
+  'https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg',
+);
+check(
+  'a picture which the user uploaded is not taken from the account',
+  googleProfilePictureUrl({
+    photoURL: 'https://firebasestorage.googleapis.com/v0/b/demo/o/pic.jpg',
+    providerData: [{ providerId: 'phone', photoURL: '' }],
+  }),
+  '',
+);
+check(
+  'an account without a Google identity has no picture',
+  googleProfilePictureUrl({
+    photoURL: '',
+    providerData: [{ providerId: 'phone', photoURL: '' }],
+  }),
+  '',
 );
 
 console.log(`\n${pass} passed, ${fail} failed`);

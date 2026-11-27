@@ -245,15 +245,32 @@ service cloud.firestore {
     // Fields which a user may change on their own profile.  `role`,
     // `roleClaimed`, `isActive` and `registrationCompleted` are deliberately
     // absent.
+    //
+    // The profile picture is absent as well: it is uploaded through the
+    // `uploadProfilePicture` callable, which writes the object into the
+    // trusted bucket with the Admin SDK and publishes the URL itself. A
+    // client which could write the field could point its own profile at any
+    // address of the internet.
     function changesOnlyAllowedSelfFields() {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
         'name',
-        'profileImage',
         'fcmToken',
         'savedRooms',
         'pincode',
         'updatedAt',
       ]);
+    }
+
+    // The name of a person has to fit. The server applies the same limit
+    // when it writes the profile, so a modified client cannot store a name
+    // which the app is not able to display.
+    function selfNameIsValid() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['name']) ||
+        (
+          request.resource.data.get('name', '') is string &&
+          request.resource.data.get('name', '').size() > 0 &&
+          request.resource.data.get('name', '').size() <= 80
+        );
     }
 
     // A client may bootstrap a profile for itself, but it may not claim
@@ -482,7 +499,8 @@ service cloud.firestore {
       // administrator has no direct profile-field write path.
       allow update: if request.auth != null &&
         request.auth.uid == uid &&
-        changesOnlyAllowedSelfFields();
+        changesOnlyAllowedSelfFields() &&
+        selfNameIsValid();
 
       // Account deletion is exclusively a server operation.  The
       // deleteUserCompletely callable removes Firebase Auth and Firestore

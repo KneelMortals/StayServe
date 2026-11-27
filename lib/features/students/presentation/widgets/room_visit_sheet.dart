@@ -30,7 +30,7 @@ Future<void> showRoomVisitSheet(BuildContext context, String roomId) async {
   } catch (e) {
     messenger.showSnackBar(
       SnackBar(
-        content: Text(e.toString().replaceFirst('Exception: ', '')),
+        content: Text(readableAuthError(e)),
         backgroundColor: errorColor,
       ),
     );

@@ -423,7 +423,10 @@ class AuthRepository {
       // `phone`, `email`, their verification flags and the provider list
       // are server-owned. They are copied from signed Firebase Auth claims
       // and must never be written by this client method.
-      'profileImage': user.profileImage,
+      //
+      // The profile picture is server-owned as well: it is uploaded through
+      // the `uploadProfilePicture` callable, which writes the object into the
+      // trusted bucket and publishes the URL itself.
       'pincode': user.pincode,
       'updatedAt': FieldValue.serverTimestamp(),
     });

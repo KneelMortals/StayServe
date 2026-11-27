@@ -154,6 +154,19 @@ String readableAuthError(Object error) {
         .replaceFirst(RegExp(r'^\[[^\]]+\]\s*'), '')
         .trim();
   }
+  // A `RangeError` (and every other `Error`) is a bug of the framework or of
+  // a plugin — for example a photo which a decoder could not read. The raw
+  // text ("RangeError (index): Invalid value: Not in inclusive range
+  // 0..255: 255") is useless for the user, so it is replaced by a message
+  // which explains what to do instead.
+  if (error is RangeError) {
+    return 'The selected file could not be processed. Please choose another '
+        'one.';
+  }
+  if (error is Error) {
+    return 'Something went wrong while the file was prepared. Please try '
+        'again.';
+  }
   return error.toString();
 }
 

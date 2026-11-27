@@ -8478,6 +8478,47 @@ async function testPhoneAndGoogleRegistrationIdentities() {
     false,
   );
 
+  // A name which does not fit would break the layout of the app and could
+  // exceed the size limit of a Firestore document.
+  await reset();
+  await db.collection('users').doc('long-name-user').set({
+    uid: 'long-name-user',
+    role: 'student',
+    roleClaimed: false,
+    roleRevision: 0,
+    registrationCompleted: false,
+    isActive: true,
+    phone: '+919876543210',
+    phoneVerified: true,
+  });
+  await expectDenied(
+    'a name which does not fit is refused',
+    () =>
+      invoke(
+        completeRegistration,
+        { name: 'A'.repeat(81), role: 'student' },
+        'long-name-user',
+        {
+          email: '',
+          email_verified: false,
+          phone_number: '+919876543210',
+          phone_number_verified: true,
+          firebase: {
+            identities: { phone: ['+919876543210'] },
+            sign_in_provider: 'phone',
+          },
+        },
+      ),
+    'invalid-argument',
+  );
+  check(
+    'the account of the refused name is still incomplete',
+    (
+      await db.collection('users').doc('long-name-user').get()
+    ).get('registrationCompleted'),
+    false,
+  );
+
   await reset();
   await db.collection('users').doc('google-user').set({
     uid: 'google-user',

@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as firestore from 'firebase-admin/firestore';
 import * as functions from 'firebase-functions/v1';
 import * as storage from 'firebase-admin/storage';
+import * as auth from 'firebase-admin/auth';
 
 // Creates the default Firebase app before this module opens Firestore —
 // see the comment in `./firebase.ts`.
@@ -44,6 +45,91 @@ const PROFILE_PICTURE_CONTENT_TYPES = [
   'image/webp',
   'image/gif',
 ];
+
+/**
+ * The hosts which may serve the profile picture of a Google account.
+ *
+ * Only Google itself may serve such a picture. The check keeps the server
+ * from downloading an arbitrary address which a client put into the profile.
+ */
+const GOOGLE_PHOTO_HOST_PATTERN = /(^|\.)googleusercontent\.com$/i;
+
+/** The maximum size of a downloaded Google profile picture. */
+export const MAX_GOOGLE_PHOTO_BYTES = 2 * 1024 * 1024;
+
+/** The time a download of a Google profile picture may take. */
+const GOOGLE_PHOTO_TIMEOUT_MS = 10_000;
+
+/**
+ * Whether a URL points at a profile picture which Google itself serves.
+ */
+export function isTrustedGooglePhotoUrl(url: string): boolean {
+  const trimmed = String(url || '').trim();
+  if (!trimmed) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  return GOOGLE_PHOTO_HOST_PATTERN.test(parsed.hostname.toLowerCase());
+}
+
+/**
+ * The profile picture of the Google identity of an account.
+ *
+ * The picture of the Google provider is preferred: the picture of the account
+ * itself may be a StayServe picture which the user uploaded by hand. An empty
+ * string is returned when the account has no Google picture.
+ */
+export function googleProfilePictureUrl(user: {
+  photoURL?: string | null;
+  providerData?: Array<{
+    providerId?: string | null;
+    photoURL?: string | null;
+  }>;
+}): string {
+  const providers = Array.isArray(user.providerData) ? user.providerData : [];
+  const google = providers.find(
+    (provider) => String(provider.providerId || '') === 'google.com',
+  );
+  const candidate = String(google?.photoURL || user.photoURL || '').trim();
+  return isTrustedGooglePhotoUrl(candidate) ? candidate : '';
+}
+
+/**
+ * Downloads a Google profile picture.
+ *
+ * The download is bounded: it is aborted after ten seconds and a picture
+ * which is larger than two megabytes is refused. A redirect is **not**
+ * followed, because the redirect could point at any host.
+ */
+export async function downloadGooglePhoto(url: string): Promise<Buffer | null> {
+  if (!isTrustedGooglePhotoUrl(url)) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GOOGLE_PHOTO_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'manual',
+      headers: { Accept: 'image/*' },
+    });
+    if (!response.ok) return null;
+    const announced = Number(response.headers.get('content-length') || '0');
+    if (announced > MAX_GOOGLE_PHOTO_BYTES) return null;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > MAX_GOOGLE_PHOTO_BYTES) return null;
+    return bytes;
+  } catch (error) {
+    console.warn('Could not download a Google profile picture:', error);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 
 /**
  * Whether an upload id is safe to use as a Storage object name.
@@ -227,6 +313,118 @@ export function decodeProfilePictureBytes(encoded: string): Buffer {
 }
 
 /**
+ * Imports the profile picture of the Google identity of an account.
+ *
+ * A Google account already carries a name and a picture. The picture is
+ * copied into the trusted bucket by the server, so the profile shows exactly
+ * the same picture everywhere and the client never has to write into the
+ * storage namespace.
+ *
+ * The import never overwrites a picture which the user chose by hand: it
+ * only fills an empty profile or replaces an older Google picture.
+ */
+export async function importGoogleProfilePicture(
+  uid: string,
+  photoUrl: string,
+): Promise<string | null> {
+  const trimmed = String(photoUrl || '').trim();
+  if (!trimmed || !isTrustedGooglePhotoUrl(trimmed)) return null;
+
+  const userRef = db.collection('users').doc(uid);
+  const snapshot = await userRef.get();
+  if (!snapshot.exists) return null;
+
+  const currentUrl = String(snapshot.get('profileImage') || '').trim();
+  const currentSource = String(snapshot.get('profileImageSource') || '').trim();
+  if (currentSource === 'upload' || currentSource === 'removed') {
+    // The user picked this picture by hand, or removed it on purpose. The
+    // Google picture must not come back on the next synchronisation — that
+    // would silently undo what the user just did.
+    return null;
+  }
+  if (currentUrl && currentSource !== 'google') {
+    // An unknown source: the picture was not written by the server, so it is
+    // not owned by the server either.
+    return null;
+  }
+
+  const bytes = await downloadGooglePhoto(trimmed);
+  if (!bytes) return null;
+
+  const contentType = detectImageContentType(bytes);
+  if (!contentType || PROFILE_PICTURE_CONTENT_TYPES.indexOf(contentType) < 0) {
+    return null;
+  }
+
+  // The upload id is derived from the address of the picture, so a repeated
+  // import writes the same object and produces the same URL.
+  const uploadId = `google-${crypto
+    .createHash('sha256')
+    .update(trimmed)
+    .digest('hex')
+    .slice(0, 24)}`;
+  const objectPath = profilePictureObjectPath(uid, uploadId);
+  const downloadToken = profilePictureDownloadToken(uid, uploadId);
+  const file = storage.getStorage().bucket(PROFILE_PICTURE_BUCKET).file(objectPath);
+
+  try {
+    await file.save(bytes, {
+      resumable: false,
+      metadata: {
+        contentType,
+        cacheControl: 'private,max-age=3600',
+        metadata: {
+          firebaseStorageDownloadTokens: downloadToken,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Could not store the Google profile picture:', error);
+    return null;
+  }
+
+  let url = '';
+  try {
+    url = await storage.getDownloadURL(file);
+  } catch (error) {
+    console.error('Could not create the profile-picture download URL:', error);
+    await file.delete({ ignoreNotFound: true }).catch(() => undefined);
+    return null;
+  }
+  if (!url.includes(downloadToken) || !isOwnProfilePictureUrl(url, uid)) {
+    await file.delete({ ignoreNotFound: true }).catch(() => undefined);
+    return null;
+  }
+
+  // The account may have been deleted while the picture was downloaded.
+  try {
+    await userRef.update({
+      profileImage: url,
+      profileImageUpdatedAt: firestore.FieldValue.serverTimestamp(),
+      profileImageSource: 'google',
+      updatedAt: firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (error) {
+    await file.delete({ ignoreNotFound: true }).catch(() => undefined);
+    return null;
+  }
+
+  // The Auth record carries the same picture, so the other Firebase surfaces
+  // — the account switcher of the operating system for example — show it as
+  // well. A failure here does not affect the profile.
+  try {
+    await auth.getAuth().updateUser(uid, { photoURL: url });
+  } catch (error) {
+    console.warn(
+      'Could not write the Google picture to the Auth record:',
+      error,
+    );
+  }
+
+  return url;
+}
+
+/**
  * Stores one profile picture and publishes it on the profile.
  *
  * The object is written by the Admin SDK, so a client can never create an
@@ -315,6 +513,7 @@ export const uploadProfilePicture = callableHttps.onCall(async (data, context) =
     await userRef.update({
       profileImage: url,
       profileImageUpdatedAt: firestore.FieldValue.serverTimestamp(),
+      profileImageSource: 'upload',
       updatedAt: firestore.FieldValue.serverTimestamp(),
     });
   } catch (error) {
@@ -331,6 +530,18 @@ export const uploadProfilePicture = callableHttps.onCall(async (data, context) =
   await deleteOtherProfilePictureObjects(uid, objectPath).catch((error) => {
     console.error('Could not remove the replaced profile picture:', error);
   });
+
+  // The Auth record carries the picture as well, so the other Firebase
+  // surfaces show the same picture. A failure here does not affect the
+  // profile.
+  try {
+    await auth.getAuth().updateUser(uid, { photoURL: url });
+  } catch (error) {
+    console.warn(
+      'Could not write the profile picture to the Auth record:',
+      error,
+    );
+  }
 
   return {
     success: true,
@@ -360,11 +571,28 @@ export const removeProfilePicture = callableHttps.onCall(async (_data, context) 
   const userRef = db.collection('users').doc(uid);
   await userRef.update({
     profileImage: '',
+    // The marker keeps a later Google synchronisation from importing the
+    // picture of the Google account again. Without it the picture would
+    // reappear at the next start of the app, although the user removed it on
+    // purpose.
+    profileImageSource: 'removed',
     profileImageUpdatedAt: firestore.FieldValue.serverTimestamp(),
     updatedAt: firestore.FieldValue.serverTimestamp(),
   });
 
   await deleteProfilePictureObjects(uid);
+
+  // The Auth record carries the picture as well, so the other Firebase
+  // surfaces — the account switcher of the operating system for example —
+  // would still show it. A failure here does not affect the profile.
+  try {
+    await auth.getAuth().updateUser(uid, { photoURL: '' });
+  } catch (error) {
+    console.warn(
+      'Could not clear the profile picture on the Auth record:',
+      error,
+    );
+  }
 
   return { success: true };
 });

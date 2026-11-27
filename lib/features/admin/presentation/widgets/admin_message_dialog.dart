@@ -78,7 +78,7 @@ class _AdminMessageDialogState extends ConsumerState<AdminMessageDialog> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            error.toString().replaceFirst('Exception: ', '').trim(),
+            readableAuthError(error),
           ),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),

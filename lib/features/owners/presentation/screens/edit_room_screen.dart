@@ -126,7 +126,7 @@ class EditRoomScreen extends ConsumerWidget {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );

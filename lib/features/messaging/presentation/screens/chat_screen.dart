@@ -199,7 +199,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ref.invalidate(conversationInteractionDetailsProvider(_interactionKey));
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
@@ -281,7 +281,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );

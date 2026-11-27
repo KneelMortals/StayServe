@@ -1,9 +1,25 @@
 import 'package:intl/intl.dart';
 
 class AppValidators {
+  /// The longest name a profile may carry.
+  ///
+  /// The server enforces the same limit, so a modified client cannot write a
+  /// name which the app is not able to display.
+  static const int maxNameLength = 80;
+
   static String? validateRequired(String? value, String fieldName) {
     if (value == null || value.trim().isEmpty) {
       return '$fieldName is required';
+    }
+    return null;
+  }
+
+  /// The name of a person: it has to be there and it has to fit.
+  static String? validateName(String? value) {
+    final required = validateRequired(value, 'Name');
+    if (required != null) return required;
+    if (value!.trim().length > maxNameLength) {
+      return 'Name must be $maxNameLength characters or fewer';
     }
     return null;
   }

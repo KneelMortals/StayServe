@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../../core/index.dart';
+import '../../../../models/user_model.dart';
 import '../../../../../firebase/auth/auth_service.dart';
 import '../../../../../firebase/otp/otp_service.dart';
 import '../providers/auth_provider.dart';
@@ -24,12 +25,48 @@ class RoleSelectionScreen extends ConsumerStatefulWidget {
 
 class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
   final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
 
   UserRole? _selectedRole;
   bool _isLoading = false;
 
   @override
+  void initState() {
+    super.initState();
+    // A Google account already knows the name of its owner. A phone account
+    // does not, so the field stays empty and the user has to fill it in.
+    final user = ref.read(authRepositoryProvider).currentUser;
+    final displayName = user?.displayName?.trim() ?? '';
+    if (displayName.isNotEmpty) {
+      _nameController.text = displayName;
+      return;
+    }
+    _prefillFromProfile(user?.uid);
+  }
+
+  /// Uses the name of the profile when Firebase Auth does not know one.
+  ///
+  /// A phone account has no name in Firebase Auth. The profile may still
+  /// carry one — for example when the registration is repeated after a
+  /// rollback. The placeholder of the bootstrap ("User") is not a name, so it
+  /// is ignored.
+  Future<void> _prefillFromProfile(String? uid) async {
+    if (uid == null) return;
+    final UserModel? profile;
+    try {
+      profile = await ref.read(userProfileProvider(uid).future);
+    } catch (error) {
+      return;
+    }
+    final name = profile?.name.trim() ?? '';
+    if (name.isEmpty || name == 'User') return;
+    if (!mounted || _nameController.text.isNotEmpty) return;
+    _nameController.text = name;
+  }
+
+  @override
   void dispose() {
+    _nameController.dispose();
     super.dispose();
   }
 
@@ -60,12 +97,11 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
       // returns the role which was actually stored; an already claimed role
       // is preserved by the server and may differ from the button which was
       // pressed.
+      final name = _nameController.text.trim();
       final registration = await ref
           .read(otpServiceProvider)
           .completeRegistration(
-            name: user.displayName?.trim().isNotEmpty == true
-                ? user.displayName!.trim()
-                : 'User',
+            name: name,
             role: _selectedRole!.name,
             challenge: challenge,
           );
@@ -98,7 +134,7 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          content: Text(readableAuthError(e)),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
@@ -162,7 +198,8 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                       ),
                       const SizedBox(height: AppSpacing.sm),
                       Text(
-                        'Select your role to personalize your experience',
+                        'Tell us your name and select your role to personalize '
+                        'your experience',
                         style: theme.textTheme.bodyMedium?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
@@ -185,6 +222,16 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: AppSpacing.xl),
+                AppTextField(
+                  label: 'Full name',
+                  hint: 'Your name',
+                  controller: _nameController,
+                  validator: AppValidators.validateName,
+                  prefixIcon: const Icon(Icons.person_outline),
+                  enabled: !_isLoading,
+                  maxLength: AppValidators.maxNameLength,
+                ),
+                const SizedBox(height: AppSpacing.lg),
                 Expanded(
                   child: Column(
                     children: [

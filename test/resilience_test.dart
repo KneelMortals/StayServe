@@ -218,6 +218,26 @@ void main() {
         'Too many attempts.',
       );
     });
+
+    // The "range error" which users reported while changing their profile
+    // picture was a `RangeError`. It is an `Error` and not an `Exception`, so
+    // the branch above never caught it and the raw technical text — which
+    // names an index and a value — was shown in the snack bar.
+    test('explains a range error of a picture instead of its raw text', () {
+      final message = readableAuthError(
+        RangeError.index(255, [0], 'value', null),
+      );
+      expect(message, isNot(contains('RangeError')));
+      expect(message, isNot(contains('inclusive range')));
+      expect(message, contains('could not be processed'));
+    });
+
+    test('explains any other error of the framework', () {
+      final message = readableAuthError(
+        StateError('Bad state: something went wrong'),
+      );
+      expect(message, isNot(contains('Bad state')));
+    });
   });
 
   group('LaunchPincodeConfig', () {
