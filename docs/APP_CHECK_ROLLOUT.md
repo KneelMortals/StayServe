@@ -176,6 +176,12 @@ only carries `FIREBASE_APPCHECK_RECAPTCHA_SITE_KEY`. The Enterprise key is
 preferred because it belongs to the project and can be limited to the domains
 of the app.
 
+The key was proved in a real browser: the Firebase JS SDK was initialised
+with `ReCaptchaEnterpriseProvider` and the key of the project on
+`http://localhost:8765/` (the key allows `localhost`), and `getToken()`
+returned an App Check token of 960 characters. A key which is registered but
+not usable would answer with an error instead.
+
 The key of the **App Check** provider and the key of the **Identity Platform
 phone provider** are two different things. The Identity Platform provisions
 its own keys for the phone provider when the reCAPTCHA Enterprise bot
