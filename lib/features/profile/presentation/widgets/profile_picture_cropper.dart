@@ -70,7 +70,10 @@ Future<Uint8List?> convertUnsupportedPicture(Uint8List bytes) async {
     );
     frame.image.dispose();
     if (data == null) return null;
-    return data.buffer.asUint8List();
+    // The buffer of the data can be larger than the picture itself. Only the
+    // bytes of the picture are taken, otherwise the decoder would read the
+    // leading rubbish and fail.
+    return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
   } catch (error) {
     return null;
   } finally {
