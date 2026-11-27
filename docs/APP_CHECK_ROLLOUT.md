@@ -12,9 +12,11 @@ request.
 - Debug builds use the App Check **debug** provider.
 - Release Android builds use **Play Integrity**.
 - Release iOS builds use **App Attest**, with DeviceCheck as a fallback.
-- Web App Check remains inactive until a reCAPTCHA v3 site key is configured.
-  The Web Firebase app itself is registered and can be published before that
-  provider is enabled.
+- Web App Check uses the **reCAPTCHA Enterprise** key of the project. The key
+  is registered for the Web app and the released web build carries it through
+  `FIREBASE_APPCHECK_RECAPTCHA_ENTERPRISE_SITE_KEY`.
+- A web build without any key intentionally skips App Check rather than
+  failing startup, so the fallback stays available for local builds.
 - Every callable uses one shared server-side switch:
   `APP_CHECK_ENFORCE=true`.
 - The switch defaults to `false`, so the emulator and existing clients remain
@@ -27,9 +29,12 @@ request.
 Do **not** set `APP_CHECK_ENFORCE=true` until all of these are resolved and
 proved with real builds:
 
-1. The Web client has no reCAPTCHA v3 site key in the checked-in build, so it
-   intentionally sends no App Check token. Because callable enforcement is
-   global, enabling it would also reject Web OTP and registration calls.
+1. The web client carries the reCAPTCHA Enterprise key only in a build which
+   was made with
+   `--dart-define=FIREBASE_APPCHECK_RECAPTCHA_ENTERPRISE_SITE_KEY=…`.
+   A build without that define intentionally sends no App Check token. Because
+   callable enforcement is global, enabling it would also reject Web OTP and
+   registration calls of such a build.
 2. The checked-in iOS project does not yet contain the App Attest/DeviceCheck
    entitlement and Xcode capability. Add and validate them before testing an
    iOS release token.
@@ -144,15 +149,42 @@ mistaking an App Check toggle for a complete room-photo access boundary.
 
 The Web Firebase app is registered as
 `1:96035616668:web:21b41ac4b3224e4d88fa59`, and its `FirebaseOptions` live in
-`lib/firebase/firebase_config.dart`. Build with the reCAPTCHA v3 provider once
-its site key is configured:
+`lib/firebase/firebase_config.dart`.
+
+The project has a **reCAPTCHA Enterprise** key for the web build. Its key
+`6LdABDUuAAAAALANiAAsOKmI8DwqXO0G-LHu-4sB` is registered as the
+`recaptchaEnterpriseConfig` of the Web app with a minimum risk score of `0.5`.
+The key is restricted to the domains of the app:
+
+```text
+myfirstapp-fa30f52b.web.app
+myfirstapp-fa30f52b.firebaseapp.com
+localhost
+stayserve.co.in
+www.stayserve.co.in
+```
+
+Build the web client with that key:
 
 ```bash
 flutter build web \
-  --dart-define=FIREBASE_APPCHECK_RECAPTCHA_SITE_KEY=your-site-key
+  --dart-define=FIREBASE_APPCHECK_RECAPTCHA_ENTERPRISE_SITE_KEY=6LdABDUuAAAAALANiAAsOKmI8DwqXO0G-LHu-4sB
 ```
 
-Without that key the Flutter client intentionally skips web App Check rather
+The classic reCAPTCHA v3 key is still accepted as a fallback for a build which
+only carries `FIREBASE_APPCHECK_RECAPTCHA_SITE_KEY`. The Enterprise key is
+preferred because it belongs to the project and can be limited to the domains
+of the app.
+
+The key of the **App Check** provider and the key of the **Identity Platform
+phone provider** are two different things. The Identity Platform provisions
+its own keys for the phone provider when the reCAPTCHA Enterprise bot
+protection is enabled in the Firebase console; that integration is currently
+off and must not be enabled through the REST API, because the API stores the
+entry without the key. See the phone-provider section of
+[`DEPLOYMENT.md`](../DEPLOYMENT.md).
+
+Without any key the Flutter client intentionally skips web App Check rather
 than failing startup. Callable enforcement must also remain disabled until
 browser tokens have been validated.
 

@@ -1,6 +1,6 @@
 # StayServe domain and Google Search readiness
 
-Last reviewed: **2026-11-22**
+Last reviewed: **2026-11-28**
 
 This document records the non-production domain and search readiness work for
 StayServe. It does **not** authorize a production deployment or a DNS change.
@@ -10,9 +10,12 @@ StayServe. It does **not** authorize a production deployment or a DNS change.
 - Firebase project: `myfirstapp-fa30f52b`
 - Firebase Hosting site: `myfirstapp-fa30f52b`
 - Current public Hosting origin: `https://myfirstapp-fa30f52b.web.app`
-- Custom domains attached to the Hosting site: **none**
+- Custom domains attached to the Hosting site:
+  - `stayserve.co.in` — canonical host;
+  - `www.stayserve.co.in` — permanent redirect to `stayserve.co.in`.
 - Selected target domain: **`stayserve.co.in`**
-- Target-domain registration status on 2026-11-22: **not yet registered by the owner**
+- Remote readiness of both domains: **waiting for DNS**
+  (`OWNERSHIP_MISSING`, `HOST_UNHOSTED`, `CERT_VALIDATING`)
 - Checked-in canonical origin: `https://myfirstapp-fa30f52b.web.app`
 - Production deployment performed during this work: **none**
 
@@ -20,6 +23,12 @@ The checked-in canonical origin deliberately points to the domain that is
 actually attached to Hosting today. Do not point canonical metadata, the
 sitemap, or the robots sitemap directive at a candidate domain until that
 domain is connected and its managed TLS certificate is active.
+
+The Firebase-side attachment is done. What is missing is the registrar side:
+the owner must apply the exact records which `npm run domain:status` prints.
+Until Firebase reports `OWNERSHIP_ACTIVE`, `HOST_ACTIVE` and `CERT_ACTIVE`,
+the custom domain cannot serve traffic and the alignment helper refuses to
+rewrite the checked-in URLs.
 
 ## Implemented technical readiness
 
@@ -161,6 +170,24 @@ an existing live site before the cutover.
 Run `npm run domain:status` again while DNS propagates. Firebase provisions
 and renews the TLS certificate automatically. The domain is ready only when
 DNS ownership, host routing, and the TLS certificate all report active.
+
+### 3.1 Prepare the platform for the new domain
+
+Two platform allowlists are already prepared for `stayserve.co.in`, so a
+Google sign-in or a phone sign-in on the custom domain is not refused:
+
+- **Identity Platform authorized domains** — `stayserve.co.in` and
+  `www.stayserve.co.in` are authorized besides `localhost`,
+  `myfirstapp-fa30f52b.firebaseapp.com` and
+  `myfirstapp-fa30f52b.web.app`. Without them a Google sign-in on the custom
+  domain is refused with `auth/disallowed-domain`.
+- **reCAPTCHA Enterprise** — both web keys of the project allow the custom
+  domains in addition to the Hosting origins, so browser App Check and the
+  phone sign-in keep working after the cutover.
+
+The Identity Platform config also carries **test phone numbers** so the phone
+sign-in can be exercised without a SIM and without a fee. The numbers
+`+16505550100` … `+16505550104` accept the code `123456`.
 
 ### 4. Align all checked-in public URLs
 

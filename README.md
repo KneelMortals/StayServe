@@ -242,6 +242,21 @@ STAY_SERVE_RELEASE_KEY_ALIAS
 STAY_SERVE_RELEASE_KEY_PASSWORD
 ```
 
+The upload key of this project lives outside the repository:
+
+```text
+~/.config/stayserve/stayserve-upload.jks     (PKCS#12)
+~/.config/stayserve/release-signing.env      (the four values above)
+```
+
+Its fingerprints are registered with the Firebase Android app
+(`1:96035616668:android:cfc3cf3dab21aa9488fa59`):
+
+```text
+SHA-1   0B:8F:32:33:C7:49:49:EB:F4:D4:70:DB:99:8C:A5:28:B3:7A:EE:41
+SHA-256 66:09:19:FA:38:4F:C4:FD:54:5A:D7:27:CD:04:6D:9E:9F:5D:BA:D6:02:45:1E:34:9A:D5:5D:C9:06:94:74:8B
+```
+
 When all four values are absent, the build falls back to the debug key so
 local and CI size validation can still run. A partial configuration (including
 a missing or blank value) fails the Gradle build instead of silently producing
@@ -252,6 +267,11 @@ Every certificate which will run the app must also be registered in the
 Firebase Android OAuth client: the local/debug SHA-1, the CI/upload SHA-1,
 and the Play App Signing SHA-1. A CI runner or Play build with an
 unregistered certificate cannot complete Google sign-in.
+
+The upload key must be backed up in a private place and enrolled in **Play
+App Signing**; Play then issues its own app-signing key and the upload key is
+used only for the upload artifact. Losing the upload key means the app can
+no longer be updated through Play.
 
 The exact room address is stored in the server-owned
 `roomPrivate/{roomId}` collection. Public `rooms/{roomId}` documents retain

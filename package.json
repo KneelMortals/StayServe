@@ -19,6 +19,8 @@
     "test:domain": "node --test tools/domain_cutover_test.mjs",
     "storage:cors:check": "node tools/configure_storage_cors.mjs",
     "storage:cors:apply": "node tools/configure_storage_cors.mjs --apply",
+    "phone:test-numbers": "node tools/firebase_phone_test_numbers.mjs",
+    "phone:test-numbers:probe": "node tools/firebase_phone_test_numbers.mjs --probe",
     "web:html:check": "html-validate web/index.html web/home/index.html web/terms/index.html web/privacy-policy/index.html",
     "web:seo:check": "node tools/verify_web_seo.mjs build/web",
     "domain:status": "node tools/domain_cutover.mjs status",

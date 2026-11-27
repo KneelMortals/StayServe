@@ -258,6 +258,57 @@ Security properties:
   cannot register with an unverified number. The app also invalidates the
   verification whenever the email or phone field is edited.
 
+### 4.1 Firebase phone sign-in test numbers
+
+The Firebase phone provider (used by the phone sign-up screen) carries test
+phone numbers, so the flow can be exercised without a SIM and without a fee:
+
+| Number | Code |
+|---|---|
+| `+16505550100` | `123456` |
+| `+16505550101` | `123456` |
+| `+16505550102` | `123456` |
+| `+16505550103` | `123456` |
+| `+16505550104` | `123456` |
+
+A test number never receives a real SMS; the code is accepted by Firebase
+directly. Test accounts are disposable — remove them with the Firebase
+console or the Admin SDK after a test run.
+
+The Identity Platform config also authorizes the custom domains
+`stayserve.co.in` and `www.stayserve.co.in`, so a Google sign-in or a phone
+sign-in on the live domain is not refused with `auth/disallowed-domain`.
+
+#### The reCAPTCHA of the phone provider
+
+The browser sign-in of the Firebase phone provider uses the **classic**
+reCAPTCHA path. The backend hands out its site key with
+`GET identitytoolkit.googleapis.com/v1/recaptchaParams`, and the Firebase JS
+SDK loads it automatically. No key has to be configured for it, and the phone
+sign-up works in the browser out of the box.
+
+The **reCAPTCHA Enterprise** integration of the Identity Platform (the bot
+protection of the phone and the email provider) is **off**
+(`phoneEnforcementState: OFF`, `emailPasswordEnforcementState: OFF`). It has
+to stay off until it is enabled from the Firebase console:
+
+> Firebase Console → Authentication → Settings → reCAPTCHA → **Enable
+> reCAPTCHA Enterprise**.
+
+The console provisions the score-based keys of the project itself (one for
+the web, one for Android, one for iOS). The REST API of the Identity Platform
+cannot do this: a request which uploads a key of your own
+(`recaptchaConfig.recaptchaKeys`) is answered with `INVALID_SITE_KEY`, and a
+request without a type is accepted but stores the entry **without the key**,
+which makes the browser fail with `recaptcha key is empty`. The keys of the
+project are used by the **App Check** provider of the web build instead; see
+[`docs/APP_CHECK_ROLLOUT.md`](docs/APP_CHECK_ROLLOUT.md).
+
+The phone provider keeps working while the integration is off. Turn it on only
+after the console has provisioned the keys, and check
+`GET identitytoolkit.googleapis.com/v2/recaptchaConfig?clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE`
+for a `recaptchaKey` before a release.
+
 ### 4.1 What the payment functions do
 
 | Function | Callable | Purpose |
