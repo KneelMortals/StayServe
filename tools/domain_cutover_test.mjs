@@ -11,6 +11,7 @@ import {
   formatDnsRecords,
   getDesiredDnsRecords,
   getDomainReadinessProblems,
+  HostingApiError,
   isDomainReady,
   normalizeHostname,
   parseCanonicalOrigin,
@@ -596,4 +597,173 @@ test('operation polling returns the completed response', async () => {
   );
   assert.equal(polls, 1);
   assert.match(response.name, /customDomains\/domain$/);
+});
+
+test('operation polling survives an operation which cannot be read', async () => {
+  // The custom-domain operations of Firebase Hosting cannot be fetched: the
+  // API answers with `404 NOT_FOUND`. The domain resource is the source of
+  // truth, so the missing operation must not stop the cutover.
+  const api = {
+    async getOperation() {
+      throw new HostingApiError('Firebase Hosting returned HTTP 404', {
+        status: 404,
+      });
+    },
+  };
+
+  const response = await waitForOperation(
+    api,
+    {name: 'operations/one'},
+    {sleep: async () => {}},
+  );
+  assert.equal(response, null);
+});
+
+test('attaching a domain survives an operation which cannot be read', async () => {
+  const calls = [];
+  const attached = {
+    name: 'projects/project/sites/site/customDomains/stayserve.co.in',
+    ownershipState: 'OWNERSHIP_PENDING',
+  };
+  const api = {
+    async listCustomDomains() {
+      return [];
+    },
+    async createCustomDomain(projectId, siteId, domain, options) {
+      calls.push({domain, options});
+      return {name: `operations/${domain}`};
+    },
+    async getOperation() {
+      throw new HostingApiError('Firebase Hosting returned HTTP 404', {
+        status: 404,
+      });
+    },
+    async getCustomDomain() {
+      return attached;
+    },
+  };
+
+  const result = await ensureCustomDomain(api, {
+    projectId: 'project',
+    siteId: 'site',
+    domain: 'stayserve.co.in',
+    sleep: async () => {},
+  });
+  assert.equal(result.created, true);
+  assert.equal(result.domain, attached);
+  assert.equal(calls.length, 2);
+});
+
+test('attaching recognises a domain which the API names with the project number', async () => {
+  // The API names the resource with the number of the project, so the
+  // comparison with the project id would never match and the tool would try
+  // to attach the domain a second time.
+  const existing = {
+    name: 'projects/96035616668/sites/myfirstapp-fa30f52b/customDomains/stayserve.co.in',
+    ownershipState: 'OWNERSHIP_MISSING',
+  };
+  let createCalls = 0;
+  const api = {
+    async listCustomDomains() {
+      return [existing];
+    },
+    async createCustomDomain() {
+      createCalls += 1;
+      throw new Error('create should not run');
+    },
+  };
+
+  const result = await ensureCustomDomain(api, {
+    projectId: 'myfirstapp-fa30f52b',
+    siteId: 'myfirstapp-fa30f52b',
+    domain: 'stayserve.co.in',
+  });
+  assert.equal(result.created, false);
+  assert.equal(result.domain, existing);
+  assert.equal(createCalls, 0);
+});
+
+test('attaching survives an operation which never reports a result', async () => {
+  // The custom-domain operations of Firebase Hosting sometimes stay pending
+  // forever. The domain resource shows the result.
+  const attached = {
+    name: 'projects/project/sites/site/customDomains/stayserve.co.in',
+    ownershipState: 'OWNERSHIP_PENDING',
+  };
+  const api = {
+    async listCustomDomains() {
+      return [];
+    },
+    async createCustomDomain() {
+      return {name: 'operations/one'};
+    },
+    async getOperation() {
+      return {done: false};
+    },
+    async getCustomDomain() {
+      return attached;
+    },
+  };
+
+  const result = await ensureCustomDomain(api, {
+    projectId: 'project',
+    siteId: 'site',
+    domain: 'stayserve.co.in',
+    sleep: async () => {},
+    operationTimeoutMs: 0,
+  });
+  assert.equal(result.created, true);
+  assert.equal(result.domain, attached);
+});
+
+test('attaching stops when the API reports a failed validation', async () => {
+  const api = {
+    async listCustomDomains() {
+      return [];
+    },
+    async createCustomDomain() {
+      return {
+        name: 'operations/one',
+        done: true,
+        error: {code: 400, message: 'the domain is not usable'},
+      };
+    },
+    async getCustomDomain() {
+      throw new Error('the domain must not be read');
+    },
+  };
+
+  await assert.rejects(
+    ensureCustomDomain(api, {
+      projectId: 'project',
+      siteId: 'site',
+      domain: 'stayserve.co.in',
+      sleep: async () => {},
+    }),
+    /the domain is not usable/,
+  );
+});
+
+test('attaching fails when the domain is not attached after the operation', async () => {
+  const api = {
+    async listCustomDomains() {
+      return [];
+    },
+    async createCustomDomain() {
+      return {name: 'operations/one', done: true, response: {}};
+    },
+    async getCustomDomain() {
+      return null;
+    },
+  };
+
+  await assert.rejects(
+    ensureCustomDomain(api, {
+      projectId: 'project',
+      siteId: 'site',
+      domain: 'stayserve.co.in',
+      sleep: async () => {},
+    }),
+    /did not attach/,
+  );
 });

@@ -26,11 +26,14 @@ const EXPECTED_CANONICAL_PATHS = Object.freeze({
 });
 
 export class HostingApiError extends Error {
-  constructor(message, {status = null, body = null} = {}) {
+  constructor(message, {status = null, body = null, reason = null} = {}) {
     super(message);
     this.name = 'HostingApiError';
     this.status = status;
     this.body = body;
+    // Why the call failed: `operation-failed` (the API reported an error),
+    // `timeout` (no result in time) or `api` (the request itself failed).
+    this.reason = reason;
   }
 }
 
@@ -556,6 +559,17 @@ export class FirebaseHostingApi {
   }
 }
 
+/**
+ * Waits for a custom-domain operation of Firebase Hosting.
+ *
+ * The operation of the custom-domain API cannot be read back: the API
+ * answers a `GET` on the operation name with `404 NOT_FOUND`, although the
+ * operation itself runs and completes. The domain resource is therefore the
+ * source of truth, and a missing operation resource is not an error — the
+ * caller verifies the result with `getCustomDomain`.
+ *
+ * `null` is returned when the operation could not be read.
+ */
 export async function waitForOperation(api, operation, {timeoutMs = 120000, intervalMs = 2000, sleep} = {}) {
   if (!operation?.name) {
     throw new Error('Firebase did not return a custom-domain operation name.');
@@ -565,6 +579,7 @@ export async function waitForOperation(api, operation, {timeoutMs = 120000, inte
       throw new HostingApiError(
         `Firebase custom-domain operation failed: ` +
           JSON.stringify(operation.error),
+        {reason: 'operation-failed'},
       );
     }
     return operation.response;
@@ -575,12 +590,24 @@ export async function waitForOperation(api, operation, {timeoutMs = 120000, inte
 
   while (Date.now() < deadline) {
     await wait(intervalMs);
-    const latest = await api.getOperation(operation.name);
+    let latest;
+    try {
+      latest = await api.getOperation(operation.name);
+    } catch (error) {
+      if (error instanceof HostingApiError && error.status === 404) {
+        // The operation resource is gone. The API removes it as soon as the
+        // operation is finished, and it never exposes the custom-domain
+        // operations at all. The caller checks the domain resource.
+        return null;
+      }
+      throw error;
+    }
     if (latest.done) {
       if (latest.error) {
         throw new HostingApiError(
           `Firebase custom-domain operation failed: ` +
             JSON.stringify(latest.error),
+          {reason: 'operation-failed'},
         );
       }
       return latest.response;
@@ -589,14 +616,33 @@ export async function waitForOperation(api, operation, {timeoutMs = 120000, inte
 
   throw new HostingApiError(
     `Firebase custom-domain operation did not finish within ${timeoutMs}ms: ${operation.name}`,
+    {reason: 'timeout'},
   );
 }
 
-export async function ensureCustomDomain(api, {projectId, siteId, domain, redirectTarget, sleep}) {
+/**
+ * Attaches one domain to the Hosting site.
+ *
+ * The domain is validated first, so a domain which cannot work is refused
+ * before it is attached. The operation of the API cannot be read back (see
+ * [waitForOperation]), so the result is verified with the domain resource
+ * itself. A domain which is already attached is left alone.
+ */
+export async function ensureCustomDomain(api, {
+  projectId,
+  siteId,
+  domain,
+  redirectTarget,
+  sleep,
+  operationTimeoutMs = 120000,
+}) {
   const existingDomains = await api.listCustomDomains(projectId, siteId);
+  // The API names the resource with the **number** of the project
+  // (`projects/96035616668/sites/…`) instead of its id, so the domain is
+  // found by the last part of the name.
   const existing = existingDomains.find(
     (candidate) =>
-      candidate.name === `projects/${projectId}/sites/${siteId}/customDomains/${domain}`,
+      String(candidate?.name || '').endsWith(`/customDomains/${domain}`),
   );
 
   if (existing) {
@@ -614,13 +660,47 @@ export async function ensureCustomDomain(api, {projectId, siteId, domain, redire
     redirectTarget,
     validateOnly: true,
   });
-  await waitForOperation(api, validation, {sleep});
+  try {
+    await waitForOperation(api, validation, {
+      sleep,
+      timeoutMs: operationTimeoutMs,
+    });
+  } catch (error) {
+    // A failed validation is reported by the API and must stop the cutover.
+    // A missing or unfinished operation only means that the API does not
+    // report the result; the domain resource decides.
+    if (error instanceof HostingApiError && error.reason === 'operation-failed') {
+      throw error;
+    }
+    if (!(error instanceof HostingApiError)) throw error;
+  }
 
   const operation = await api.createCustomDomain(projectId, siteId, domain, {
     redirectTarget,
     validateOnly: false,
   });
-  await waitForOperation(api, operation, {sleep});
+  try {
+    await waitForOperation(api, operation, {
+      sleep,
+      timeoutMs: operationTimeoutMs,
+    });
+  } catch (error) {
+    // The operation of the API does not always report a result. The domain
+    // resource is the source of truth, so the result is checked there.
+    if (error instanceof HostingApiError && error.reason === 'operation-failed') {
+      throw error;
+    }
+    if (!(error instanceof HostingApiError)) throw error;
+  }
+
   const attached = await api.getCustomDomain(projectId, siteId, domain);
+  if (
+    !attached ||
+    !String(attached.name || '').endsWith(`/customDomains/${domain}`)
+  ) {
+    throw new HostingApiError(
+      `Firebase did not attach ${domain} to the Hosting site.`,
+    );
+  }
   return {domain: attached, created: true};
 }
