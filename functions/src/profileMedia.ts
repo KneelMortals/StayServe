@@ -241,6 +241,41 @@ export function profilePictureDownloadToken(
 }
 
 /**
+ * The object path of a stored profile picture.
+ *
+ * The path is read out of the download URL. Both URL shapes are understood:
+ *
+ *   https://firebasestorage.googleapis.com/v0/b/{bucket}/o/{path}?token=…
+ *   https://storage.googleapis.com/{bucket}/{path}?token=…
+ *
+ * An empty string is returned when the URL does not point at the profile
+ * namespace.
+ */
+export function profilePictureObjectPathOf(url: string): string {
+  const trimmed = String(url || '').trim();
+  if (!trimmed) return '';
+
+  let path = trimmed.split('#')[0].split('?')[0];
+  const objectMarker = path.lastIndexOf('/o/');
+  if (objectMarker >= 0) {
+    path = path.slice(objectMarker + 3);
+  }
+
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return '';
+  }
+  decoded = decoded.replace(/^\/+/, '');
+
+  const marker = `${PROFILE_PICTURE_PREFIX}/`;
+  const index = decoded.indexOf(marker);
+  if (index < 0) return '';
+  return decoded.slice(index);
+}
+
+/**
  * Whether a stored URL points at a profile picture of this account.
  *
  * Only the objects of the trusted namespace are owned by the server. A URL
@@ -274,30 +309,13 @@ export function isOwnProfilePictureUrl(
     if (!trusted) return false;
   }
 
-  let path = trimmed.split('#')[0].split('?')[0];
-  const objectMarker = path.lastIndexOf('/o/');
-  if (objectMarker >= 0) {
-    path = path.slice(objectMarker + 3);
-  }
+  const objectPath = profilePictureObjectPathOf(trimmed);
+  if (!objectPath) return false;
 
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(path);
-  } catch {
-    return false;
-  }
-  decoded = decoded.replace(/^\/+/, '');
+  const expected = `${PROFILE_PICTURE_PREFIX}/${uid}/`;
+  if (!objectPath.startsWith(expected)) return false;
 
-  // The namespace may be preceded by the bucket name in the GCS-style URL.
-  const marker = `${PROFILE_PICTURE_PREFIX}/`;
-  const index = decoded.indexOf(marker);
-  if (index < 0) return false;
-
-  const rest = decoded.slice(index + marker.length);
-  const expected = `${uid}/`;
-  if (!rest.startsWith(expected)) return false;
-
-  const fileName = rest.slice(expected.length);
+  const fileName = objectPath.slice(expected.length);
   return fileName.length > 0 && !fileName.includes('/');
 }
 
@@ -416,14 +434,6 @@ export async function importGoogleProfilePicture(
     return null;
   }
 
-  const bytes = await downloadGooglePhoto(trimmed);
-  if (!bytes) return null;
-
-  const contentType = detectImageContentType(bytes);
-  if (!contentType || PROFILE_PICTURE_CONTENT_TYPES.indexOf(contentType) < 0) {
-    return null;
-  }
-
   // The upload id is derived from the address of the picture, so a repeated
   // import writes the same object and produces the same URL.
   const uploadId = `google-${crypto
@@ -432,6 +442,26 @@ export async function importGoogleProfilePicture(
     .digest('hex')
     .slice(0, 24)}`;
   const objectPath = profilePictureObjectPath(uid, uploadId);
+
+  if (
+    currentUrl &&
+    profilePictureObjectPathOf(currentUrl) === objectPath &&
+    isOwnProfilePictureUrl(currentUrl, uid)
+  ) {
+    // The very same picture was imported before. It is downloaded again on
+    // every start of the app, so the existing object is kept instead of
+    // transferring the picture once more.
+    return currentUrl;
+  }
+
+  const bytes = await downloadGooglePhoto(trimmed);
+  if (!bytes) return null;
+
+  const contentType = detectImageContentType(bytes);
+  if (!contentType || PROFILE_PICTURE_CONTENT_TYPES.indexOf(contentType) < 0) {
+    return null;
+  }
+
   const downloadToken = profilePictureDownloadToken(uid, uploadId);
   const file = storage.getStorage().bucket(PROFILE_PICTURE_BUCKET).file(objectPath);
 
@@ -488,6 +518,14 @@ export async function importGoogleProfilePicture(
       error,
     );
   }
+
+  // The picture of the Google account changed: the object of the older
+  // picture would stay in the bucket forever without this sweep. A picture
+  // which the user chose by hand is never touched — such an account is not
+  // imported at all.
+  await deleteOtherProfilePictureObjects(uid, objectPath).catch((error) => {
+    console.error('Could not remove the replaced Google picture:', error);
+  });
 
   return url;
 }

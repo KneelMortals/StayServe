@@ -410,8 +410,12 @@ async function main() {
   section('the Google profile picture');
   const GOOGLE_PHOTO = 'https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg';
   const originalFetch = globalThis.fetch;
+  // Every address which the server asks for.
+  const requested = [];
   globalThis.fetch = async (url) => {
-    if (!String(url).startsWith('https://lh3.googleusercontent.com/')) {
+    const address = String(url);
+    requested.push(address);
+    if (!address.startsWith('https://lh3.googleusercontent.com/')) {
       return { ok: false, status: 404, headers: { get: () => '0' } };
     }
     return {
@@ -455,6 +459,20 @@ async function main() {
       'the Auth record carries the picture as well',
       authPhotos.get('google-media'),
       imported,
+    );
+
+    // The picture is imported again on every start of the app. The object
+    // which is already there is kept instead of being downloaded once more.
+    const downloadsBefore = requested.length;
+    const repeated = await importGoogleProfilePicture(
+      'google-media',
+      GOOGLE_PHOTO,
+    );
+    check('the repeated import returns the same URL', repeated, imported);
+    check(
+      'the repeated import did not download the picture again',
+      requested.length,
+      downloadsBefore,
     );
 
     // A picture which the user chose by hand is never replaced.
@@ -509,7 +527,6 @@ async function main() {
       Buffer.from('ftypheic', 'ascii'),
       Buffer.alloc(16),
     ]);
-    const requested = [];
     globalThis.fetch = async (url) => {
       const address = String(url);
       requested.push(address);
@@ -544,6 +561,27 @@ async function main() {
       'the profile publishes the converted picture',
       heifProfile.get('profileImage'),
       converted,
+    );
+
+    // The picture of the Google account changed: the object of the older
+    // picture must not stay in the bucket.
+    await seedUser('changed-media');
+    const first = await importGoogleProfilePicture(
+      'changed-media',
+      'https://lh3.googleusercontent.com/a/ACg8oc/first.jpg',
+    );
+    const second = await importGoogleProfilePicture(
+      'changed-media',
+      'https://lh3.googleusercontent.com/a/ACg8oc/second.jpg',
+    );
+    check('the newer picture was imported', typeof second === 'string', true);
+    check('the picture changed', second !== first, true);
+    check(
+      'the object of the older picture was removed',
+      Array.from(objects.keys()).filter((name) =>
+        name.startsWith(`${PROFILE_PICTURE_PREFIX}/changed-media/`),
+      ).length,
+      1,
     );
   } finally {
     globalThis.fetch = originalFetch;
