@@ -118,6 +118,9 @@ const {
   finalizeRoomLocationPrivacy,
   setClientExactLocationWritesAllowed,
 } = require(path.join(ROOT, 'lib', 'privateLocations.js'));
+const {
+  updateRoomListing,
+} = require(path.join(ROOT, 'lib', 'roomEditing.js'));
 const { getRoomVisitDetails } = require(path.join(ROOT, 'lib', 'visits.js'));
 const {
   submitRoomReview,
@@ -425,6 +428,11 @@ async function reset() {
     'roomDrafts',
     'roomPrivate',
     'roomReviews',
+    'roomPhotoUploadOperations',
+    'roomPhotoCommitOperations',
+    'roomPhotoUploadQuotas',
+    'roomPhotoRoomQuotas',
+    'roomListingEditOperations',
     'reviewDeletionAudit',
     'reviewDeletionState',
     'emailLinkOperations',
@@ -11703,6 +11711,531 @@ async function testIncompleteRegistrationRollback() {
   );
 }
 
+/**
+ * The document id of one staged photo operation.
+ *
+ * The server derives it from the owner and the upload id, so the test seeds
+ * the same document the staging callable would have written.
+ */
+function photoOperationDocumentId(ownerId, uploadId) {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${ownerId}:${uploadId}`)
+    .digest('hex');
+  return `upload-${digest}`;
+}
+
+/**
+ * The canonical download URL of one staged photo.
+ *
+ * The URL is derived from the owner, the room and the upload id, exactly like
+ * the staging callable does.
+ */
+function canonicalPhotoUrl(ownerId, roomId, uploadId, bucket, token) {
+  const objectPath = `rooms/${ownerId}/${roomId}/room-photo-${uploadId}`;
+  return (
+    `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/` +
+    `${encodeURIComponent(objectPath)}?alt=media&token=${token}`
+  );
+}
+
+/** The editable fields of one owner edit. */
+function editFields(overrides = {}) {
+  return {
+    title: 'Renamed room',
+    description: 'The owner changed the description.',
+    monthlyRent: 12000,
+    securityDeposit: 6000,
+    roomType: 'single',
+    furnishing: 'unfurnished',
+    availableFromMillis: Date.UTC(2027, 0, 1),
+    amenities: ['Wi-Fi'],
+    occupancy: 3,
+    genderPreference: 'any',
+    homeId: 'home-1',
+    homeName: 'Green House',
+    ...overrides,
+  };
+}
+
+/** The exact location of one owner edit. */
+function editLocation(overrides = {}) {
+  return {
+    address: '99 New Street',
+    city: 'Bengaluru',
+    state: 'Karnataka',
+    pincode: '560002',
+    latitude: 12.9716,
+    longitude: 77.5946,
+    ...overrides,
+  };
+}
+
+/**
+ * The owner edit commits the metadata, the location and the photo list in one
+ * transaction, so a failure between them cannot leave a half-edited listing.
+ */
+async function testAtomicOwnerListingEdit() {
+  section('the owner edit commits the metadata, the location and the photos together');
+
+  const previousStage = process.env.ROOM_LOCATION_STAGE;
+  process.env.ROOM_LOCATION_STAGE = 'dual';
+
+  try {
+    await reset();
+    await seedUser('owner-1', 'owner');
+    await seedUser('owner-2', 'owner');
+    await seedUser('student-1', 'student');
+    await seedRoom('RM-EDIT', 'owner-1', {
+      title: 'Original room',
+      monthlyRent: 5000,
+      occupancy: 2,
+      currentOccupancy: 2,
+      images: [],
+      listingGeneration: 'generation-edit',
+    });
+
+    const result = await invoke(
+      updateRoomListing,
+      {
+        roomId: 'RM-EDIT',
+        commitId: 'edit-commit-1',
+        update: editFields(),
+        location: editLocation(),
+        uploadIds: [],
+        removeUrls: [],
+      },
+      'owner-1',
+    );
+    check('the edit succeeded', result.success, true);
+    check('the edit was not a replay', result.alreadyCommitted, false);
+    check(
+      'the edit addressed the published collection',
+      result.listingCollection,
+      'rooms',
+    );
+
+    const edited = await db.collection('rooms').doc('RM-EDIT').get();
+    check('the title was committed', edited.get('title'), 'Renamed room');
+    check('the rent was committed', edited.get('monthlyRent'), 12000);
+    check('the capacity was committed', edited.get('occupancy'), 3);
+    check('the home was committed', edited.get('homeId'), 'home-1');
+    check(
+      'the tenant counter stayed server-owned',
+      edited.get('currentOccupancy'),
+      2,
+    );
+    check('the publication status stayed server-owned', edited.get('status'), 'available');
+
+    const privateLocation = await db.collection('roomPrivate').doc('RM-EDIT').get();
+    check(
+      'the exact address was committed to the private collection',
+      privateLocation.get('address'),
+      '99 New Street',
+    );
+    check(
+      'the private document names the live owner',
+      privateLocation.get('ownerId'),
+      'owner-1',
+    );
+    check(
+      'the public copy and the private copy share one location revision',
+      edited.get('locationRevision'),
+      privateLocation.get('locationRevision'),
+    );
+
+    // ------------------------------------------------------------------
+    // A rejected edit changes nothing at all.
+    // ------------------------------------------------------------------
+    const before = await db.collection('rooms').doc('RM-EDIT').get();
+    const beforePrivate = await db.collection('roomPrivate').doc('RM-EDIT').get();
+
+    await expectDenied(
+      'a capacity below the live occupancy is refused',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-capacity',
+            update: editFields({ occupancy: 1, title: 'Too small' }),
+            location: editLocation({ address: 'Rejected Road' }),
+            uploadIds: [],
+            removeUrls: [],
+          },
+          'owner-1',
+        ),
+      'failed-precondition',
+    );
+
+    const afterCapacity = await db.collection('rooms').doc('RM-EDIT').get();
+    const afterCapacityPrivate = await db
+      .collection('roomPrivate')
+      .doc('RM-EDIT')
+      .get();
+    check(
+      'the refused edit left the metadata untouched',
+      afterCapacity.get('title'),
+      before.get('title'),
+    );
+    check(
+      'the refused edit left the capacity untouched',
+      afterCapacity.get('occupancy'),
+      before.get('occupancy'),
+    );
+    check(
+      'the refused edit left the address untouched',
+      afterCapacityPrivate.get('address'),
+      beforePrivate.get('address'),
+    );
+
+    // A staged photo which the server does not know must not leave the
+    // metadata or the address behind either.
+    await expectDenied(
+      'an unknown staged photo is refused',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-photo',
+            update: editFields({ title: 'Half edited' }),
+            location: editLocation({ address: 'Half edited Road' }),
+            uploadIds: ['upload-unknown'],
+            removeUrls: [],
+          },
+          'owner-1',
+        ),
+      'failed-precondition',
+    );
+
+    const afterPhoto = await db.collection('rooms').doc('RM-EDIT').get();
+    const afterPhotoPrivate = await db.collection('roomPrivate').doc('RM-EDIT').get();
+    check(
+      'the refused photo change left the metadata untouched',
+      afterPhoto.get('title'),
+      before.get('title'),
+    );
+    check(
+      'the refused photo change left the address untouched',
+      afterPhotoPrivate.get('address'),
+      beforePrivate.get('address'),
+    );
+    check(
+      'the refused photo change left the photo list untouched',
+      afterPhoto.get('images'),
+      before.get('images'),
+    );
+
+    // An invalid location is refused before anything is written.
+    await expectDenied(
+      'an incomplete exact location is refused',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-location',
+            update: editFields({ title: 'Half edited again' }),
+            location: editLocation({ pincode: '' }),
+            uploadIds: [],
+            removeUrls: [],
+          },
+          'owner-1',
+        ),
+      'invalid-argument',
+    );
+    const afterLocation = await db.collection('rooms').doc('RM-EDIT').get();
+    check(
+      'the refused location left the metadata untouched',
+      afterLocation.get('title'),
+      before.get('title'),
+    );
+
+    // ------------------------------------------------------------------
+    // The commit id makes the edit idempotent.
+    // ------------------------------------------------------------------
+    const replay = await invoke(
+      updateRoomListing,
+      {
+        roomId: 'RM-EDIT',
+        commitId: 'edit-commit-1',
+        update: editFields(),
+        location: editLocation(),
+        uploadIds: [],
+        removeUrls: [],
+      },
+      'owner-1',
+    );
+    check('the replay is idempotent', replay.alreadyCommitted, true);
+    check(
+      'the replay returned the recorded image list',
+      replay.images,
+      result.images,
+    );
+    const afterReplay = await db.collection('rooms').doc('RM-EDIT').get();
+    check(
+      'the replay did not change the listing again',
+      afterReplay.get('title'),
+      edited.get('title'),
+    );
+
+    await expectDenied(
+      'a commit id cannot be reused for a different edit',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-1',
+            update: editFields({ title: 'A different edit' }),
+            location: editLocation(),
+            uploadIds: [],
+            removeUrls: [],
+          },
+          'owner-1',
+        ),
+      'failed-precondition',
+    );
+
+    // ------------------------------------------------------------------
+    // Only the live owner may edit the listing.
+    // ------------------------------------------------------------------
+    await expectDenied(
+      'a different owner cannot edit the listing',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-foreign',
+            update: editFields({ title: 'Hijacked' }),
+            location: editLocation({ address: 'Hijacked Road' }),
+            uploadIds: [],
+            removeUrls: [],
+          },
+          'owner-2',
+        ),
+      'permission-denied',
+    );
+    await expectDenied(
+      'a student cannot edit the listing',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-student',
+            update: editFields({ title: 'Student edit' }),
+            location: editLocation(),
+            uploadIds: [],
+            removeUrls: [],
+          },
+          'student-1',
+        ),
+      'permission-denied',
+    );
+
+    await seedUser('owner-1', 'student');
+    await expectDenied(
+      'a demoted owner cannot edit the listing',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-demoted',
+            update: editFields({ title: 'Demoted edit' }),
+            location: editLocation(),
+            uploadIds: [],
+            removeUrls: [],
+          },
+          'owner-1',
+        ),
+      'permission-denied',
+    );
+    await seedUser('owner-1', 'owner');
+
+    const afterForeign = await db.collection('rooms').doc('RM-EDIT').get();
+    check(
+      'the refused edits left the listing untouched',
+      afterForeign.get('title'),
+      edited.get('title'),
+    );
+
+    // ------------------------------------------------------------------
+    // A staged photo is committed together with the metadata.
+    // ------------------------------------------------------------------
+    const uploadId = 'upload-edit-1';
+    const photoUrl = canonicalPhotoUrl(
+      'owner-1',
+      'RM-EDIT',
+      uploadId,
+      process.env.ROOM_PHOTO_BUCKET,
+      'edit-token',
+    );
+    await db
+      .collection('roomPhotoUploadOperations')
+      .doc(photoOperationDocumentId('owner-1', uploadId))
+      .set({
+        ownerId: 'owner-1',
+        roomId: 'RM-EDIT',
+        uploadId,
+        listingGeneration: 'generation-edit',
+        objectPath: `rooms/owner-1/RM-EDIT/room-photo-${uploadId}`,
+        url: photoUrl,
+        downloadToken: 'edit-token',
+        status: 'uploaded',
+        byteLength: 2048,
+        cleanupAfter: new Date(Date.now() + 3600000),
+      });
+
+    const withPhoto = await invoke(
+      updateRoomListing,
+      {
+        roomId: 'RM-EDIT',
+        commitId: 'edit-commit-photo-ok',
+        update: editFields({ title: 'Room with a photo' }),
+        location: editLocation(),
+        uploadIds: [uploadId],
+        removeUrls: [],
+      },
+      'owner-1',
+    );
+    check(
+      'the staged photo was committed with the edit',
+      withPhoto.images,
+      [photoUrl],
+    );
+    const afterPhotoOk = await db.collection('rooms').doc('RM-EDIT').get();
+    check(
+      'the live listing carries the committed photo',
+      afterPhotoOk.get('images'),
+      [photoUrl],
+    );
+    check(
+      'the committed metadata is live as well',
+      afterPhotoOk.get('title'),
+      'Room with a photo',
+    );
+    check(
+      'the staged photo was marked as referenced',
+      (
+        await db
+          .collection('roomPhotoUploadOperations')
+          .doc(photoOperationDocumentId('owner-1', uploadId))
+          .get()
+      ).get('status'),
+      'referenced',
+    );
+
+    // A photo which belongs to another listing is refused.
+    const foreignUploadId = 'upload-edit-foreign';
+    await db
+      .collection('roomPhotoUploadOperations')
+      .doc(photoOperationDocumentId('owner-1', foreignUploadId))
+      .set({
+        ownerId: 'owner-1',
+        roomId: 'RM-EDIT-OTHER',
+        uploadId: foreignUploadId,
+        listingGeneration: 'generation-edit',
+        objectPath: `rooms/owner-1/RM-EDIT-OTHER/room-photo-${foreignUploadId}`,
+        url: canonicalPhotoUrl(
+          'owner-1',
+          'RM-EDIT-OTHER',
+          foreignUploadId,
+          process.env.ROOM_PHOTO_BUCKET,
+          'foreign-token',
+        ),
+        downloadToken: 'foreign-token',
+        status: 'uploaded',
+        byteLength: 2048,
+        cleanupAfter: new Date(Date.now() + 3600000),
+      });
+    await expectDenied(
+      'a staged photo of another listing is refused',
+      () =>
+        invoke(
+          updateRoomListing,
+          {
+            roomId: 'RM-EDIT',
+            commitId: 'edit-commit-foreign-photo',
+            update: editFields({ title: 'Foreign photo' }),
+            location: editLocation(),
+            uploadIds: [foreignUploadId],
+            removeUrls: [],
+          },
+          'owner-1',
+        ),
+      'permission-denied',
+    );
+    const afterForeignPhoto = await db.collection('rooms').doc('RM-EDIT').get();
+    check(
+      'the refused foreign photo left the metadata untouched',
+      afterForeignPhoto.get('title'),
+      'Room with a photo',
+    );
+    check(
+      'the refused foreign photo left the photo list untouched',
+      afterForeignPhoto.get('images'),
+      [photoUrl],
+    );
+
+    // ------------------------------------------------------------------
+    // An unfinished draft is edited the same way.
+    // ------------------------------------------------------------------
+    await db.collection('roomDrafts').doc('RM-EDIT-DRAFT').set({
+      roomId: 'RM-EDIT-DRAFT',
+      ownerId: 'owner-1',
+      title: 'Draft room',
+      monthlyRent: 5000,
+      occupancy: 2,
+      currentOccupancy: 0,
+      status: 'draft',
+      listingGeneration: 'generation-edit-draft',
+      images: [],
+    });
+    const draftEdit = await invoke(
+      updateRoomListing,
+      {
+        roomId: 'RM-EDIT-DRAFT',
+        commitId: 'edit-commit-draft',
+        update: editFields({ title: 'Edited draft' }),
+        location: editLocation(),
+        uploadIds: [],
+        removeUrls: [],
+      },
+      'owner-1',
+    );
+    check(
+      'the edit addressed the draft collection',
+      draftEdit.listingCollection,
+      'roomDrafts',
+    );
+    const editedDraft = await db.collection('roomDrafts').doc('RM-EDIT-DRAFT').get();
+    check('the draft title was committed', editedDraft.get('title'), 'Edited draft');
+    check('the draft stayed a draft', editedDraft.get('status'), 'draft');
+    check(
+      'the draft never reached the public collection',
+      (await db.collection('rooms').doc('RM-EDIT-DRAFT').get()).exists,
+      false,
+    );
+    check(
+      'the draft has its own private location',
+      (
+        await db.collection('roomPrivate').doc('RM-EDIT-DRAFT').get()
+      ).get('address'),
+      '99 New Street',
+    );
+  } finally {
+    if (previousStage === undefined) {
+      delete process.env.ROOM_LOCATION_STAGE;
+    } else {
+      process.env.ROOM_LOCATION_STAGE = previousStage;
+    }
+  }
+}
+
 async function main() {
   await testPhoneAndGoogleRegistrationIdentities();
   await testUserProfileBootstrapRepairsMalformedFcmDocument();
@@ -11713,6 +12246,7 @@ async function main() {
   await testLegacyAdminUnreadCounterSurvivesTheConversion();
   await testSupportReplyNotificationDeliveryIsRetryable();
   await testDraftListingsArePublishedByTheServer();
+  await testAtomicOwnerListingEdit();
   await testAdminMessagingAndReviewDeletion();
   await testLegacyAdminSupportPrivacyMigration();
   await testReviewAndAdminMessagingEnforceLiveVerifiedPhone();

@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:stayserve/core/constants/enums.dart';
 import 'package:stayserve/core/constants/room_location_privacy.dart';
+import 'package:stayserve/firebase/owner/owner_repository.dart';
 import 'package:stayserve/models/owned_room_model.dart';
 import 'package:stayserve/models/room_model.dart';
 import 'package:stayserve/models/room_private_location.dart';
@@ -90,12 +91,45 @@ void main() {
 
     test('never sends location fields in an owner listing update', () {
       final room = RoomModel.fromJson(_legacyRoomJson(), documentId: 'room-1');
-      final payload = room.toOwnerUpdateJson();
+      final draft = RoomDraft(
+        room: room,
+        privateLocation: const RoomPrivateLocation(
+          roomId: 'room-1',
+          ownerId: 'owner-1',
+          address: '42 Exact Street',
+          city: 'Bengaluru',
+          state: 'Karnataka',
+          pincode: '560001',
+          latitude: 12.9716,
+          longitude: 77.5946,
+        ),
+      );
+      final payload = buildRoomListingEditPayload(
+        roomId: 'room-1',
+        commitId: 'commit-1',
+        draft: draft,
+        uploadIds: const <String>[],
+        removeUrls: const <String>[],
+      );
 
-      expect(payload.containsKey('location'), isFalse);
+      // The owner edit carries no listing document at all: the server writes
+      // the metadata, the location and the photo list in one transaction.
       expect(payload.containsKey('latitude'), isFalse);
       expect(payload.containsKey('longitude'), isFalse);
       expect(payload.containsKey('geoCell'), isFalse);
+      expect(payload.containsKey('images'), isFalse);
+
+      // The exact address travels in the location section only, and the
+      // listing fields themselves never carry it.
+      final update = payload['update'] as Map<String, dynamic>;
+      expect(update.containsKey('location'), isFalse);
+      expect(update.containsKey('latitude'), isFalse);
+      expect(update.containsKey('longitude'), isFalse);
+      expect(update.containsKey('geoCell'), isFalse);
+
+      final location = payload['location'] as Map<String, dynamic>;
+      expect(location['address'], '42 Exact Street');
+      expect(location['latitude'], 12.9716);
     });
   });
 

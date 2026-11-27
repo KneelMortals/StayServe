@@ -317,13 +317,7 @@ service cloud.firestore {
       return images is list && images.size() == 0;
     }
 
-    function roomImagesAreUnchanged() {
-      return request.resource.data.get('images', null) ==
-        resource.data.get('images', null);
-    }
-
-    // Whether an unpublished (draft) listing may be read by the caller.
-    //
+    // Whether an unpublished (draft) listing may be read by the caller.    //
     // A draft belongs to its owner.  A live administrator may inspect it
     // (for example to remove an abandoned listing).  Every other account is
     // refused.
@@ -405,23 +399,6 @@ service cloud.firestore {
         (hasExactFields && clientExactLocationWritesAllowed());
     }
 
-    function publicLocationUpdateIsAllowed() {
-      let changedKeys = request.resource.data
-        .diff(resource.data)
-        .affectedKeys();
-
-      // Existing legacy documents may still contain exact fields while the
-      // data migration runs. Only a write which changes one of those fields
-      // needs the transitional server-owned switch.
-      return !changedKeys.hasAny([
-        'location',
-        'address',
-        'pincode',
-        'latitude',
-        'longitude'
-      ]) || clientExactLocationWritesAllowed();
-    }
-
     function roomCreateCannotForgeServerLocationFields() {
       return !request.resource.data.keys().hasAny([
         'geoCell',
@@ -470,69 +447,17 @@ service cloud.firestore {
         current <= capacity;
     }
 
-    function changesOnlyAllowedRoomFields() {
-      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-        'title',
-        'description',
-        'monthlyRent',
-        'securityDeposit',
-        'location',
-        'roomType',
-        'furnishing',
-        'availableFrom',
-        'amenities',
-        'occupancy',
-        'genderPreference',
-        'images',
-        'updatedAt',
-        'latitude',
-        'longitude',
-        'homeId',
-        'homeName',
-      ]);
-    }
-
-    function roomPhotoCleanupIsLocked() {
-      let lock = resource.data.get('photoCleanupLock', null);
-      return lock is map &&
-        lock.get('expiresAt', request.time) > request.time;
-    }
-
-    function ownerMayUpdateRoom() {
-      // `isOwner` already checks the live owner role and the owner id, so
-      // repeating `isLiveOwner()` here would only expand the rules
-      // expression beyond Firestore's evaluation limit.
-      return isOwner(resource.data.get('ownerId', '')) &&
-        !roomPhotoCleanupIsLocked() &&
-        resource.data.get('deletionInProgress', false) != true &&
-        changesOnlyAllowedRoomFields() &&
-        publicLocationUpdateIsAllowed() &&
-        roomImagesAreUnchanged() &&
-        request.resource.data.get('ownerId', '') ==
-          resource.data.get('ownerId', '') &&
-        request.resource.data.get('createdAt', null) ==
-          resource.data.get('createdAt', null) &&
-        request.resource.data.get('listingGeneration', null) ==
-          resource.data.get('listingGeneration', null) &&
-        request.resource.data.get('currentOccupancy', 0) ==
-          resource.data.get('currentOccupancy', 0) &&
-        request.resource.data.get('status', null) ==
-          resource.data.get('status', null) &&
-        roomMonthlyRentIsValid(request.resource.data) &&
-        roomCapacityIsValid(request.resource.data) &&
-        request.resource.data.get('roomId', '') ==
-          resource.data.get('roomId', '');
-    }
-
-    // The same edit policy for an unpublished draft.
+    // ----------------------------------------------------------------------
+    // Owner listing edits are server-owned.
+    // ----------------------------------------------------------------------
     //
-    // A draft may never change into a published listing through a client
-    // write: the publication is a server operation which copies the draft
-    // into the public collection.
-    function ownerMayUpdateRoomDraft() {
-      return ownerMayUpdateRoom() &&
-        resource.data.get('status', '') == 'draft';
-    }
+    // An owner edit changes the metadata, the exact location and the photo
+    // list together. The `updateRoomListing` callable writes all three in
+    // one transaction, so a listing is never left half-edited. A client
+    // write could only change one of the three, so it is refused outright.
+    //
+    // The helpers which used to describe the client edit policy are gone:
+    // there is no client edit policy any more.
 
     // ======================================================================
     // Users collection
@@ -600,9 +525,12 @@ service cloud.firestore {
       // unfinished listing out of every collection query.
       allow create: if false;
 
-      // Only the owner may edit the legitimate listing fields.  There is no
-      // client path for status, currentOccupancy or any admin room update.
-      allow update: if ownerMayUpdateRoom();
+      // A published listing is **server-owned**. The owner edit changes the
+      // metadata, the exact location and the photo list together, so the
+      // `updateRoomListing` callable writes all three in one transaction. A
+      // client write could only change one of them and would therefore leave
+      // the listing half-edited, so it is refused outright.
+      allow update: if false;
 
       // Listing deletion is exclusively a server operation.  The
       // deleteRoomListing callable verifies live owner/admin authority,
@@ -669,9 +597,12 @@ service cloud.firestore {
         request.resource.data.get('currentOccupancy', 0) == 0 &&
         request.resource.data.get('roomId', roomId) == roomId;
 
-      // The owner may correct the editable fields of their own draft. The
-      // status stays `draft` and the server-owned fields stay untouched.
-      allow update: if ownerMayUpdateRoomDraft();
+      // A draft is **server-owned** once it exists. The owner edit changes
+      // the metadata, the exact location and the photo list together, so the
+      // `updateRoomListing` callable writes all three in one transaction. A
+      // client write could only change one of them and would therefore leave
+      // the draft half-edited, so it is refused outright.
+      allow update: if false;
 
       // A draft is removed by the server, which also cleans up its photos.
       allow delete: if false;

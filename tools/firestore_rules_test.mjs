@@ -1813,7 +1813,7 @@ async function main() {
     false,
   );
   check(
-    'owner can edit legitimate room fields',
+    'the owner cannot edit the listing fields directly (the server commits the whole edit)',
     await update(TOKENS.owner, 'rooms', 'room1', {
       title: string('Renamed room'),
       description: string('Updated description'),
@@ -1824,7 +1824,15 @@ async function main() {
       homeName: string('Updated home'),
       updatedAt: timestamp(),
     }),
-    true,
+    false,
+  );
+  check(
+    'the owner cannot edit a draft listing directly (the server commits the whole edit)',
+    await update(TOKENS.owner, 'roomDrafts', 'owner-draft-room', {
+      title: string('Renamed draft'),
+      updatedAt: timestamp(),
+    }),
+    false,
   );
   check(
     'owner cannot replace the public room location directly',
@@ -1963,18 +1971,18 @@ async function main() {
     false,
   );
   check(
-    'owner cannot reduce the capacity below the current occupancy',
+    'the owner cannot reduce the capacity below the current occupancy',
     await update(TOKENS.owner, 'rooms', 'room-occupied', {
       occupancy: integer(1),
     }),
     false,
   );
   check(
-    'owner can raise the capacity above the current occupancy',
+    'the owner cannot raise the capacity directly (the server validates the live occupancy)',
     await update(TOKENS.owner, 'rooms', 'room-occupied', {
       occupancy: integer(3),
     }),
-    true,
+    false,
   );
 
   await call('owner', 'PATCH', '/users/owner1?updateMask.fieldPaths=role', {

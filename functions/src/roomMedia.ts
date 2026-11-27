@@ -70,7 +70,7 @@ type RoomPhotoUploadStatus =
   | 'quarantined'
   | 'discarded';
 
-interface RoomPhotoQuotaState {
+export interface RoomPhotoQuotaState {
   pendingCount: number;
   pendingBytes: number;
   windowStartedAtMillis: number;
@@ -116,13 +116,13 @@ function timestampMillis(value: unknown, fallback = 0): number {
   return fallback;
 }
 
-function nonNegativeInteger(value: unknown): number {
+export function nonNegativeInteger(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return 0;
   return Math.floor(parsed);
 }
 
-function stringList(value: unknown): string[] {
+export function stringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const result: string[] = [];
   for (const item of value) {
@@ -133,7 +133,7 @@ function stringList(value: unknown): string[] {
   return result;
 }
 
-function uniqueStringList(value: unknown, maximum: number): string[] {
+export function uniqueStringList(value: unknown, maximum: number): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value) || value.length > maximum) {
     throw new functions.https.HttpsError(
@@ -161,7 +161,7 @@ function uniqueStringList(value: unknown, maximum: number): string[] {
   return result;
 }
 
-function operationDocumentId(ownerId: string, uploadId: string): string {
+export function operationDocumentId(ownerId: string, uploadId: string): string {
   const digest = crypto
     .createHash('sha256')
     .update(`${ownerId}:${uploadId}`)
@@ -169,7 +169,7 @@ function operationDocumentId(ownerId: string, uploadId: string): string {
   return `upload-${digest}`;
 }
 
-function commitDocumentId(ownerId: string, commitId: string): string {
+export function commitDocumentId(ownerId: string, commitId: string): string {
   const digest = crypto
     .createHash('sha256')
     .update(`${ownerId}:${commitId}`)
@@ -177,11 +177,35 @@ function commitDocumentId(ownerId: string, commitId: string): string {
   return `commit-${digest}`;
 }
 
-function quotaDocumentId(ownerId: string): string {
+/**
+ * The fingerprint of one room-photo change request.
+ *
+ * The fingerprint proves that a commit id was reused for the **same**
+ * request. A different request under the same id is refused, so a lost
+ * acknowledgement can never silently apply another edit.
+ */
+export function roomPhotoCommitRequestHash(options: {
+  roomId: string;
+  uploadIds: string[];
+  removeUrls: string[];
+}): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        roomId: options.roomId,
+        uploadIds: [...options.uploadIds].sort(),
+        removeUrls: [...options.removeUrls].sort(),
+      }),
+    )
+    .digest('hex');
+}
+
+export function quotaDocumentId(ownerId: string): string {
   return ownerId;
 }
 
-function quotaState(snapshot: firestore.DocumentSnapshot): RoomPhotoQuotaState {
+export function quotaState(snapshot: firestore.DocumentSnapshot): RoomPhotoQuotaState {
   const now = Date.now();
   const windowStartedAtMillis = timestampMillis(
     snapshot.get('windowStartedAt'),
@@ -197,7 +221,7 @@ function quotaState(snapshot: firestore.DocumentSnapshot): RoomPhotoQuotaState {
 }
 
 /** The download token carried by one canonical room-photo URL. */
-function roomPhotoDownloadToken(value: unknown): string {
+export function roomPhotoDownloadToken(value: unknown): string {
   if (typeof value !== 'string' || !value.trim()) return '';
   try {
     return new URL(value.trim()).searchParams.get('token')?.trim() || '';
@@ -212,7 +236,7 @@ function roomPhotoDownloadToken(value: unknown): string {
  * `cleanupAfter` is the single deadline used by stage, commit and cleanup.
  * A retry cannot move it forward, so an expired upload is never revived.
  */
-function roomPhotoUploadExpired(
+export function roomPhotoUploadExpired(
   operation: Record<string, any>,
   now = Date.now(),
 ): boolean {
@@ -223,7 +247,7 @@ function roomObjectPath(ownerId: string, roomId: string, uploadId: string): stri
   return `rooms/${ownerId}/${roomId}/room-photo-${uploadId}`;
 }
 
-function validIdentifier(value: string, maximum: number): boolean {
+export function validIdentifier(value: string, maximum: number): boolean {
   return new RegExp(`^[A-Za-z0-9_-]{1,${maximum}}$`).test(value);
 }
 
@@ -235,7 +259,7 @@ function validIdentifier(value: string, maximum: number): boolean {
  * in the same transaction as the upload reservation, so the staged upload can
  * never be committed to a later listing which happens to reuse the room id.
  */
-function roomListingGeneration(room: Record<string, any>): string {
+export function roomListingGeneration(room: Record<string, any>): string {
   const existing = String(room.listingGeneration || '').trim();
   return existing || crypto.randomUUID();
 }
@@ -353,7 +377,7 @@ function expectedRoomPhotoObjectPath(
  * prevents a corrupt operation record from making cleanup delete an object
  * outside the room-photo namespace.
  */
-function assertRoomPhotoOperationIdentity(
+export function assertRoomPhotoOperationIdentity(
   operation: Record<string, any>,
   ownerId: string,
   roomId: string,
@@ -386,7 +410,7 @@ function roomPhotoCleanupRetryDelay(attempts: number): number {
   );
 }
 
-function assertRoomBelongsToOwner(
+export function assertRoomBelongsToOwner(
   snapshot: firestore.DocumentSnapshot | null | undefined,
   ownerId: string,
   roomId: string,
@@ -545,7 +569,7 @@ export function isCanonicalRoomImageUrl(
   }
 }
 
-function releasePendingQuota(
+export function releasePendingQuota(
   transaction: firestore.Transaction,
   quotaRef: firestore.DocumentReference,
   quota: RoomPhotoQuotaState,
@@ -588,7 +612,7 @@ function isTerminalRoomPhotoStatus(status: string): boolean {
  * the live room must therefore all name the same listing before one pending
  * counter is decremented.
  */
-function releasePendingRoomQuota(
+export function releasePendingRoomQuota(
   transaction: firestore.Transaction,
   quotaRef: firestore.DocumentReference,
   quotaSnapshot: firestore.DocumentSnapshot,
@@ -1512,16 +1536,11 @@ export const commitRoomPhotoChanges = callableHttps.onCall(
       );
     }
 
-    const requestHash = crypto
-      .createHash('sha256')
-      .update(
-        JSON.stringify({
-          roomId,
-          uploadIds: [...uploadIds].sort(),
-          removeUrls: [...removeUrls].sort(),
-        }),
-      )
-      .digest('hex');
+    const requestHash = roomPhotoCommitRequestHash({
+      roomId,
+      uploadIds,
+      removeUrls,
+    });
 
     const roomDocuments = roomListingDocuments(roomId);
     const ownerRef = db.collection('users').doc(ownerId);

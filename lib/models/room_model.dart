@@ -253,33 +253,6 @@ class RoomModel {
     return payload;
   }
 
-  /// The owner-editable fields of an existing listing.
-  ///
-  /// This is used with an update (not a full `set`) so a stale edit can
-  /// never overwrite a server-owned value that changed in the meantime —
-  /// for example the occupancy counter after a booking was verified.
-  ///
-  /// Location fields are also server-owned: the owner calls
-  /// `setRoomPrivateLocation` before this update is committed.
-  Map<String, dynamic> toOwnerUpdateJson() {
-    return {
-      'title': title,
-      'description': description,
-      'monthlyRent': monthlyRent,
-      'securityDeposit': securityDeposit,
-      'roomType': roomType.name,
-      'furnishing': furnishing.name,
-      'availableFrom': Timestamp.fromDate(availableFrom),
-      'amenities': amenities,
-      'occupancy': occupancy,
-      'genderPreference': genderPreference.name,
-      'images': images,
-      'updatedAt': Timestamp.fromDate(updatedAt),
-      'homeId': homeId,
-      'homeName': homeName,
-    };
-  }
-
   String get primaryImage => images.isNotEmpty ? images.first : '';
   bool get hasImages => images.isNotEmpty;
   bool get isAvailable =>

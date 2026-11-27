@@ -76,6 +76,18 @@ enum _PublicationState {
   unknown,
 }
 
+/// The listing which holds one room id, together with its live occupancy.
+///
+/// The occupancy is the server-owned tenant counter. It is read before an
+/// edit so that a capacity below the number of people who already live in
+/// the room is rejected before anything is changed.
+class _OwnerListing {
+  final DocumentReference<Map<String, dynamic>> ref;
+  final int currentOccupancy;
+
+  const _OwnerListing({required this.ref, required this.currentOccupancy});
+}
+
 /// Reads a room-photo list without trusting its Firestore shape.
 List<String> _safeImageUrls(dynamic value) {
   if (value is! List) return const <String>[];
@@ -537,80 +549,46 @@ class OwnerRepository {
   }
 
   /// Updates one of the current owner's rooms.
+  ///
+  /// The whole edit is committed by the server in **one** transaction: the
+  /// metadata, the exact location and the photo list change together. A
+  /// failure between them is therefore impossible — the listing either has
+  /// all three new values or none of them.
+  ///
+  /// The client never writes the listing itself. Every field of a listing is
+  /// server-owned, so the Firestore rules refuse a direct owner update.
   Future<void> updateRoom(RoomDraft draft) async {
     final uid = _uid;
     if (uid == null) throw Exception('User not logged in');
 
+    final roomId = draft.room.roomId;
+
     // The listing is either a published listing or an unfinished draft. The
     // edit has to address the document which really holds it.
-    final roomRef = await _resolveOwnerListingRef(draft.room.roomId, uid);
+    final listing = await _readOwnerListing(roomId, uid);
 
     // The live listing is validated **before** anything is committed.
     //
     // A rejected edit — for example a capacity below the number of people
     // who already live in the room — must not leave a new location or new
-    // photos behind. The server-side location write and the photo commit are
-    // separate, durable operations, so a failure between them cannot be
-    // rolled back completely; the cheap validation therefore runs first.
-    final currentOccupancy = await _readLiveOccupancy(roomRef, uid);
-    _assertOwnerEditIsValid(draft, currentOccupancy);
+    // photos behind. The server validates the same limits again inside its
+    // transaction, but this cheap check turns a rejection into a message the
+    // owner understands without uploading a single byte.
+    _assertOwnerEditIsValid(draft, listing.currentOccupancy);
 
-    final upload = await _stageImages(draft.room.roomId, draft);
-    final document = draft.room.copyWith(updatedAt: DateTime.now());
+    final upload = await _stageImages(roomId, draft);
 
+    // The commit id identifies this edit. It is reused for the retry, so a
+    // lost acknowledgement is idempotent on the server: the edit can never
+    // be applied twice and a photo can never be appended twice.
+    final commitId = _uuid.v4();
     try {
-      // The owner-editable fields are committed in one transaction, and the
-      // capacity is validated **inside** that same transaction.
-      //
-      // The tenant counter is server-owned: it is raised by the booking
-      // activation and lowered by the rollback. The capacity therefore may
-      // never be smaller than the number of people who already live there.
-      // The booking activation reads the same document in its own
-      // transaction and refuses to overbook a listing, so the two
-      // transactions serialise: either this edit lowers the capacity first
-      // and the activation sees the new capacity, or the activation raises
-      // the counter first and this transaction sees the new counter.
-      //
-      // This transaction is therefore the **first** write of the edit. A
-      // rejected edit never reaches the location write or the photo commit,
-      // so it cannot leave a new address or new photos behind.
-      //
-      // The image list is deliberately omitted: it is server-owned, so this
-      // write cannot restore a stale photo or forge a download URL.
-      await _firestore.runTransaction((transaction) async {
-        final snapshot = await transaction.get(roomRef);
-        if (!snapshot.exists) throw Exception('Room not found');
-
-        final data = snapshot.data();
-        if (data?['ownerId'] != uid) {
-          throw Exception('You can only edit your own listings');
-        }
-
-        final liveOccupancy = (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
-        _assertOwnerEditIsValid(draft, liveOccupancy);
-
-        final payload = document.toOwnerUpdateJson()..remove('images');
-        transaction.update(roomRef, payload);
-      });
-
-      // The exact location is written next. The server stores it privately
-      // and updates the public compatibility fields in the same transaction,
-      // so the address can never split across two different values.
-      await _writePrivateLocation(
-        draft.room.roomId,
-        _draftPrivateLocation(draft, roomId: draft.room.roomId, ownerId: uid),
-      );
-
-      // Photo additions and removals are committed by the server. It reads
-      // the live listing, so a photo added by another device while this form
-      // was open is preserved. Only URLs which this form explicitly removed
-      // are taken out of the list.
-      await _commitRoomPhotoChanges(draft.room.roomId, draft, upload);
+      await _commitRoomListingEdit(roomId, draft, upload, commitId);
     } catch (error) {
       // The acknowledgement may have been lost after the server committed the
-      // photo change. The server-side discard operation checks the live
-      // listing before it removes anything.
-      await _discardUploadsBestEffort(draft.room.roomId, upload.uploadIds);
+      // edit. The server-side discard operation checks the live listing
+      // before it removes anything.
+      await _discardUploadsBestEffort(roomId, upload.uploadIds);
       rethrow;
     }
 
@@ -621,24 +599,63 @@ class OwnerRepository {
     // a newer edit still references.
   }
 
-  /// The document which holds the listing of one room id.
+  /// Commits the whole owner edit in one server transaction.
+  ///
+  /// The server writes the metadata, the exact location and the photo list
+  /// together, so a failure between them cannot leave a half-edited listing.
+  ///
+  /// The same commit id is used for the retry. A lost acknowledgement is
+  /// therefore idempotent on the server and can never append a duplicate
+  /// photo or apply the metadata twice.
+  Future<void> _commitRoomListingEdit(
+    String roomId,
+    RoomDraft draft,
+    _RoomImageUpload upload,
+    String commitId,
+  ) async {
+    final parameters = buildRoomListingEditPayload(
+      roomId: roomId,
+      commitId: commitId,
+      draft: draft,
+      uploadIds: upload.uploadIds,
+      removeUrls: _plannedRemovalUrls(draft),
+    );
+
+    Object? lastError;
+    for (var attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await _functions.callFunction(
+          'updateRoomListing',
+          parameters: parameters,
+        );
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError ?? Exception('Could not save the listing changes.');
+  }
+
+  /// The listing of one room id and its live occupancy.
   ///
   /// The published listing wins over the draft: the publication moves the
   /// draft into the public collection, so both only exist at the same time
   /// when a stale draft survived an interrupted publication.
-  Future<DocumentReference<Map<String, dynamic>>> _resolveOwnerListingRef(
-    String roomId,
-    String ownerId,
-  ) async {
+  Future<_OwnerListing> _readOwnerListing(String roomId, String ownerId) async {
     final published = await _firestore
         .collection(publishedRoomsCollection)
         .doc(roomId)
         .get();
     if (published.exists) {
-      if (published.data()?['ownerId'] != ownerId) {
+      final data = published.data();
+      if (data?['ownerId'] != ownerId) {
         throw Exception('You can only edit your own listings');
       }
-      return _firestore.collection(publishedRoomsCollection).doc(roomId);
+      return _OwnerListing(
+        ref: _firestore.collection(publishedRoomsCollection).doc(roomId),
+        currentOccupancy: (data?['currentOccupancy'] as num?)?.toInt() ?? 0,
+      );
     }
 
     final draft = await _firestore
@@ -646,28 +663,14 @@ class OwnerRepository {
         .doc(roomId)
         .get();
     if (!draft.exists) throw Exception('Room not found');
-    if (draft.data()?['ownerId'] != ownerId) {
-      throw Exception('You can only edit your own listings');
-    }
-    return _firestore.collection(roomDraftsCollection).doc(roomId);
-  }
-
-  /// The number of people who live in the listing right now.
-  ///
-  /// The read is the pre-flight check of an owner edit. It fails closed: a
-  /// listing which cannot be read is not edited, because its current
-  /// occupancy is unknown.
-  Future<int> _readLiveOccupancy(
-    DocumentReference<Map<String, dynamic>> roomRef,
-    String ownerId,
-  ) async {
-    final snapshot = await roomRef.get();
-    if (!snapshot.exists) throw Exception('Room not found');
-    final data = snapshot.data();
+    final data = draft.data();
     if (data?['ownerId'] != ownerId) {
       throw Exception('You can only edit your own listings');
     }
-    return (data?['currentOccupancy'] as num?)?.toInt() ?? 0;
+    return _OwnerListing(
+      ref: _firestore.collection(roomDraftsCollection).doc(roomId),
+      currentOccupancy: (data?['currentOccupancy'] as num?)?.toInt() ?? 0,
+    );
   }
 
   /// The owner-editable limits of one listing.
@@ -1220,6 +1223,54 @@ List<OwnerHome> groupRoomsByHome(Iterable<OwnedRoomModel> rooms) {
 
   homes.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
   return homes;
+}
+
+/// The payload of one atomic owner edit.
+///
+/// The exact address travels in the `location` section **only**. The server
+/// stores it in the private collection and copies only the coarse locality
+/// into the public listing, so the address never travels as a listing field.
+///
+/// The payload carries no listing document: the server writes the metadata,
+/// the location and the photo list in one transaction. A client therefore
+/// cannot write a listing field directly at all.
+Map<String, dynamic> buildRoomListingEditPayload({
+  required String roomId,
+  required String commitId,
+  required RoomDraft draft,
+  required List<String> uploadIds,
+  required List<String> removeUrls,
+}) {
+  return {
+    'roomId': roomId,
+    'commitId': commitId,
+    'update': {
+      'title': draft.room.title,
+      'description': draft.room.description,
+      'monthlyRent': draft.room.monthlyRent,
+      'securityDeposit': draft.room.securityDeposit,
+      'roomType': draft.room.roomType.name,
+      'furnishing': draft.room.furnishing.name,
+      'availableFromMillis': draft.room.availableFrom
+          .toUtc()
+          .millisecondsSinceEpoch,
+      'amenities': draft.room.amenities,
+      'occupancy': draft.room.occupancy,
+      'genderPreference': draft.room.genderPreference.name,
+      'homeId': draft.room.homeId ?? '',
+      'homeName': draft.room.homeName ?? '',
+    },
+    'location': {
+      'address': draft.privateLocation.address,
+      'city': draft.privateLocation.city,
+      'state': draft.privateLocation.state,
+      'pincode': draft.privateLocation.pincode,
+      'latitude': draft.privateLocation.latitude,
+      'longitude': draft.privateLocation.longitude,
+    },
+    'uploadIds': uploadIds,
+    'removeUrls': removeUrls,
+  };
 }
 
 /// The listing as it comes out of the form.

@@ -431,6 +431,13 @@ export {
   discardRoomPhotoUpload,
 } from './roomMedia';
 
+// An owner edit is committed by the server in one transaction.
+//
+// The metadata, the exact location and the photo list change together, so a
+// failure between them is impossible: the listing either has all three new
+// values or none of them.
+export { updateRoomListing } from './roomEditing';
+
 // Durable Auth custom-claim publication retries.
 export { processRoleClaimPublicationJobs } from './roleClaims';
 

@@ -826,7 +826,7 @@ void main() {
     );
 
     test(
-      'a tenant who moves in during the edit refuses the whole edit',
+      'the whole edit is committed by one server call and the client never writes the listing',
       () async {
         final firestore = _FakeFirestore();
         final functions = _RecordingFunctionsService();
@@ -835,43 +835,83 @@ void main() {
           'ownerId': 'owner-1',
           'currentOccupancy': 0,
           'status': 'available',
-        };
-
-        // The pre-flight read sees an empty room. A tenant moves in right
-        // afterwards, so the transactional validation sees a full room.
-        var reads = 0;
-        firestore.afterGet = (id) {
-          reads += 1;
-          if (reads != 1) return;
-          firestore.rooms[id] = <String, dynamic>{
-            ...firestore.rooms[id]!,
-            'currentOccupancy': 2,
-          };
+          'images': <String>[],
         };
 
         final draft = _draft();
-        final occupiedRoom = draft.room.copyWith(
+        final editedRoom = draft.room.copyWith(
           roomId: 'room-1',
           ownerId: 'owner-1',
-          occupancy: 1,
+          title: 'Renamed room',
+          occupancy: 3,
         );
 
-        await expectLater(
-          _repository(firestore: firestore, functions: functions).updateRoom(
-            RoomDraft(
-              room: occupiedRoom,
-              privateLocation: draft.privateLocation,
-            ),
+        await _repository(
+          firestore: firestore,
+          functions: functions,
+        ).updateRoom(
+          RoomDraft(
+            room: editedRoom,
+            privateLocation: draft.privateLocation,
+            originalImageUrls: const <String>[],
           ),
-          throwsA(isA<Exception>()),
         );
 
-        // The capacity was validated before the location and the photos
-        // were written, so the rejected edit changed nothing at all.
-        expect(functions.calls, isNot(contains('setRoomPrivateLocation')));
-        expect(functions.calls, isNot(contains('commitRoomPhotoChanges')));
+        // The metadata, the exact location and the photo list are committed
+        // by the server in one transaction, so the client makes exactly one
+        // call and writes no listing document itself.
+        expect(functions.calls, <String>['updateRoomListing']);
         expect(firestore.writes, isEmpty);
+
+        final parameters = functions.parameters['updateRoomListing']!;
+        expect(parameters['roomId'], 'room-1');
+        final update = parameters['update'] as Map<String, dynamic>;
+        expect(update['title'], 'Renamed room');
+        expect(update['occupancy'], 3);
+        final location = parameters['location'] as Map<String, dynamic>;
+        expect(location['address'], '42 Test Street');
+        expect(parameters['uploadIds'], isEmpty);
+        expect(parameters['removeUrls'], isEmpty);
       },
     );
+
+    test('a lost acknowledgement is retried with the same commit id', () async {
+      final firestore = _FakeFirestore();
+      final functions = _RecordingFunctionsService();
+      firestore.rooms['room-1'] = <String, dynamic>{
+        'roomId': 'room-1',
+        'ownerId': 'owner-1',
+        'currentOccupancy': 0,
+        'status': 'available',
+        'images': <String>[],
+      };
+      functions.failing.add('updateRoomListing');
+
+      final draft = _draft();
+      final editedRoom = draft.room.copyWith(
+        roomId: 'room-1',
+        ownerId: 'owner-1',
+        title: 'Renamed room',
+      );
+
+      await expectLater(
+        _repository(firestore: firestore, functions: functions).updateRoom(
+          RoomDraft(room: editedRoom, privateLocation: draft.privateLocation),
+        ),
+        throwsA(isA<Exception>()),
+      );
+
+      // The server makes the edit idempotent through the commit id, so the
+      // retry carries the very same one and can never apply the edit twice.
+      expect(functions.calls, <String>[
+        'updateRoomListing',
+        'updateRoomListing',
+      ]);
+      final first = functions.callHistory[0]['updateRoomListing']!;
+      final second = functions.callHistory[1]['updateRoomListing']!;
+      expect(second['commitId'], first['commitId']);
+      expect(first['commitId'], isNotEmpty);
+      expect(firestore.writes, isEmpty);
+    });
   });
 }

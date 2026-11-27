@@ -40,7 +40,7 @@ export interface RoomLocationPrivacyConfig {
   finalizedAtMillis: number | null;
 }
 
-const locationPrivacyConfigRef = db
+export const locationPrivacyConfigRef = db
   .collection('system')
   .doc('locationPrivacy');
 
@@ -112,7 +112,7 @@ export async function readRoomLocationPrivacyConfig(): Promise<RoomLocationPriva
  * exact values private even if an old Functions deployment is still running
  * with `ROOM_LOCATION_STAGE=dual`.
  */
-function effectiveRoomLocationStage(
+export function effectiveRoomLocationStage(
   config: RoomLocationPrivacyConfig,
 ): ReturnType<typeof configuredRoomLocationStage> {
   return config.finalized ? 'private' : configuredRoomLocationStage();
@@ -142,7 +142,7 @@ function timestampMillis(value: unknown): number | null {
  * The owner id is never taken from the client. The server reads it from the
  * live room document and stores it in the private document itself.
  */
-function readOwnerLocationInput(
+export function readOwnerLocationInput(
   data: Record<string, any>,
 ): ExactRoomLocation {
   const location = normalizeExactRoomLocation(data);
@@ -213,7 +213,7 @@ export async function readPrivateRoomLocation(
  * In `private` mode only city/state and the rounded geocell survive in the
  * public document.
  */
-function publicLocationPatch(
+export function publicLocationPatch(
   location: ExactRoomLocation,
   stage: ReturnType<typeof configuredRoomLocationStage>,
   locationRevision: string,
