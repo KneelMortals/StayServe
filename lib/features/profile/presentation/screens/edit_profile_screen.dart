@@ -1,6 +1,7 @@
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../../../core/index.dart';
 import '../../../../models/user_model.dart';
@@ -23,15 +24,15 @@ class EditProfileScreen extends ConsumerStatefulWidget {
 class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
-  final _imageController = TextEditingController();
+  final _imagePicker = ImagePicker();
 
   bool _isSaving = false;
+  bool _isUploadingPicture = false;
   bool _prefilled = false;
 
   @override
   void dispose() {
     _nameController.dispose();
-    _imageController.dispose();
     super.dispose();
   }
 
@@ -41,7 +42,6 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
     if (_prefilled) return;
     _prefilled = true;
     _nameController.text = profile.name;
-    _imageController.text = profile.profileImage ?? '';
   }
 
   Future<void> _save() async {
@@ -49,16 +49,9 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
 
     setState(() => _isSaving = true);
     try {
-      final image = _imageController.text.trim();
       await ref
           .read(authControllerProvider.notifier)
-          .updateProfile(
-            name: _nameController.text.trim(),
-            profileImage: image.isEmpty ? null : image,
-            // An empty field removes the picture — the old code silently
-            // kept the old one.
-            removeProfileImage: image.isEmpty,
-          );
+          .updateProfile(name: _nameController.text.trim());
 
       if (!mounted) return;
       context.showSuccessSnackBar('Profile updated');
@@ -68,6 +61,66 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
       context.showErrorSnackBar(readableAuthError(error));
     } finally {
       if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  /// Lets the user pick a profile picture from the gallery of the phone.
+  ///
+  /// The bytes are uploaded by the server, which writes the picture into the
+  /// trusted bucket and publishes its URL on the profile. The client cannot
+  /// write the storage namespace directly.
+  Future<void> _pickProfilePicture() async {
+    if (_isUploadingPicture) return;
+
+    XFile? picked;
+    try {
+      picked = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: AppConstants.imageCompressionQuality,
+        maxWidth: 1024,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      context.showErrorSnackBar('Could not open the gallery: $error');
+      return;
+    }
+    if (picked == null || !mounted) return;
+
+    setState(() => _isUploadingPicture = true);
+    try {
+      final bytes = await picked.readAsBytes();
+      if (!mounted) return;
+      if (bytes.isEmpty) {
+        context.showErrorSnackBar('The selected photo is empty.');
+        return;
+      }
+      await ref
+          .read(authControllerProvider.notifier)
+          .uploadProfilePicture(bytes);
+      if (!mounted) return;
+      context.showSuccessSnackBar('Profile picture updated');
+    } catch (error) {
+      if (!mounted) return;
+      context.showErrorSnackBar(readableAuthError(error));
+    } finally {
+      if (mounted) setState(() => _isUploadingPicture = false);
+    }
+  }
+
+  /// Removes the profile picture of the signed-in account.
+  Future<void> _removeProfilePicture() async {
+    if (_isUploadingPicture) return;
+
+    setState(() => _isUploadingPicture = true);
+    try {
+      await ref.read(authControllerProvider.notifier).removeProfilePicture();
+      if (!mounted) return;
+      context.showSuccessSnackBar('Profile picture removed');
+    } catch (error) {
+      if (!mounted) return;
+      context.showErrorSnackBar(readableAuthError(error));
+    } finally {
+      if (mounted) setState(() => _isUploadingPicture = false);
     }
   }
 
@@ -165,9 +218,7 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                             name: _nameController.text.trim().isEmpty
                                 ? profile.name
                                 : _nameController.text.trim(),
-                            imageUrl: _imageController.text.trim().isEmpty
-                                ? profile.profileImage
-                                : _imageController.text.trim(),
+                            imageUrl: profile.profileImage,
                             radius: 50,
                           ),
                           const SizedBox(height: AppSpacing.sm),
@@ -180,6 +231,48 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                         ],
                       ),
                     ),
+                    const SizedBox(height: AppSpacing.md),
+                    // The picture is picked from the gallery of the phone and
+                    // uploaded by the server. The stored object is deleted
+                    // with the account and with the picture itself.
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: profileBusy || _isUploadingPicture
+                                ? null
+                                : _pickProfilePicture,
+                            icon: _isUploadingPicture
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.photo_library_outlined),
+                            label: Text(
+                              profile.profileImage == null ||
+                                      profile.profileImage!.isEmpty
+                                  ? 'Choose from gallery'
+                                  : 'Change picture',
+                            ),
+                          ),
+                        ),
+                        if (profile.profileImage != null &&
+                            profile.profileImage!.isNotEmpty) ...[
+                          const SizedBox(width: AppSpacing.sm),
+                          IconButton(
+                            tooltip: 'Remove picture',
+                            onPressed: profileBusy || _isUploadingPicture
+                                ? null
+                                : _removeProfilePicture,
+                            icon: const Icon(Icons.delete_outline),
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ],
+                      ],
+                    ),
                     const SizedBox(height: AppSpacing.lg),
                     AppTextField(
                       label: 'Full name',
@@ -190,15 +283,6 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                       prefixIcon: const Icon(Icons.person_outline),
                       enabled: !profileBusy,
                       onChanged: (_) => setState(() {}),
-                    ),
-                    const SizedBox(height: AppSpacing.md),
-                    AppTextField(
-                      label: 'Profile image URL (optional)',
-                      hint: 'https://…',
-                      controller: _imageController,
-                      keyboardType: TextInputType.url,
-                      prefixIcon: const Icon(Icons.image_outlined),
-                      enabled: !profileBusy,
                     ),
                     const SizedBox(height: AppSpacing.lg),
                     Text(

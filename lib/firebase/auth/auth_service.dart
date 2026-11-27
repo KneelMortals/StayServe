@@ -1,11 +1,40 @@
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 
 import '../../core/utils/app_logger.dart';
 import '../../models/user_model.dart';
 import '../functions/functions_service.dart';
+
+/// Whether an authentication error means that the account no longer exists.
+///
+/// Firebase reports a deleted or disabled account as `user-disabled`, as
+/// `user-not-found` or as `user-token-expired` — the last one because the
+/// server revoked the refresh tokens. The server reports the same fact when
+/// the live Auth record is gone while the identity token on the device is
+/// still valid.
+///
+/// Such an account must **not** keep a session: the identity token which is
+/// already on the device stays valid for up to an hour, so the app would
+/// otherwise keep showing the profile of somebody whose account is gone.
+bool authErrorMeansAccountIsGone(Object error) {
+  if (error is FirebaseAuthException) {
+    return error.code == 'user-token-expired' ||
+        error.code == 'user-disabled' ||
+        error.code == 'user-not-found';
+  }
+  if (error is FirebaseFunctionsException) {
+    final message = error.message ?? '';
+    return message.contains('no longer exists');
+  }
+  return false;
+}
 
 /// Makes sure that Firebase keeps the signed-in user across app restarts.
 ///
@@ -100,6 +129,29 @@ class AuthRepository {
     } catch (e) {
       // A failed refresh must never break the session.
       AppLogger.warning('Could not refresh the ID token', error: e);
+    }
+  }
+
+  /// Refreshes the ID token and reports whether the account still exists.
+  ///
+  /// `false` means that Firebase refused to issue a new token because the
+  /// account was deleted or disabled — the server revokes the refresh tokens
+  /// of a banned and of a deleted account. The session has to end in that
+  /// case: the identity token which is already on the device stays valid for
+  /// up to an hour.
+  ///
+  /// A **network** failure is not an answer: it is reported as an error so
+  /// that the caller keeps the session and can retry later.
+  Future<bool> refreshIdTokenAndCheckAccount() async {
+    final user = _auth.currentUser;
+    if (user == null) return false;
+    try {
+      await user.getIdToken(true);
+      return true;
+    } catch (e) {
+      AppLogger.warning('Could not refresh the ID token', error: e);
+      if (authErrorMeansAccountIsGone(e)) return false;
+      rethrow;
     }
   }
 
@@ -403,6 +455,64 @@ class AuthRepository {
       'fcmToken': token,
       'updatedAt': FieldValue.serverTimestamp(),
     });
+  }
+
+  /// Uploads a profile picture which the user picked on the device.
+  ///
+  /// The bytes are sent to the server, which writes the object with the
+  /// Admin SDK and publishes the canonical download URL on the profile. A
+  /// client cannot write the storage namespace directly, so the picture is
+  /// always stored in the trusted bucket.
+  ///
+  /// The returned URL is also written to the Firestore profile by the
+  /// server; the profile snapshot therefore updates the avatar on its own.
+  Future<String> uploadProfilePicture(Uint8List bytes) async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      throw StateError(
+        'You have to be signed in before changing your profile picture.',
+      );
+    }
+    if (bytes.isEmpty) {
+      throw StateError('The selected photo is empty.');
+    }
+
+    final uploadId = _profilePictureUploadId();
+    final data = await _functions.callFunctionData(
+      'uploadProfilePicture',
+      parameters: {'uploadId': uploadId, 'data': base64Encode(bytes)},
+    );
+    final url = data['url'];
+    if (url is! String || url.trim().isEmpty) {
+      throw StateError('The profile picture could not be saved.');
+    }
+    return url.trim();
+  }
+
+  /// Removes the profile picture of the signed-in account.
+  ///
+  /// The stored object is deleted by the server as well, so a removed
+  /// picture does not stay in the bucket as an orphan.
+  Future<void> removeProfilePicture() async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      throw StateError(
+        'You have to be signed in before changing your profile picture.',
+      );
+    }
+    await _functions.callFunctionData('removeProfilePicture');
+  }
+
+  /// An opaque id for one profile-picture upload.
+  ///
+  /// The id is part of the storage path, so it has to be unique for every
+  /// picture and safe to use as a file name. A retry of the same upload
+  /// therefore overwrites the same object instead of leaving an orphan
+  /// behind.
+  String _profilePictureUploadId() {
+    final random = Random().nextInt(1 << 32).toRadixString(16);
+    return 'p${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}'
+        '$random';
   }
 
   /// Deletes the account of the signed-in user.

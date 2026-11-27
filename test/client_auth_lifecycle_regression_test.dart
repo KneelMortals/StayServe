@@ -113,11 +113,17 @@ class _SessionAuthRepository implements AuthRepository {
 
   @override
   Future<void> refreshIdToken() async {
+    await refreshIdTokenAndCheckAccount();
+  }
+
+  @override
+  Future<bool> refreshIdTokenAndCheckAccount() async {
     refreshCalls++;
     if (!refreshStarted.isCompleted) refreshStarted.complete();
     if (refreshCalls == 1 && firstRefreshGate != null) {
       await firstRefreshGate!.future;
     }
+    return true;
   }
 
   @override

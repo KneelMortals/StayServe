@@ -1,0 +1,391 @@
+// Integration regressions for the server-mediated profile-picture protocol.
+//
+//   node functions/test/profile_media_test.mjs <firestore-port> <project>
+//
+// The suite uses the Firestore emulator and a deterministic Storage mock.
+// It exercises the real callable handlers: the live-account check, the
+// image validation, the Admin-SDK write, the canonical URL, the sweep of
+// the replaced picture and the removal of the picture.
+
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, '..');
+const require = createRequire(import.meta.url);
+
+const PORT = process.argv[2] || '8181';
+const PROJECT = process.argv[3] || 'demo-stayserve-profile-media';
+
+process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${PORT}`;
+process.env.GCLOUD_PROJECT = PROJECT;
+process.env.GCLOUD_PROJECT_ID = PROJECT;
+process.env.FIREBASE_CONFIG = JSON.stringify({ projectId: PROJECT });
+process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9099';
+process.env.ROOM_PHOTO_BUCKET =
+  process.env.ROOM_PHOTO_BUCKET || 'demo.appspot.com';
+process.env.PROFILE_PICTURE_BUCKET =
+  process.env.PROFILE_PICTURE_BUCKET || 'demo.appspot.com';
+
+const firestore = require('firebase-admin/firestore');
+const authSdk = require('firebase-admin/auth');
+const storageSdk = require('firebase-admin/storage');
+
+const objects = new Map();
+let bucketName = '';
+
+storageSdk.getStorage = () => ({
+  bucket: (requestedBucket) => {
+    bucketName = String(requestedBucket || '');
+    return {
+      name: bucketName,
+      file: (objectPath) => ({
+        name: objectPath,
+        bucket: { name: bucketName },
+        save: async (bytes, options = {}) => {
+          objects.set(objectPath, {
+            bytes: Buffer.from(bytes),
+            metadata: options.metadata || {},
+          });
+        },
+        delete: async () => {
+          objects.delete(objectPath);
+        },
+      }),
+      getFiles: async ({ prefix } = {}) => {
+        const files = [];
+        for (const name of Array.from(objects.keys())) {
+          if (prefix && !name.startsWith(prefix)) continue;
+          files.push({
+            name,
+            delete: async () => {
+              objects.delete(name);
+            },
+          });
+        }
+        return [files];
+      },
+    };
+  },
+});
+storageSdk.getDownloadURL = async (file) => {
+  const stored = objects.get(file.name);
+  const token =
+    stored?.metadata?.metadata?.firebaseStorageDownloadTokens || 'test-token';
+  return (
+    `https://firebasestorage.googleapis.com/v0/b/${file.bucket.name}/o/` +
+    `${encodeURIComponent(file.name)}?alt=media&token=${token}`
+  );
+};
+
+const {
+  MAX_PROFILE_PICTURE_BYTES,
+  PROFILE_PICTURE_PREFIX,
+  decodeProfilePictureBytes,
+  isOwnProfilePictureUrl,
+  profilePictureDownloadToken,
+  profilePictureObjectPath,
+  uploadProfilePicture,
+  removeProfilePicture,
+  validProfilePictureUploadId,
+} = require(path.join(ROOT, 'lib', 'profileMedia.js'));
+
+const db = firestore.getFirestore();
+const auth = authSdk.getAuth();
+
+const liveUsers = new Set(['profile-media', 'disabled-media', 'unverified-media']);
+const verifiedPhoneUsers = new Set(['profile-media', 'disabled-media']);
+
+auth.getUser = async (uid) => {
+  if (!liveUsers.has(uid)) {
+    const error = new Error('user not found');
+    error.code = 'auth/user-not-found';
+    throw error;
+  }
+  const customClaims = verifiedPhoneUsers.has(uid)
+    ? { stayServeVerifiedPhone: '+919876500001' }
+    : {};
+  return {
+    uid,
+    email: `${uid}@example.test`,
+    emailVerified: false,
+    phoneNumber: '+919876500001',
+    customClaims,
+    providerData: [
+      { providerId: 'password', uid },
+      { providerId: 'phone', uid, phoneNumber: '+919876500001' },
+    ],
+  };
+};
+
+let pass = 0;
+let fail = 0;
+const failures = [];
+
+function check(label, actual, expected) {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  if (ok) {
+    pass += 1;
+    console.log(`  PASS  ${label}`);
+  } else {
+    fail += 1;
+    failures.push(label);
+    console.log(
+      `  FAIL  ${label}  expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
+function section(title) {
+  console.log(`\n=== ${title} ===`);
+}
+
+async function invoke(callable, data, uid = 'profile-media') {
+  return callable.run(data, {
+    auth: uid
+      ? {
+          uid,
+          token: {
+            email: `${uid}@example.test`,
+            email_verified: true,
+            phone_number: '+919876500001',
+            stayServeVerifiedPhone: '+919876500001',
+          },
+        }
+      : undefined,
+    rawRequest: {},
+    instanceIdToken: null,
+  });
+}
+
+async function expectFailure(label, operation, expectedCode) {
+  try {
+    await operation();
+    check(label, 'accepted', expectedCode);
+  } catch (error) {
+    check(label, String(error?.code || error?.message || error), expectedCode);
+  }
+}
+
+/// A minimal JPEG header — the server detects the type from the bytes.
+const JPEG_BYTES = Buffer.from([
+  0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+  0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+]);
+
+async function reset() {
+  const users = await db.collection('users').get();
+  for (const doc of users.docs) {
+    await doc.ref.delete();
+  }
+  objects.clear();
+}
+
+async function seedUser(uid, overrides = {}) {
+  await db.collection('users').doc(uid).set({
+    uid,
+    name: uid,
+    email: `${uid}@example.test`,
+    role: 'student',
+    roleClaimed: true,
+    registrationCompleted: true,
+    isActive: true,
+    phone: '+919876500001',
+    phoneVerified: true,
+    emailVerified: true,
+    authProviders: ['password', 'phone'],
+    createdAt: firestore.Timestamp.now(),
+    updatedAt: firestore.Timestamp.now(),
+    ...overrides,
+  });
+}
+
+async function main() {
+  await reset();
+  await seedUser('profile-media');
+
+  section('the upload id and the object path');
+  check(
+    'a plain upload id is accepted',
+    validProfilePictureUploadId('p123abc'),
+    true,
+  );
+  check(
+    'an upload id with a slash is refused',
+    validProfilePictureUploadId('a/b'),
+    false,
+  );
+  check(
+    'an upload id with a dot-dot segment is refused',
+    validProfilePictureUploadId('..'),
+    false,
+  );
+  check(
+    'an empty upload id is refused',
+    validProfilePictureUploadId(''),
+    false,
+  );
+  check(
+    'the object path stays inside the account namespace',
+    profilePictureObjectPath('uid-1', 'p1'),
+    `${PROFILE_PICTURE_PREFIX}/uid-1/p1`,
+  );
+  check(
+    'the download token is stable for the same upload',
+    profilePictureDownloadToken('uid-1', 'p1'),
+    profilePictureDownloadToken('uid-1', 'p1'),
+  );
+  check(
+    'the download token differs for another account',
+    profilePictureDownloadToken('uid-1', 'p1') ===
+      profilePictureDownloadToken('uid-2', 'p1'),
+    false,
+  );
+
+  section('the uploaded bytes');
+  check(
+    'a small image is decoded',
+    decodeProfilePictureBytes(JPEG_BYTES.toString('base64')).length,
+    JPEG_BYTES.length,
+  );
+  await expectFailure(
+    'empty data is refused',
+    async () => decodeProfilePictureBytes(''),
+    'invalid-argument',
+  );
+  await expectFailure(
+    'data which is not base64 is refused',
+    async () => decodeProfilePictureBytes('not base64!!'),
+    'invalid-argument',
+  );
+  await expectFailure(
+    'an oversized upload is refused',
+    async () =>
+      decodeProfilePictureBytes(
+        Buffer.alloc(MAX_PROFILE_PICTURE_BYTES + 1).toString('base64'),
+      ),
+    'invalid-argument',
+  );
+
+  section('the upload itself');
+  const upload = await invoke(uploadProfilePicture, {
+    uploadId: 'p-first',
+    data: JPEG_BYTES.toString('base64'),
+  });
+  check('the upload succeeded', upload.success, true);
+  check(
+    'the object was written into the account namespace',
+    Array.from(objects.keys()),
+    [`${PROFILE_PICTURE_PREFIX}/profile-media/p-first`],
+  );
+  check(
+    'the published URL points at the stored object',
+    isOwnProfilePictureUrl(upload.url, 'profile-media'),
+    true,
+  );
+  check(
+    'the URL of another account is not owned by this account',
+    isOwnProfilePictureUrl(upload.url, 'another-account'),
+    false,
+  );
+  const profile = await db.collection('users').doc('profile-media').get();
+  check(
+    'the profile publishes the stored picture',
+    profile.get('profileImage'),
+    upload.url,
+  );
+
+  section('a repeated upload');
+  const repeated = await invoke(uploadProfilePicture, {
+    uploadId: 'p-first',
+    data: JPEG_BYTES.toString('base64'),
+  });
+  check('the repeated upload returns the same URL', repeated.url, upload.url);
+  check(
+    'the repeated upload did not leave a second object behind',
+    objects.size,
+    1,
+  );
+
+  section('the replaced picture');
+  const second = await invoke(uploadProfilePicture, {
+    uploadId: 'p-second',
+    data: JPEG_BYTES.toString('base64'),
+  });
+  check('the second upload succeeded', second.success, true);
+  check(
+    'the replaced object was removed',
+    Array.from(objects.keys()),
+    [`${PROFILE_PICTURE_PREFIX}/profile-media/p-second`],
+  );
+
+  section('the refused uploads');
+  await expectFailure(
+    'a signed-out caller may not upload',
+    async () => invoke(uploadProfilePicture, {
+      uploadId: 'p-anonymous',
+      data: JPEG_BYTES.toString('base64'),
+    }, null),
+    'unauthenticated',
+  );
+  await expectFailure(
+    'an invalid upload id is refused',
+    async () =>
+      invoke(uploadProfilePicture, {
+        uploadId: '../escape',
+        data: JPEG_BYTES.toString('base64'),
+      }),
+    'invalid-argument',
+  );
+  await expectFailure(
+    'a file which is not an image is refused',
+    async () =>
+      invoke(uploadProfilePicture, {
+        uploadId: 'p-text',
+        data: Buffer.from('this is not an image').toString('base64'),
+      }),
+    'invalid-argument',
+  );
+  await expectFailure(
+    'a disabled account may not upload',
+    async () => {
+      await seedUser('disabled-media', { isActive: false });
+      return invoke(uploadProfilePicture, {
+        uploadId: 'p-disabled',
+        data: JPEG_BYTES.toString('base64'),
+      }, 'disabled-media');
+    },
+    'permission-denied',
+  );
+  await expectFailure(
+    'an account without a verified phone may not upload',
+    async () => {
+      await seedUser('unverified-media', { phoneVerified: false });
+      return invoke(uploadProfilePicture, {
+        uploadId: 'p-unverified',
+        data: JPEG_BYTES.toString('base64'),
+      }, 'unverified-media');
+    },
+    'permission-denied',
+  );
+
+  section('the removal');
+  const removal = await invoke(removeProfilePicture, {});
+  check('the removal succeeded', removal.success, true);
+  check('the stored object was deleted', objects.size, 0);
+  const cleared = await db.collection('users').doc('profile-media').get();
+  check('the profile no longer has a picture', cleared.get('profileImage'), '');
+
+  console.log(`\n${pass} passed, ${fail} failed`);
+  if (fail > 0) {
+    console.log('failed checks:');
+    for (const failure of failures) console.log(`  - ${failure}`);
+    process.exit(1);
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

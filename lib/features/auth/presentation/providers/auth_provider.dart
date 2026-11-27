@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -125,8 +126,17 @@ final authSessionUserChangedProvider = Provider<AuthSessionUserChanged>((ref) {
     // account was created, so the token of a returning user can be stale.
     // Refreshing it here makes sure the `admin` claim is picked up as soon
     // as an admin granted the role.
+    //
+    // A refresh which fails because the account was deleted or disabled
+    // ends the session: the identity token on the device stays valid for up
+    // to an hour, so the app would otherwise keep the account of somebody
+    // whose account is gone.
     try {
-      await authRepo.refreshIdToken();
+      final accountStillExists = await authRepo.refreshIdTokenAndCheckAccount();
+      if (!accountStillExists) {
+        await ref.read(authSessionRemovedProvider).call(user.uid);
+        return;
+      }
     } catch (error) {
       AppLogger.warning(
         'Could not refresh the token of ${user.uid}',
@@ -146,6 +156,13 @@ final authSessionUserChangedProvider = Provider<AuthSessionUserChanged>((ref) {
         'Could not synchronize the auth profile of ${user.uid}',
         error: error,
       );
+      // The server reads the **live** Auth record. It therefore knows when
+      // the account was deleted while the identity token on the device is
+      // still valid.
+      if (authErrorMeansAccountIsGone(error)) {
+        await ref.read(authSessionRemovedProvider).call(user.uid);
+        return;
+      }
     }
 
     if (!isCurrent()) return;
@@ -155,6 +172,38 @@ final authSessionUserChangedProvider = Provider<AuthSessionUserChanged>((ref) {
     // closed. Without it the user only heard about a booking after they
     // opened the app.
     await ref.read(pushNotificationRegistrarProvider).register(user.uid);
+  };
+});
+
+/// Ends the session of an account which the server removed.
+///
+/// The server disables an account when it is banned and when its deletion
+/// starts, and it removes the Firebase Auth account when the deletion
+/// completed. The identity token on the device stays valid for up to an
+/// hour, so the app has to end the session itself — otherwise a deleted
+/// account keeps using the app (and keeps its cached profile) long after
+/// the backend removed it.
+///
+/// The handler is a provider of its own so that the session stream and the
+/// sign-in tasks can both end a session without depending on each other.
+typedef AuthSessionRemovedHandler = Future<void> Function(String uid);
+
+final authSessionRemovedProvider = Provider<AuthSessionRemovedHandler>((ref) {
+  return (uid) async {
+    final authRepo = ref.read(authRepositoryProvider);
+    if (authRepo.currentUser?.uid != uid) return;
+
+    AppLogger.info('Ending the session of the removed account $uid');
+    try {
+      await authRepo.signOut();
+    } catch (error) {
+      AppLogger.warning(
+        'Could not sign the removed account $uid out',
+        error: error,
+      );
+    }
+    ref.read(authProfileTransitionProvider.notifier).state = null;
+    ref.read(navigationHistoryProvider).clear();
   };
 });
 
@@ -183,6 +232,14 @@ final authSessionProvider = StreamProvider<AuthSession?>((ref) {
   StreamSubscription<UserModel?>? profileSubscription;
   String? activeUid;
 
+  /// The account whose profile document was seen at least once.
+  ///
+  /// It tells a **deleted** account apart from a **brand-new** one: the
+  /// profile of a new account is created by the Auth trigger a moment after
+  /// the sign-in, while a profile which disappears again means that the
+  /// server removed the account.
+  String? knownProfileUid;
+
   /// Monotonically increasing generation of the Auth session.
   ///
   /// Every asynchronous auth task is tied to the generation which started
@@ -207,6 +264,17 @@ final authSessionProvider = StreamProvider<AuthSession?>((ref) {
     controller.add(AuthSession(user: user, profile: profile));
   }
 
+  /// Ends the session of an account which the server removed.
+  ///
+  /// The server disables an account when it is banned and when its deletion
+  /// starts. The identity token on the device stays valid for up to an hour,
+  /// so the app has to end the session itself — otherwise the deleted
+  /// account keeps using the app (and keeps its cached profile) long after
+  /// the backend removed it.
+  Future<void> endRemovedSession(String uid) async {
+    await ref.read(authSessionRemovedProvider).call(uid);
+  }
+
   Future<void> cleanupReplacedAccount(String uid) async {
     try {
       await ref.read(pushNotificationRegistrarProvider).unregister(uid);
@@ -224,6 +292,7 @@ final authSessionProvider = StreamProvider<AuthSession?>((ref) {
 
     cancelProfileSubscription();
     activeUid = user?.uid;
+    knownProfileUid = null;
     tracker.switchTo(user?.uid);
 
     if (user == null) {
@@ -272,7 +341,24 @@ final authSessionProvider = StreamProvider<AuthSession?>((ref) {
 
     profileSubscription = profileStreamFactory(user.uid).listen(
       (profile) {
+        if (profile != null) knownProfileUid = user.uid;
         emitSession(user, profile);
+
+        // The server disables an account when it is banned and when its
+        // deletion starts. The session has to end here — the identity token
+        // on the device stays valid for up to an hour.
+        if (profile != null && !profile.isActive) {
+          unawaited(endRemovedSession(user.uid));
+          return;
+        }
+
+        // The profile document disappeared although it existed before: the
+        // account was deleted on the server. A profile which was **never**
+        // there is normal for a brand-new account, whose profile is created
+        // by the Auth trigger.
+        if (profile == null && knownProfileUid == user.uid) {
+          unawaited(endRemovedSession(user.uid));
+        }
       },
       onError: (Object error, StackTrace stack) {
         // A profile read error must not kill the auth stream. Keep the
@@ -346,6 +432,8 @@ enum ProfileMutationOperation {
   linkGoogle,
   linkVerifiedEmail,
   syncAuthProfile,
+  uploadProfilePicture,
+  removeProfilePicture,
 }
 
 /// The currently running profile mutations.
@@ -1165,6 +1253,49 @@ class AuthController extends AsyncNotifier<void> {
             photoURL: removeProfileImage ? '' : profileImage,
           );
         }
+      },
+    );
+  }
+
+  /// Uploads a profile picture which the user picked on the device.
+  ///
+  /// The bytes are sent to the server, which writes the object in the
+  /// trusted bucket and publishes the canonical URL on the profile. The
+  /// profile snapshot therefore updates the avatar on its own.
+  Future<String> uploadProfilePicture(Uint8List bytes) {
+    return _runProfileOperation(
+      ProfileMutationOperation.uploadProfilePicture,
+      () async {
+        final user = ref.read(currentUserProvider);
+        if (user == null) {
+          throw Exception('You have to be signed in to change your profile');
+        }
+        final url = await ref
+            .read(authRepositoryProvider)
+            .uploadProfilePicture(bytes);
+        // The Auth profile carries the same picture, so the other Firebase
+        // surfaces (the account switcher, a fresh sign-in) show it as well.
+        await ref.read(authRepositoryProvider).updateProfile(photoURL: url);
+        return url;
+      },
+    );
+  }
+
+  /// Removes the profile picture of the signed-in account.
+  ///
+  /// The stored object is deleted by the server as well, so the picture does
+  /// not stay in the bucket as an orphan.
+  Future<void> removeProfilePicture() {
+    return _runProfileOperation(
+      ProfileMutationOperation.removeProfilePicture,
+      () async {
+        final user = ref.read(currentUserProvider);
+        if (user == null) {
+          throw Exception('You have to be signed in to change your profile');
+        }
+        final authRepo = ref.read(authRepositoryProvider);
+        await authRepo.removeProfilePicture();
+        await authRepo.updateProfile(photoURL: '');
       },
     );
   }

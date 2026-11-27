@@ -545,6 +545,17 @@ class _UserCard extends ConsumerWidget {
                     : 'Account disabled — deletion scheduled',
               ),
             ],
+            if (user.deletionInProgress && !user.deletionScheduled) ...[
+              const SizedBox(height: AppSpacing.sm),
+              _NoticeChip(
+                icon: Icons.delete_sweep_outlined,
+                color: Colors.orange,
+                // The backend is already removing this account. The chip
+                // tells the administrator that the account is on its way out
+                // instead of being an ordinary inactive user.
+                text: 'Deletion in progress (${user.deletionState})',
+              ),
+            ],
             const SizedBox(height: AppSpacing.sm),
             Row(
               children: [

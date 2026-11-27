@@ -15,7 +15,11 @@ import {
   readUserProfilesInPathOrder,
 } from './accounts';
 import { isActiveBookingStatus } from './bookings';
-import { paymentAlreadyMade } from './bookingAccess';
+import {
+  paymentAlreadyMade,
+  paymentBlocksAccountDeletion,
+  requestBlocksAccountDeletion,
+} from './bookingAccess';
 import { BATCH_SIZE, deleteWhere, PAGE_SIZE } from './batches';
 import {
   notificationDocumentData,
@@ -42,6 +46,7 @@ import {
 } from './reviews';
 import { REGISTRATION_ROLLBACK_OPERATIONS } from './otp';
 import { ROOM_PHOTO_BUCKET } from './roomMedia';
+import { deleteProfilePictureObjects } from './profileMedia';
 import { PHONE_VERIFICATION_PROOFS } from './verifiedPhone';
 
 const db = firestore.getFirestore();
@@ -192,8 +197,7 @@ async function assertAccountDeletionIsSafe(uid: string): Promise<void> {
           .orderBy(firestore.FieldPath.documentId()),
       (request) => {
         const data = request.data() as Record<string, any>;
-        const status = String(data.status || '');
-        if (isActiveBookingStatus(status) || paymentAlreadyMade(data)) {
+        if (requestBlocksAccountDeletion(data)) {
           throw new AccountDeletionBlockedError(
             'The account still has an active booking or a payment waiting for settlement.',
           );
@@ -208,8 +212,8 @@ async function assertAccountDeletionIsSafe(uid: string): Promise<void> {
           .where(field, '==', uid)
           .orderBy(firestore.FieldPath.documentId()),
       (payment) => {
-        const status = String(payment.get('status') || '');
-        if (status === 'submitted' || status === 'verified') {
+        const data = payment.data() as Record<string, any>;
+        if (paymentBlocksAccountDeletion(data)) {
           throw new AccountDeletionBlockedError(
             'The account still has a payment waiting for settlement.',
           );
@@ -657,10 +661,7 @@ async function cancelOpenAccountDeletionRequests(uid: string): Promise<number> {
             return false;
           }
 
-          if (
-            isActiveBookingStatus(status) ||
-            paymentAlreadyMade(request)
-          ) {
+          if (requestBlocksAccountDeletion(request)) {
             throw new AccountDeletionBlockedError(
               'The account still has an active booking or a payment waiting for settlement.',
             );
@@ -1273,6 +1274,10 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // account deletion.
   await deleteOwnerRoomPhotoObjects(uid);
 
+  // The profile picture of the account is personal data as well. It lives in
+  // its own namespace, so the room-photo sweep above never touched it.
+  await deleteProfilePictureObjects(uid);
+
   // The server-mediated room-photo protocol keeps its own durable records.
   // They contain the deleted uid and must not survive the account. The
   // Storage prefix above is deleted first; if that fails, the account-deletion
@@ -1291,6 +1296,11 @@ export async function deleteUserEverywhere(uid: string): Promise<void> {
   // pending and retries the sweep; no operation record is discarded while its
   // object has no remaining cleanup trigger.
   await deleteOwnerRoomPhotoObjects(uid);
+
+  // The same race exists for the profile picture: an upload which was
+  // written while the first sweep was running is removed by this second
+  // sweep before the durable job may be completed.
+  await deleteProfilePictureObjects(uid);
 
   await db.collection('roomPhotoUploadQuotas').doc(uid).delete();
   await deleteWhere(() =>

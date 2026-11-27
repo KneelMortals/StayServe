@@ -70,6 +70,8 @@
 		<string>StayServe needs your location to check if service is available in your area and show nearby rooms.</string>
 		<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 		<string>StayServe needs your location to check if service is available in your area and show nearby rooms.</string>
+		<key>NSPhotoLibraryUsageDescription</key>
+		<string>StayServe needs access to your photos so you can choose a profile picture and the photos of your room listing.</string>
 		<key>UILaunchStoryboardName</key>
 		<string>LaunchScreen</string>
 		<key>UIMainStoryboardFile</key>

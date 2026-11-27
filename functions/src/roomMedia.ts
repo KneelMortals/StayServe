@@ -460,7 +460,15 @@ export function assertRoomBelongsToOwner(
   return room;
 }
 
-function detectImageContentType(bytes: Buffer): string | null {
+/**
+ * Detects the image type of an upload from its bytes.
+ *
+ * The type is never taken from the client: a file which claims to be a PNG
+ * but contains something else is rejected instead of being published as a
+ * broken image. The profile-picture upload uses the same helper, so both
+ * namespaces accept exactly the same formats.
+ */
+export function detectImageContentType(bytes: Buffer): string | null {
   if (
     bytes.length >= 3 &&
     bytes[0] === 0xff &&

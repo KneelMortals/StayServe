@@ -1632,6 +1632,114 @@ async function testAccountDeletionDoesNotEraseLiveBookings() {
   );
 }
 
+async function testAccountDeletionErasesSettledCancelledBookings() {
+  section('account deletion erases a cancelled booking whose payment was settled');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await seedUser('owner-1', 'owner');
+  // The booking was cancelled after the advance had been paid and the
+  // platform cut had been taken. Nothing live is left — the request is
+  // history and must not block the deletion of the account.
+  await seedRequest('JRQ-SETTLED', {
+    status: 'cancelled',
+    advancePaid: true,
+    platformCutTaken: true,
+    advancePaymentStatus: 'verified',
+  });
+  await db.collection('payments').doc('JRQ-SETTLED').set({
+    requestId: 'JRQ-SETTLED',
+    roomId: 'RM-1',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'verified',
+  });
+
+  const originalUpdateUser = auth.updateUser;
+  const originalRevoke = auth.revokeRefreshTokens;
+  const originalDeleteUser = auth.deleteUser;
+  const originalGetStorage = storageSdk.getStorage;
+  auth.updateUser = async () => undefined;
+  auth.revokeRefreshTokens = async () => undefined;
+  auth.deleteUser = async () => undefined;
+  storageSdk.getStorage = () => ({
+    bucket: () => ({ getFiles: async () => [[]] }),
+  });
+
+  let result;
+  try {
+    result = await invoke(
+      deleteUserCompletely,
+      { uid: 'student-1' },
+      'admin-1',
+    );
+  } finally {
+    auth.updateUser = originalUpdateUser;
+    auth.revokeRefreshTokens = originalRevoke;
+    auth.deleteUser = originalDeleteUser;
+    storageSdk.getStorage = originalGetStorage;
+  }
+
+  check('the deletion completed', result.completed, true);
+  check('the deletion is not blocked', result.blocked, false);
+  check(
+    'the profile of the deleted account is gone',
+    (await db.collection('users').doc('student-1').get()).exists,
+    false,
+  );
+  check(
+    'the cancelled request was removed with the account',
+    (await db.collection('joinRequests').doc('JRQ-SETTLED').get()).exists,
+    false,
+  );
+  check(
+    'the settled payment was removed with the account',
+    (await db.collection('payments').doc('JRQ-SETTLED').get()).exists,
+    false,
+  );
+}
+
+async function testAccountDeletionStillWaitsForAnUnsettledPayment() {
+  section('account deletion waits for a payment which still has to be settled');
+
+  await reset();
+  await seedUser('admin-1', 'admin');
+  await seedUser('student-1', 'student');
+  await seedUser('owner-1', 'owner');
+  await seedRequest('JRQ-UNSETTLED', {
+    status: 'cancelled',
+    advancePaid: false,
+    platformCutTaken: false,
+    advancePaymentStatus: 'submitted',
+  });
+  await db.collection('payments').doc('JRQ-UNSETTLED').set({
+    requestId: 'JRQ-UNSETTLED',
+    roomId: 'RM-1',
+    studentId: 'student-1',
+    ownerId: 'owner-1',
+    status: 'submitted',
+  });
+
+  const result = await invoke(
+    deleteUserCompletely,
+    { uid: 'student-1' },
+    'admin-1',
+  );
+  check('the deletion is blocked', result.blocked, true);
+  check('the deletion did not complete', result.completed, false);
+  check(
+    'the profile of the blocked account is kept',
+    (await db.collection('users').doc('student-1').get()).exists,
+    true,
+  );
+  check(
+    'the unsettled payment is kept',
+    (await db.collection('payments').doc('JRQ-UNSETTLED').get()).exists,
+    true,
+  );
+}
+
 async function testAdminDeletionDistinguishesBlockedAndTransientFailures() {
   section('the admin deletion response distinguishes blocked and transient failures');
 
@@ -12311,6 +12419,8 @@ async function main() {
   await testAccountCleanupRemovesReviewNotificationDependents();
   await testAccountDeletionPreservesPendingRegistrationRollback();
   await testAccountDeletionDoesNotEraseLiveBookings();
+  await testAccountDeletionErasesSettledCancelledBookings();
+  await testAccountDeletionStillWaitsForAnUnsettledPayment();
   await testAdminDeletionDistinguishesBlockedAndTransientFailures();
   await testScheduledCancellationAndClaimRace();
   await testScheduledDeletionScanLeavesFutureAccountsAlone();

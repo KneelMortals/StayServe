@@ -170,6 +170,72 @@ export function paymentAlreadyMade(request: Record<string, any>): boolean {
 }
 
 /**
+ * The request states in which a booking is over for good.
+ *
+ * A cancelled or a declined request can never become a live booking again.
+ * The records which belong to it are therefore **history**, not live booking
+ * data — as long as no money is still waiting for its settlement.
+ */
+export const TERMINAL_BOOKING_STATUSES = ['cancelled', 'rejected'];
+
+/**
+ * Whether a booking request still keeps an account from being deleted.
+ *
+ * The rule distinguishes **live** booking data from **historical** data:
+ *
+ *  - An active booking (`adminReviewed`) still occupies a room. It blocks the
+ *    deletion until the booking is released.
+ *  - A request which is still open (`pending`, `ownerConfirmed`,
+ *    `studentConfirmed`) and which carries payment activity still needs an
+ *    administrator to settle it. The documents have to survive that decision.
+ *  - A **cancelled** or **declined** request whose payment was already
+ *    settled is history. The money changed hands, the platform cut was taken
+ *    and the booking itself is over — there is nothing left to settle and
+ *    nothing live to protect. Such a request must not block the deletion of
+ *    the account forever; the deletion removes the request and its payment
+ *    record together with the rest of the personal data.
+ *  - A cancelled request whose payment is still **submitted** is different:
+ *    the administrator has not decided what to do with that money yet, so the
+ *    payment still has to be settled before the data may disappear.
+ */
+export function requestBlocksAccountDeletion(
+  request: Record<string, any>,
+): boolean {
+  const status = String(request.status || '').trim();
+
+  // An active booking is live data, whatever the payment state says.
+  // `ACTIVE_BOOKING_STATUSES` is used directly because `./bookings` imports
+  // this module — importing it back would create a cycle.
+  if (ACTIVE_BOOKING_STATUSES.indexOf(status) >= 0) return true;
+
+  const terminal = TERMINAL_BOOKING_STATUSES.indexOf(status) >= 0;
+  if (terminal) {
+    // Only a payment which is still waiting for its settlement blocks the
+    // deletion of a finished booking.
+    return String(request.advancePaymentStatus || '').trim() === 'submitted';
+  }
+
+  // An open request with payment activity still needs a decision.
+  return paymentAlreadyMade(request);
+}
+
+/**
+ * Whether a payment record still keeps an account from being deleted.
+ *
+ * A `submitted` payment is waiting for the administrator: it has to be
+ * verified or rejected before the booking data may disappear. A `verified`
+ * payment is already settled — it is part of the history of a booking which
+ * the account deletion removes together with the rest of the personal data.
+ * The booking itself is protected by [requestBlocksAccountDeletion], which
+ * blocks an account which still owns a live room.
+ */
+export function paymentBlocksAccountDeletion(
+  payment: Record<string, any>,
+): boolean {
+  return String(payment.status || '').trim() === 'submitted';
+}
+
+/**
  * The request states in which a student may still withdraw their request.
  *
  * The snake-case spellings are legacy documents which the Flutter model

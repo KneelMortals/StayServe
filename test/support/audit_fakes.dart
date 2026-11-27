@@ -507,6 +507,9 @@ class FakeAuthRepository implements AuthRepository {
   Future<void> refreshIdToken() async {}
 
   @override
+  Future<bool> refreshIdTokenAndCheckAccount() async => true;
+
+  @override
   Future<void> signOut() async {}
 
   @override

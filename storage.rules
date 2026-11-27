@@ -83,6 +83,27 @@ service firebase.storage {
     }
 
     // -----------------------------------------------------------------------
+    // The profile picture of an account.
+    //
+    // They are stored under
+    //
+    //     profile-images/{uid}/{uploadId}
+    //
+    // Client writes are denied in this namespace as well. The
+    // `uploadProfilePicture` callable validates the live account and the
+    // image bytes and writes the object with the Admin SDK, so a client can
+    // neither create an arbitrary object nor publish an arbitrary URL on a
+    // profile.
+    //
+    // Reading is open to live, registered accounts — the picture is shown in
+    // the app next to the name of its owner.
+    // -----------------------------------------------------------------------
+    match /profile-images/{uid}/{fileName} {
+      allow read: if isLiveRegisteredAccount();
+      allow write: if false;
+    }
+
+    // -----------------------------------------------------------------------
     // Administrator-owned files.
     //
     // This grant is deliberately limited to its own namespace. A broad

@@ -58,6 +58,17 @@ class UserModel {
   /// When the account is really deleted — seven days after the scheduling.
   final DateTime? deleteAfter;
 
+  /// The server-owned state of the account-deletion state machine.
+  ///
+  /// It is empty while no deletion is running. The server writes
+  /// `scheduled`, `pending`, `deleting` and `restoring` while a deletion is
+  /// in flight and clears the field again when the account is restored.
+  ///
+  /// The admin panel shows this state so a queued deletion is not mistaken
+  /// for a ban and so an administrator can tell that an account is on its
+  /// way out instead of looking like an ordinary inactive user.
+  final String? deletionState;
+
   UserModel({
     required this.uid,
     required this.name,
@@ -84,6 +95,7 @@ class UserModel {
     this.deletionScheduled = false,
     this.deletionScheduledAt,
     this.deleteAfter,
+    this.deletionState,
   });
 
   factory UserModel.fromJson(Map<String, dynamic> json) {
@@ -139,6 +151,7 @@ class UserModel {
       deleteAfter: json['deleteAfter'] != null
           ? _toDate(json['deleteAfter'])
           : null,
+      deletionState: _asNullableString(json['deletionState']),
     );
   }
 
@@ -177,6 +190,7 @@ class UserModel {
       'deleteAfter': deleteAfter != null
           ? Timestamp.fromDate(deleteAfter!)
           : null,
+      'deletionState': deletionState,
     };
   }
 
@@ -206,6 +220,7 @@ class UserModel {
     bool? deletionScheduled,
     DateTime? deletionScheduledAt,
     DateTime? deleteAfter,
+    String? deletionState,
   }) {
     return UserModel(
       uid: uid ?? this.uid,
@@ -234,6 +249,7 @@ class UserModel {
       deletionScheduled: deletionScheduled ?? this.deletionScheduled,
       deletionScheduledAt: deletionScheduledAt ?? this.deletionScheduledAt,
       deleteAfter: deleteAfter ?? this.deleteAfter,
+      deletionState: deletionState ?? this.deletionState,
     );
   }
 
@@ -259,6 +275,13 @@ class UserModel {
   bool get isStudent => role == UserRole.student;
   bool get isOwner => role == UserRole.owner;
   bool get isAdmin => role == UserRole.admin;
+
+  /// Whether the server is currently deleting this account.
+  ///
+  /// The state machine writes `scheduled`, `pending`, `deleting` and
+  /// `restoring` while a deletion is in flight. A restored account has the
+  /// field cleared again.
+  bool get deletionInProgress => (deletionState ?? '').trim().isNotEmpty;
 
   /// Whether this account may use the student/owner service areas.
   ///

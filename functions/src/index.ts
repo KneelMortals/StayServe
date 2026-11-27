@@ -431,6 +431,17 @@ export {
   discardRoomPhotoUpload,
 } from './roomMedia';
 
+// Profile-picture uploads are server-mediated as well.
+//
+// A client cannot write the profile-image namespace directly and cannot put
+// an arbitrary URL on a profile: the server validates the live account and
+// the image bytes, writes the object with the Admin SDK and publishes the
+// canonical download URL itself.
+export {
+  uploadProfilePicture,
+  removeProfilePicture,
+} from './profileMedia';
+
 // An owner edit is committed by the server in one transaction.
 //
 // The metadata, the exact location and the photo list change together, so a

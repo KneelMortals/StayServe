@@ -119,5 +119,6 @@ fi
 
 node "$ROOT/functions/test/backend_callable_test.mjs" "$FIRESTORE_PORT" "$PROJECT"
 node "$ROOT/functions/test/room_media_test.mjs" "$FIRESTORE_PORT" "$PROJECT"
+node "$ROOT/functions/test/profile_media_test.mjs" "$FIRESTORE_PORT" "$PROJECT"
 node "$ROOT/functions/test/security_hardening_test.mjs" "$FIRESTORE_PORT" "$PROJECT"
 node "$ROOT/functions/test/live_phone_participants_test.mjs" "$FIRESTORE_PORT" "$PROJECT"

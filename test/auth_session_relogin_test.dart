@@ -27,6 +27,9 @@ class _ControllableAuthRepository implements AuthRepository {
   Future<void> refreshIdToken() async {}
 
   @override
+  Future<bool> refreshIdTokenAndCheckAccount() async => true;
+
+  @override
   Future<UserCredential> signInWithEmailAndPassword({
     required String email,
     required String password,

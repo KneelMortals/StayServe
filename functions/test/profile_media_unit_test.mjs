@@ -1,0 +1,235 @@
+// Focused tests for the pure profile-picture helpers.
+//
+//   npm run build
+//   node test/profile_media_unit_test.mjs
+//
+// The helpers are loaded from the compiled output, so these checks run
+// against exactly the code that is deployed.
+//
+// The regression they protect: the profile picture is uploaded by the
+// server into a trusted namespace. The helpers decide which object paths
+// the server may write and which URLs it may publish and delete — a
+// mistake there would let a client put an arbitrary URL on a profile or
+// make the account deletion remove an object of somebody else.
+
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+
+const {
+  MAX_PROFILE_PICTURE_BYTES,
+  PROFILE_PICTURE_PREFIX,
+  decodeProfilePictureBytes,
+  isOwnProfilePictureUrl,
+  profilePictureDownloadToken,
+  profilePictureObjectPath,
+  validProfilePictureUploadId,
+} = require(path.join(HERE, '..', 'lib', 'profileMedia.js'));
+
+let pass = 0;
+let fail = 0;
+const failures = [];
+
+function check(label, actual, expected) {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  if (ok) {
+    pass += 1;
+    console.log(`  PASS  ${label}`);
+  } else {
+    fail += 1;
+    failures.push(label);
+    console.log(
+      `  FAIL  ${label}  expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}`,
+    );
+  }
+}
+
+function section(title) {
+  console.log(`\n=== ${title} ===`);
+}
+
+function refuses(label, operation) {
+  try {
+    operation();
+    check(label, 'accepted', 'refused');
+  } catch (error) {
+    check(label, String(error?.code || error?.message || error), 'invalid-argument');
+  }
+}
+
+section('the upload id');
+check('a plain upload id is accepted', validProfilePictureUploadId('p123abc'), true);
+check(
+  'an upload id with a dash and an underscore is accepted',
+  validProfilePictureUploadId('p-123_abc'),
+  true,
+);
+check('an empty upload id is refused', validProfilePictureUploadId(''), false);
+check('an upload id with a slash is refused', validProfilePictureUploadId('a/b'), false);
+check(
+  'an upload id with a dot-dot segment is refused',
+  validProfilePictureUploadId('..'),
+  false,
+);
+check(
+  'an upload id with a dot is refused',
+  validProfilePictureUploadId('picture.jpg'),
+  false,
+);
+check(
+  'an upload id which is too long is refused',
+  validProfilePictureUploadId('a'.repeat(65)),
+  false,
+);
+check(
+  'an upload id with a space is refused',
+  validProfilePictureUploadId('a b'),
+  false,
+);
+
+section('the object path');
+check(
+  'the path stays inside the account namespace',
+  profilePictureObjectPath('uid-1', 'p1'),
+  `${PROFILE_PICTURE_PREFIX}/uid-1/p1`,
+);
+check(
+  'the path does not contain the upload id twice',
+  profilePictureObjectPath('uid-1', 'p1').split('/').length,
+  3,
+);
+
+section('the download token');
+check(
+  'the token is stable for the same upload',
+  profilePictureDownloadToken('uid-1', 'p1'),
+  profilePictureDownloadToken('uid-1', 'p1'),
+);
+check(
+  'the token differs for another account',
+  profilePictureDownloadToken('uid-1', 'p1') ===
+    profilePictureDownloadToken('uid-2', 'p1'),
+  false,
+);
+check(
+  'the token differs for another upload',
+  profilePictureDownloadToken('uid-1', 'p1') ===
+    profilePictureDownloadToken('uid-1', 'p2'),
+  false,
+);
+check(
+  'the token is a hex digest',
+  /^[0-9a-f]{64}$/.test(profilePictureDownloadToken('uid-1', 'p1')),
+  true,
+);
+
+section('the ownership of a URL');
+const token = profilePictureDownloadToken('uid-1', 'p1');
+check(
+  'the SDK download URL belongs to the account',
+  isOwnProfilePictureUrl(
+    `https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/` +
+      `${encodeURIComponent(`${PROFILE_PICTURE_PREFIX}/uid-1/p1`)}` +
+      `?alt=media&token=${token}`,
+    'uid-1',
+  ),
+  true,
+);
+check(
+  'the GCS download URL belongs to the account',
+  isOwnProfilePictureUrl(
+    `https://storage.googleapis.com/demo.appspot.com/` +
+      `${PROFILE_PICTURE_PREFIX}/uid-1/p1?alt=media&token=${token}`,
+    'uid-1',
+  ),
+  true,
+);
+check(
+  'a plain object path belongs to the account',
+  isOwnProfilePictureUrl(`${PROFILE_PICTURE_PREFIX}/uid-1/p1`, 'uid-1'),
+  true,
+);
+check(
+  'the URL of another account is not owned by this account',
+  isOwnProfilePictureUrl(
+    `https://firebasestorage.googleapis.com/v0/b/demo.appspot.com/o/` +
+      `${encodeURIComponent(`${PROFILE_PICTURE_PREFIX}/uid-2/p1`)}` +
+      `?alt=media&token=${token}`,
+    'uid-1',
+  ),
+  false,
+);
+check(
+  'an external picture is never owned by the account',
+  isOwnProfilePictureUrl('https://example.com/avatar.png', 'uid-1'),
+  false,
+);
+check(
+  'a URL on a foreign host is never owned by the account',
+  isOwnProfilePictureUrl(
+    `https://evil.example/v0/b/demo.appspot.com/o/` +
+      `${encodeURIComponent(`${PROFILE_PICTURE_PREFIX}/uid-1/p1`)}`,
+    'uid-1',
+  ),
+  false,
+);
+check(
+  'a room photo is never owned by the account',
+  isOwnProfilePictureUrl('rooms/uid-1/room1/photo.jpg', 'uid-1'),
+  false,
+);
+check(
+  'a nested path is never owned by the account',
+  isOwnProfilePictureUrl(`${PROFILE_PICTURE_PREFIX}/uid-1/other/p1`, 'uid-1'),
+  false,
+);
+check('an empty URL is never owned by the account', isOwnProfilePictureUrl('', 'uid-1'), false);
+check(
+  'a malformed URL is never owned by the account',
+  isOwnProfilePictureUrl(`${PROFILE_PICTURE_PREFIX}/uid-1/%E0%A4%A`, 'uid-1'),
+  false,
+);
+
+section('the uploaded bytes');
+const jpeg = Buffer.from([
+  0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01,
+  0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+]);
+check(
+  'a small image is decoded',
+  decodeProfilePictureBytes(jpeg.toString('base64')).length,
+  jpeg.length,
+);
+refuses('empty data is refused', () => decodeProfilePictureBytes(''));
+refuses(
+  'data which is not base64 is refused',
+  () => decodeProfilePictureBytes('not base64!!'),
+);
+refuses(
+  'data with a broken length is refused',
+  () => decodeProfilePictureBytes('AAAAA'),
+);
+refuses(
+  'an oversized upload is refused',
+  () =>
+    decodeProfilePictureBytes(
+      Buffer.alloc(MAX_PROFILE_PICTURE_BYTES + 1).toString('base64'),
+    ),
+);
+check(
+  'the maximum size is still accepted',
+  decodeProfilePictureBytes(
+    Buffer.alloc(MAX_PROFILE_PICTURE_BYTES).toString('base64'),
+  ).length,
+  MAX_PROFILE_PICTURE_BYTES,
+);
+
+console.log(`\n${pass} passed, ${fail} failed`);
+if (fail > 0) {
+  console.log('failed checks:');
+  for (const failure of failures) console.log(`  - ${failure}`);
+  process.exit(1);
+}

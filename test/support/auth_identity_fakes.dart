@@ -195,6 +195,12 @@ class RecordingAuthRepository implements AuthRepository {
   }
 
   @override
+  Future<bool> refreshIdTokenAndCheckAccount() async {
+    calls.add('refreshToken');
+    return true;
+  }
+
+  @override
   Future<void> signOut() async {
     calls.add('signOut');
     currentUser = null;

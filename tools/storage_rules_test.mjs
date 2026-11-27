@@ -308,6 +308,8 @@ function check(label, actual, expectedOk) {
 const OWN_OBJECT = 'rooms/owner1/room1/photo.jpg';
 const OTHER_OBJECT = 'rooms/owner2/room2/photo.jpg';
 const ADMIN_OBJECT = 'admin/report.pdf';
+const PROFILE_OBJECT = 'profile-images/owner1/picture';
+const OTHER_PROFILE_OBJECT = 'profile-images/owner2/picture';
 const adminApp = initializeApp(
   {
     projectId: PROJECT,
@@ -598,6 +600,70 @@ async function main() {
     'a live admin may delete an object in the admin namespace',
     await remove(TOKENS.admin, ADMIN_OBJECT),
     true,
+  );
+
+  console.log('\n--- the profile-picture namespace is server-mediated too ---');
+  await seedStorageObject(PROFILE_OBJECT);
+  await seedStorageObject(OTHER_PROFILE_OBJECT);
+  check(
+    'a live owner may not upload a profile picture directly',
+    await upload(TOKENS.owner, PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'a live owner may not overwrite their own profile picture',
+    await upload(TOKENS.owner, PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'a live owner may not write below another account folder',
+    await upload(TOKENS.owner, OTHER_PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'a live student may not upload a profile picture',
+    await upload(TOKENS.student, 'profile-images/student1/picture'),
+    false,
+  );
+  check(
+    'an anonymous caller may not upload a profile picture',
+    await upload(null, 'profile-images/anonymous/picture'),
+    false,
+  );
+  check(
+    'a live admin may not upload a profile picture directly',
+    await upload(TOKENS.admin, PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'a live owner may not delete their own profile picture directly',
+    await remove(TOKENS.owner, PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'a live student may read a profile picture',
+    await get(TOKENS.student, PROFILE_OBJECT),
+    true,
+  );
+  check(
+    'a live owner may read another account profile picture',
+    await get(TOKENS.owner, OTHER_PROFILE_OBJECT),
+    true,
+  );
+  check(
+    'a student without a verified phone may not read a profile picture',
+    await get(TOKENS.unverifiedStudent, PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'an anonymous caller may not read a profile picture',
+    await get(null, PROFILE_OBJECT),
+    false,
+  );
+  check(
+    'an inactive account may not read a profile picture',
+    await get(TOKENS.inactive, PROFILE_OBJECT),
+    false,
   );
 
   console.log(`\n${pass} passed, ${fail} failed`);
