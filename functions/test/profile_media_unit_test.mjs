@@ -23,6 +23,7 @@ const {
   MAX_PROFILE_PICTURE_BYTES,
   PROFILE_PICTURE_PREFIX,
   decodeProfilePictureBytes,
+  googlePhotoJpegUrl,
   googleProfilePictureUrl,
   isOwnProfilePictureUrl,
   isTrustedGooglePhotoUrl,
@@ -296,6 +297,28 @@ check(
   }),
   '',
 );
+
+section('the address of a Google picture');
+check(
+  'an address without a directive gets a size directive',
+  googlePhotoJpegUrl('https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg'),
+  'https://lh3.googleusercontent.com/a/ACg8oc/pic.jpg=s1024-c',
+);
+check(
+  'the directive of the original picture is replaced',
+  googlePhotoJpegUrl(
+    'https://lh3.googleusercontent.com/pw/ADCreHee/pic=s0-d-ip',
+  ),
+  'https://lh3.googleusercontent.com/pw/ADCreHee/pic=s1024-c',
+);
+check(
+  'a query string is kept',
+  googlePhotoJpegUrl(
+    'https://lh3.googleusercontent.com/a/ACg8oc/pic=s96-c?sz=100',
+  ),
+  'https://lh3.googleusercontent.com/a/ACg8oc/pic=s1024-c?sz=100',
+);
+check('an empty address stays empty', googlePhotoJpegUrl(''), '');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) {

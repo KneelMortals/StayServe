@@ -500,6 +500,51 @@ async function main() {
       removedProfile.get('profileImageSource'),
       'removed',
     );
+
+    // Google sometimes answers with the original file, which can be a HEIF
+    // picture. No browser can display it, so the server asks for the picture
+    // again with a size directive — Google then delivers a JPEG.
+    const HEIF_BYTES = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x18]),
+      Buffer.from('ftypheic', 'ascii'),
+      Buffer.alloc(16),
+    ]);
+    const requested = [];
+    globalThis.fetch = async (url) => {
+      const address = String(url);
+      requested.push(address);
+      if (!address.startsWith('https://lh3.googleusercontent.com/')) {
+        return { ok: false, status: 404, headers: { get: () => '0' } };
+      }
+      const isJpeg = address.endsWith('=s1024-c');
+      const bytes = isJpeg ? JPEG_BYTES : HEIF_BYTES;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => String(bytes.length) },
+        arrayBuffer: async () => bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        ),
+      };
+    };
+    await seedUser('heif-media');
+    const converted = await importGoogleProfilePicture(
+      'heif-media',
+      'https://lh3.googleusercontent.com/pw/ADCreHee/pic=s0-d-ip',
+    );
+    check('the HEIF picture was imported as a JPEG', typeof converted === 'string', true);
+    check(
+      'the picture was asked for again with a size directive',
+      requested.some((address) => address.endsWith('=s1024-c')),
+      true,
+    );
+    const heifProfile = await db.collection('users').doc('heif-media').get();
+    check(
+      'the profile publishes the converted picture',
+      heifProfile.get('profileImage'),
+      converted,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

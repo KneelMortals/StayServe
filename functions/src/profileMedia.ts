@@ -61,6 +61,13 @@ export const MAX_GOOGLE_PHOTO_BYTES = 2 * 1024 * 1024;
 const GOOGLE_PHOTO_TIMEOUT_MS = 10_000;
 
 /**
+ * The size of the picture which Google itself is asked for.
+ *
+ * The picture is scaled by Google, so the server needs no image library.
+ */
+const GOOGLE_PHOTO_SIZE = 1024;
+
+/**
  * Whether a URL points at a profile picture which Google itself serves.
  */
 export function isTrustedGooglePhotoUrl(url: string): boolean {
@@ -74,6 +81,32 @@ export function isTrustedGooglePhotoUrl(url: string): boolean {
   }
   if (parsed.protocol !== 'https:') return false;
   return GOOGLE_PHOTO_HOST_PATTERN.test(parsed.hostname.toLowerCase());
+}
+
+/**
+ * Rewrites the address of a Google picture so that Google returns a JPEG.
+ *
+ * Google serves the **original** file when the address carries a directive
+ * which keeps the original format (`=s0-d`). That original can be a HEIF
+ * picture, which neither a browser nor the app is able to display — and it
+ * is often bigger than the limit of the download.
+ *
+ * A size directive makes Google deliver a JPEG instead: the picture is
+ * scaled by Google itself, so the server does not need an image library.
+ */
+export function googlePhotoJpegUrl(url: string): string {
+  const trimmed = String(url || '').trim();
+  if (!trimmed) return '';
+
+  // The directive is the part behind the last "=" of the path. A query string
+  // or a fragment is kept as it is.
+  const suffixStart = trimmed.search(/[?#]/);
+  const path = suffixStart >= 0 ? trimmed.slice(0, suffixStart) : trimmed;
+  const suffix = suffixStart >= 0 ? trimmed.slice(suffixStart) : '';
+  const lastSlash = path.lastIndexOf('/');
+  const lastEquals = path.lastIndexOf('=');
+  const base = lastEquals > lastSlash ? path.slice(0, lastEquals) : path;
+  return `${base}=s${GOOGLE_PHOTO_SIZE}-c${suffix}`;
 }
 
 /**
@@ -99,13 +132,13 @@ export function googleProfilePictureUrl(user: {
 }
 
 /**
- * Downloads a Google profile picture.
+ * Downloads one Google picture.
  *
  * The download is bounded: it is aborted after ten seconds and a picture
  * which is larger than two megabytes is refused. A redirect is **not**
  * followed, because the redirect could point at any host.
  */
-export async function downloadGooglePhoto(url: string): Promise<Buffer | null> {
+async function fetchGooglePhoto(url: string): Promise<Buffer | null> {
   if (!isTrustedGooglePhotoUrl(url)) return null;
 
   const controller = new AbortController();
@@ -114,7 +147,7 @@ export async function downloadGooglePhoto(url: string): Promise<Buffer | null> {
     const response = await fetch(url, {
       signal: controller.signal,
       redirect: 'manual',
-      headers: { Accept: 'image/*' },
+      headers: { Accept: 'image/jpeg,image/png,image/webp,image/gif' },
     });
     if (!response.ok) return null;
     const announced = Number(response.headers.get('content-length') || '0');
@@ -128,6 +161,41 @@ export async function downloadGooglePhoto(url: string): Promise<Buffer | null> {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Downloads a Google profile picture in a format every client can display.
+ *
+ * Google sometimes answers with the original file, which can be a HEIF
+ * picture. Such a picture is asked for again with a size directive, so that
+ * Google delivers a JPEG of it.
+ */
+export async function downloadGooglePhoto(url: string): Promise<Buffer | null> {
+  if (!isTrustedGooglePhotoUrl(url)) return null;
+
+  const direct = await fetchGooglePhoto(url);
+  if (direct) {
+    const contentType = detectImageContentType(direct);
+    if (contentType && PROFILE_PICTURE_CONTENT_TYPES.indexOf(contentType) >= 0) {
+      return direct;
+    }
+  }
+
+  const rewritten = googlePhotoJpegUrl(url);
+  if (rewritten && rewritten !== url) {
+    const converted = await fetchGooglePhoto(rewritten);
+    if (converted) {
+      const contentType = detectImageContentType(converted);
+      if (
+        contentType &&
+        PROFILE_PICTURE_CONTENT_TYPES.indexOf(contentType) >= 0
+      ) {
+        return converted;
+      }
+    }
+  }
+
+  return null;
 }
 
 
