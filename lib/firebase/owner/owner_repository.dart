@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
@@ -26,6 +27,36 @@ final ownerRepositoryProvider = Provider<OwnerRepository>((ref) {
   );
 });
 
+/// One photo which was staged with the server.
+///
+/// The upload id is the durable server-side handle and the fingerprint
+/// identifies the file which was staged under it. The server knows the upload
+/// id already: a re-use of the same id with the same bytes returns the same
+/// download URL, so a retry commits the **same** photo object instead of
+/// uploading the same bytes a second time under a fresh URL. The committed
+/// photo list therefore cannot show one photo twice.
+class _StagedPhoto {
+  final String uploadId;
+
+  /// The name and the size of the staged file.
+  ///
+  /// The fingerprint only decides whether a re-use is worth trying. The
+  /// server compares the bytes themselves and refuses a mismatching re-use.
+  final String fingerprint;
+
+  /// The photo removals which were planned when the photo was staged.
+  ///
+  /// The server compares them with the ones it stored and refuses a re-use
+  /// whose plan changed, so a re-use has to repeat the original plan.
+  final List<String> plannedRemovalUrls;
+
+  const _StagedPhoto({
+    required this.uploadId,
+    required this.fingerprint,
+    required this.plannedRemovalUrls,
+  });
+}
+
 /// The files staged for one room edit.
 ///
 /// The upload ids are the durable server-side handles. A staged object is
@@ -33,12 +64,26 @@ final ownerRepositoryProvider = Provider<OwnerRepository>((ref) {
 /// edit fails, the same handle tells the server which unreferenced object
 /// may be removed.
 class _RoomImageUpload {
+  /// The upload ids which the commit callable attaches to the listing.
   final List<String> uploadIds;
+
   final List<String> newlyUploadedUrls;
+
+  /// The staged photos with their handles and fingerprints.
+  final List<_StagedPhoto> stagedPhotos;
+
+  /// Every upload id which was sent to the server.
+  ///
+  /// A refused re-use is deliberately **not** part of [uploadIds]: the commit
+  /// must not attach the photo of the refused attempt. The object may still
+  /// have to be removed, so the id is listed here.
+  final List<String> discardUploadIds;
 
   const _RoomImageUpload({
     required this.uploadIds,
     required this.newlyUploadedUrls,
+    this.stagedPhotos = const <_StagedPhoto>[],
+    this.discardUploadIds = const <String>[],
   });
 }
 
@@ -47,18 +92,32 @@ class _RoomImageUpload {
 /// The room id is retained after an ambiguous Firestore acknowledgement so a
 /// retry updates the same listing instead of publishing a duplicate.
 ///
-/// The upload ids of the staged photos are retained as well. The server
-/// returns the same download URL for an upload id it already knows, so a
-/// retry commits the **same** photo objects instead of uploading the same
-/// bytes under a second URL. The committed photo list therefore cannot
-/// contain the same photo twice.
+/// The staged photos are retained as well. The server returns the same
+/// download URL for an upload id it already knows, so a retry commits the
+/// **same** photo objects instead of uploading the same bytes under a second
+/// URL. The committed photo list therefore cannot contain the same photo
+/// twice.
 class _PendingRoomCreation {
   final String roomId;
 
-  /// The upload ids which this attempt already staged.
-  final List<String> uploadIds;
+  /// The photos which this attempt already staged.
+  final List<_StagedPhoto> stagedPhotos;
 
-  const _PendingRoomCreation(this.roomId, {this.uploadIds = const <String>[]});
+  const _PendingRoomCreation(
+    this.roomId, {
+    this.stagedPhotos = const <_StagedPhoto>[],
+  });
+}
+
+/// One room-edit attempt whose acknowledgement may still be lost.
+///
+/// The staged photos are retained until the edit is confirmed. A retry then
+/// stages the **same** photo objects, so the committed photo list cannot show
+/// one photo twice.
+class _PendingRoomEdit {
+  final List<_StagedPhoto> stagedPhotos;
+
+  const _PendingRoomEdit(this.stagedPhotos);
 }
 
 /// The result of reading the room document after an ambiguous write.
@@ -137,6 +196,34 @@ String _roomCreationFingerprint(RoomDraft draft) {
   });
 }
 
+/// A fingerprint of one selected photo.
+///
+/// The name and the size identify the file which the owner picked. The
+/// fingerprint only decides whether a re-use of an earlier upload id is
+/// worth trying: the server compares the bytes themselves and refuses a
+/// mismatching re-use.
+String _photoFingerprint(XFile image, List<int> bytes) {
+  return jsonEncode(<String, dynamic>{
+    'name': image.name,
+    'length': bytes.length,
+  });
+}
+
+/// Whether the server refused the re-use of an upload id.
+///
+/// The server refuses a re-used upload id when the staged object no longer
+/// belongs to this listing or when it expired. The photo is then staged
+/// under a fresh id. An untrusted storage URL is **not** a refusal of the
+/// upload id: it is an integrity anomaly, and it must not be hidden by a
+/// silent re-upload.
+bool _isUploadIdRefusal(Object error) {
+  if (error is! FirebaseFunctionsException) return false;
+  if (error.code != 'failed-precondition') return false;
+  final message = error.message ?? '';
+  if (message.contains('untrusted storage URL')) return false;
+  return true;
+}
+
 /// Data access for the room owner side of the app.
 class OwnerRepository {
   final FirebaseFirestore _firestore;
@@ -144,6 +231,13 @@ class OwnerRepository {
   final FunctionsService _functions;
   final Map<String, _PendingRoomCreation> _pendingRoomCreations =
       <String, _PendingRoomCreation>{};
+
+  /// The room edits whose acknowledgement may still be lost.
+  ///
+  /// The entry is keyed by the room id and holds the photos which the last
+  /// attempt staged. It is removed as soon as an edit is confirmed.
+  final Map<String, _PendingRoomEdit> _pendingRoomEdits =
+      <String, _PendingRoomEdit>{};
 
   static const Uuid _uuid = Uuid();
 
@@ -386,7 +480,7 @@ class OwnerRepository {
     final pendingCreation = _pendingRoomCreations[attemptKey];
     var roomId = pendingCreation?.roomId ?? 'RM-${_uuid.v4()}';
     var reuseExistingRoom = false;
-    var reuseUploadIds = const <String>[];
+    var reusablePhotos = const <_StagedPhoto>[];
 
     if (pendingCreation != null) {
       final existingState = await _reconcileRoomCreation(roomId, uid);
@@ -398,7 +492,7 @@ class OwnerRepository {
         // The photos of the earlier attempt are staged under known upload
         // ids. Re-using them keeps the committed photo list free of
         // duplicates.
-        reuseUploadIds = pendingCreation.uploadIds;
+        reusablePhotos = pendingCreation.stagedPhotos;
       } else if (existingState == _RoomCreationState.mismatched) {
         // The id no longer belongs to this owner. It cannot be reused safely.
         _pendingRoomCreations.remove(attemptKey);
@@ -462,13 +556,13 @@ class OwnerRepository {
       upload = await _stageImages(
         roomId,
         draft,
-        reuseUploadIds: reuseUploadIds,
+        reusablePhotos: reusablePhotos,
       );
-      // The upload ids are retained so a retry of this attempt stages the
+      // The staged photos are retained so a retry of this attempt stages the
       // same photo objects instead of uploading the same bytes a second time.
       _pendingRoomCreations[attemptKey] = _PendingRoomCreation(
         roomId,
-        uploadIds: upload.uploadIds,
+        stagedPhotos: upload.stagedPhotos,
       );
       await _commitRoomPhotoChanges(roomId, draft, upload);
 
@@ -517,7 +611,7 @@ class OwnerRepository {
       // A lost acknowledgement does not prove that the server commit failed.
       // The server-side discard operation checks the live listing before it
       // removes anything, so a committed photo is never deleted by a retry.
-      await _discardUploadsBestEffort(roomId, upload.uploadIds);
+      await _discardUploadsBestEffort(roomId, upload.discardUploadIds);
 
       // Roll back only a listing whose owner and room identity were
       // confirmed. An ambiguous read leaves the pending room id in place so
@@ -576,7 +670,22 @@ class OwnerRepository {
     // owner understands without uploading a single byte.
     _assertOwnerEditIsValid(draft, listing.currentOccupancy);
 
-    final upload = await _stageImages(roomId, draft);
+    // The photos of an earlier attempt of this edit are re-used. The server
+    // returns the same download URL for the same bytes, so a retry commits
+    // the **same** photo objects instead of uploading the same bytes a
+    // second time under a fresh URL. Without the re-use a lost
+    // acknowledgement would leave the listing with the same photo twice.
+    final pendingEdit = _pendingRoomEdits[roomId];
+    final upload = await _stageImages(
+      roomId,
+      draft,
+      reusablePhotos: pendingEdit?.stagedPhotos ?? const <_StagedPhoto>[],
+    );
+
+    // The staged photos are retained until the edit is confirmed. A lost
+    // acknowledgement leaves the listing in an unknown state, and the next
+    // attempt has to stage the very same photos.
+    _pendingRoomEdits[roomId] = _PendingRoomEdit(upload.stagedPhotos);
 
     // The commit id identifies this edit. It is reused for the retry, so a
     // lost acknowledgement is idempotent on the server: the edit can never
@@ -588,9 +697,13 @@ class OwnerRepository {
       // The acknowledgement may have been lost after the server committed the
       // edit. The server-side discard operation checks the live listing
       // before it removes anything.
-      await _discardUploadsBestEffort(roomId, upload.uploadIds);
+      await _discardUploadsBestEffort(roomId, upload.discardUploadIds);
       rethrow;
     }
+
+    // The edit is confirmed. The staged photos are part of the listing now,
+    // so the next edit stages its own photos.
+    _pendingRoomEdits.remove(roomId);
 
     // The Firestore room-update trigger compares the committed image list
     // with the previous one and writes a durable server-side Storage-cleanup
@@ -705,23 +818,25 @@ class OwnerRepository {
   /// writes the object below `rooms/{ownerUid}/{roomId}/…` in the trusted
   /// bucket. The client never receives a Storage write capability.
   ///
-  /// [reuseUploadIds] carries the upload ids of an earlier attempt of the
-  /// same listing. The server knows those ids already and returns the same
-  /// download URLs, so a retry commits the same photo objects instead of
-  /// uploading the same bytes a second time under a fresh URL. The committed
-  /// photo list therefore never shows the same photo twice.
+  /// [reusablePhotos] carries the photos of an earlier attempt of the same
+  /// listing. The server knows those upload ids already and returns the same
+  /// download URLs for the same bytes, so a retry commits the same photo
+  /// objects instead of uploading the same bytes a second time under a fresh
+  /// URL. The committed photo list therefore never shows the same photo
+  /// twice.
   Future<_RoomImageUpload> _stageImages(
     String roomId,
     RoomDraft draft, {
-    List<String> reuseUploadIds = const <String>[],
+    List<_StagedPhoto> reusablePhotos = const <_StagedPhoto>[],
   }) async {
+    // The upload ids which the commit attaches to the listing.
     final uploadIds = <String>[];
+    // Every upload id which was sent to the server. A refused re-use is not
+    // part of the commit, but its object may still have to be removed.
+    final discardUploadIds = <String>[];
     final uploadedUrls = <String>[];
-    // The ids are only re-used when the earlier attempt staged exactly the
-    // same number of photos. A different photo list gets fresh ids.
-    final reusableIds = reuseUploadIds.length == draft.newImages.length
-        ? reuseUploadIds
-        : const <String>[];
+    final stagedPhotos = <_StagedPhoto>[];
+    final plannedRemovals = _plannedRemovalUrls(draft);
 
     try {
       for (var index = 0; index < draft.newImages.length; index += 1) {
@@ -743,43 +858,76 @@ class OwnerRepository {
           );
         }
 
-        final uploadId = index < reusableIds.length
-            ? reusableIds[index]
-            : _uuid.v4();
+        // The upload id of an earlier attempt is only re-used when it staged
+        // the same photo. The server compares the bytes itself and refuses a
+        // mismatching re-use.
+        final fingerprint = _photoFingerprint(image, bytes);
+        final reusable = index < reusablePhotos.length
+            ? reusablePhotos[index]
+            : null;
+        final reusablePhoto =
+            reusable != null && reusable.fingerprint == fingerprint
+            ? reusable
+            : null;
+
+        var uploadId = reusablePhoto?.uploadId ?? _uuid.v4();
         // Track the id before the request. The server may have accepted the
         // object even when its acknowledgement was lost.
-        uploadIds.add(uploadId);
-        final result = await _functions.callFunction(
-          'stageRoomPhoto',
-          parameters: {
-            'roomId': roomId,
-            'uploadId': uploadId,
-            'data': base64Encode(bytes),
-            // These are advisory replacement hints. The server uses them
-            // only to reserve a photo slot; the commit still recalculates
-            // the authoritative final image list.
-            'removeUrls': _plannedRemovalUrls(draft),
-          },
-        );
-        final raw = result.data;
-        if (raw is! Map) {
-          throw Exception('The room-photo upload response was invalid.');
+        discardUploadIds.add(uploadId);
+        Map<String, dynamic> data;
+        try {
+          data = await _callStageRoomPhoto(
+            roomId: roomId,
+            uploadId: uploadId,
+            bytes: bytes,
+            // The removals which were planned when the photo was staged are
+            // sent again: the server compares them with the ones it stored
+            // and refuses a re-use whose plan changed.
+            plannedRemovals:
+                reusablePhoto?.plannedRemovalUrls ?? plannedRemovals,
+          );
+        } on FirebaseFunctionsException catch (error) {
+          if (reusablePhoto == null || !_isUploadIdRefusal(error)) rethrow;
+          // The server refused the re-use of the upload id — the staged
+          // object expired or belongs to an earlier listing. The photo is
+          // staged under a fresh id instead.
+          AppLogger.warning(
+            'Could not re-use a staged room-photo upload id',
+            error: error,
+          );
+          uploadId = _uuid.v4();
+          discardUploadIds.add(uploadId);
+          data = await _callStageRoomPhoto(
+            roomId: roomId,
+            uploadId: uploadId,
+            bytes: bytes,
+            plannedRemovals: plannedRemovals,
+          );
         }
-        final data = Map<String, dynamic>.from(raw);
+
         final returnedUploadId = data['uploadId']?.toString().trim() ?? '';
         final url = data['url']?.toString().trim() ?? '';
         if (returnedUploadId.isEmpty || url.isEmpty) {
           throw Exception('The room-photo upload response was incomplete.');
         }
         if (returnedUploadId != uploadId) {
-          uploadIds.add(returnedUploadId);
+          discardUploadIds.add(returnedUploadId);
         }
+        uploadIds.add(returnedUploadId);
         uploadedUrls.add(url);
+        stagedPhotos.add(
+          _StagedPhoto(
+            uploadId: returnedUploadId,
+            fingerprint: fingerprint,
+            plannedRemovalUrls:
+                reusablePhoto?.plannedRemovalUrls ?? plannedRemovals,
+          ),
+        );
       }
     } catch (error) {
       // A later upload may fail after earlier files were staged. The server
       // removes only objects which the live listing does not reference.
-      await _discardUploadsBestEffort(roomId, uploadIds);
+      await _discardUploadsBestEffort(roomId, discardUploadIds);
       AppLogger.warning('Could not upload a room photo', error: error);
       rethrow;
     }
@@ -787,7 +935,40 @@ class OwnerRepository {
     return _RoomImageUpload(
       uploadIds: uploadIds,
       newlyUploadedUrls: uploadedUrls,
+      stagedPhotos: stagedPhotos,
+      discardUploadIds: discardUploadIds,
     );
+  }
+
+  /// Sends one photo to the staging callable and reads its response.
+  ///
+  /// The response carries the durable upload id and the download URL of the
+  /// staged object. The server returns the **same** URL for an upload id it
+  /// already knows with the same bytes, which is what keeps a retry from
+  /// appending the same photo twice.
+  Future<Map<String, dynamic>> _callStageRoomPhoto({
+    required String roomId,
+    required String uploadId,
+    required List<int> bytes,
+    required List<String> plannedRemovals,
+  }) async {
+    final result = await _functions.callFunction(
+      'stageRoomPhoto',
+      parameters: {
+        'roomId': roomId,
+        'uploadId': uploadId,
+        'data': base64Encode(bytes),
+        // These are advisory replacement hints. The server uses them
+        // only to reserve a photo slot; the commit still recalculates
+        // the authoritative final image list.
+        'removeUrls': plannedRemovals,
+      },
+    );
+    final raw = result.data;
+    if (raw is! Map) {
+      throw Exception('The room-photo upload response was invalid.');
+    }
+    return Map<String, dynamic>.from(raw);
   }
 
   /// The photos which this form explicitly removed when it was opened.
