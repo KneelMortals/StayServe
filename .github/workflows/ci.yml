@@ -89,6 +89,45 @@ jobs:
       - name: Verify the web SEO assets
         run: npm run web:seo:check
 
+      - name: Prepare the release signing material
+        # The upload key lives in the repository secrets. A pull request from
+        # a fork has no access to them, so the build keeps the debug
+        # fallback and only the size validation runs. The Gradle build
+        # refuses a partially configured release identity, so either all
+        # four values are written or none of them is.
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.STAY_SERVE_RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STAY_SERVE_RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.STAY_SERVE_RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.STAY_SERVE_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KEYSTORE_BASE64}" ]; then
+            echo "No release keystore in the secrets: the debug key is used."
+            exit 0
+          fi
+
+          if [ -z "${STORE_PASSWORD}" ] || [ -z "${KEY_ALIAS}" ] || [ -z "${KEY_PASSWORD}" ]; then
+            echo "::error::The release keystore is in the secrets, but one of the" \
+              "three passwords or the key alias is missing."
+            exit 1
+          fi
+
+          KEYSTORE="${RUNNER_TEMP}/stayserve-upload.jks"
+          printf '%s' "${KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE}"
+          chmod 600 "${KEYSTORE}"
+
+          {
+            echo "STAY_SERVE_RELEASE_STORE_FILE=${KEYSTORE}"
+            echo "STAY_SERVE_RELEASE_STORE_PASSWORD=${STORE_PASSWORD}"
+            echo "STAY_SERVE_RELEASE_KEY_ALIAS=${KEY_ALIAS}"
+            echo "STAY_SERVE_RELEASE_KEY_PASSWORD=${KEY_PASSWORD}"
+          } >> "${GITHUB_ENV}"
+
+          echo "The release upload key is available for the Android builds."
+
       - name: Build the Android App Bundle
         # A clean checkout does not track Flutter's generated Gradle wrapper.
         # The Flutter build restores it before the lint step runs below.
@@ -144,6 +183,48 @@ jobs:
         # APKs without the oversized universal fallback and honors targeted
         # Flutter ABI flags.
         run: tools/run_gradle_command_with_retry.sh flutter build apk --release --split-per-abi
+
+      - name: Verify the Android release APK signature
+        # A release artifact which is signed with the debug key must never
+        # reach the Play Store. The check reads the signer of the built
+        # APKs and compares it with the upload key of the secrets.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${STAY_SERVE_RELEASE_STORE_FILE:-}" ]; then
+            echo "No release key in the secrets: the debug key is used, so the" \
+              "signature is not checked."
+            exit 0
+          fi
+
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort -V | tail -1)"
+          if [ -z "${APKSIGNER}" ]; then
+            echo "::error::apksigner was not found in the build tools."
+            exit 1
+          fi
+
+          EXPECTED="$(keytool -list -v \
+            -keystore "${STAY_SERVE_RELEASE_STORE_FILE}" \
+            -alias "${STAY_SERVE_RELEASE_KEY_ALIAS}" \
+            -storepass "${STAY_SERVE_RELEASE_STORE_PASSWORD}" 2>/dev/null \
+            | sed -n 's/.*SHA256: //p' | head -1 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+
+          if [ -z "${EXPECTED}" ]; then
+            echo "::error::The SHA-256 fingerprint of the release key was not found."
+            exit 1
+          fi
+
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            ACTUAL="$("${APKSIGNER}" verify --print-certs "${apk}" 2>/dev/null \
+              | sed -n 's/.*certificate SHA-256 digest: //p' | head -1 \
+              | tr '[:upper:]' '[:lower:]')"
+            if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+              echo "::error::${apk} is not signed with the release upload key."
+              exit 1
+            fi
+            echo "${apk} is signed with the release upload key."
+          done
 
       - name: Verify the Android APK variant version codes
         run: |

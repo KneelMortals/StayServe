@@ -814,9 +814,92 @@ canonical-domain, robots, sitemap, Search Console, and custom-domain cutover
 procedure is documented in
 [`docs/DOMAIN_AND_SEARCH_READINESS.md`](docs/DOMAIN_AND_SEARCH_READINESS.md).
 Do not deploy Hosting until the approved custom-domain and canonical-origin
-cutover is complete. Do not pass a reCAPTCHA site key until browser App Check
-has been registered and validated; without one, the client intentionally skips
-browser App Check.
+cutover is complete. The browser App Check provider is registered, so the web
+release build carries the reCAPTCHA Enterprise key of the project:
+
+```bash
+flutter build web --release \
+  --dart-define=FIREBASE_APPCHECK_RECAPTCHA_ENTERPRISE_SITE_KEY=6LdABDUuAAAAALANiAAsOKmI8DwqXO0G-LHu-4sB
+npm run web:seo:check
+firebase deploy --only hosting --project myfirstapp-fa30f52b
+```
+
+Without a key the client intentionally skips browser App Check; a build with
+the key activates it.
+
+### 6.1 The signed Android release
+
+A distributable Android release must use the protected upload key. The key
+lives outside the repository:
+
+```text
+~/.config/stayserve/stayserve-upload.jks     (PKCS#12)
+~/.config/stayserve/release-signing.env      (the four values below)
+```
+
+Build with the four values in the environment:
+
+```bash
+set -a
+source ~/.config/stayserve/release-signing.env
+set +a
+
+flutter clean
+flutter build appbundle --release
+flutter build apk --release --split-per-abi
+```
+
+A PKCS#12 store has **one** password for the store and its key, so
+`STAY_SERVE_RELEASE_KEY_PASSWORD` is the same value as
+`STAY_SERVE_RELEASE_STORE_PASSWORD`.
+
+Verify the result before it is published:
+
+```bash
+APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)"
+for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+  "$APKSIGNER" verify --print-certs "$apk" | sed -n 's/.*certificate SHA-256 digest: //p'
+done
+```
+
+Every APK must show the fingerprint of the upload key
+(`660919fa384fc4fd545ad727cd046d9e9f5dbad602451e349ad55dc90694748b`) and
+never the fingerprint of the debug key.
+
+The per-device download size is checked with bundletool, exactly like the CI
+does it:
+
+```bash
+java -jar bundletool.jar build-apks \
+  --bundle=build/app/outputs/bundle/release/app-release.aab \
+  --output=stayserve.apks \
+  --ks="$STAY_SERVE_RELEASE_STORE_FILE" \
+  --ks-pass="pass:$STAY_SERVE_RELEASE_STORE_PASSWORD" \
+  --ks-key-alias="$STAY_SERVE_RELEASE_KEY_ALIAS" \
+  --key-pass="pass:$STAY_SERVE_RELEASE_KEY_PASSWORD"
+java -jar bundletool.jar get-size total --apks=stayserve.apks \
+  | dart run tools/check_android_bundle_size.dart --max-bytes 40000000
+```
+
+#### The CI secrets
+
+The CI uses the same key when the repository has these secrets:
+
+| Secret | Content |
+|---|---|
+| `STAY_SERVE_RELEASE_KEYSTORE_BASE64` | the upload keystore, base64 encoded (`base64 -i stayserve-upload.jks`) |
+| `STAY_SERVE_RELEASE_STORE_PASSWORD` | the password of the store |
+| `STAY_SERVE_RELEASE_KEY_ALIAS` | the alias of the key (`stayserve-upload`) |
+| `STAY_SERVE_RELEASE_KEY_PASSWORD` | the password of the key |
+
+Without them the CI keeps the debug fallback and only validates the size.
+With them the CI also checks that every release APK carries the fingerprint of
+the upload key.
+
+The upload key must be backed up in a private place and enrolled in **Play
+App Signing**. Play then issues its own app-signing key; the SHA-1 of that
+key has to be registered with the Firebase Android app, otherwise Google
+sign-in fails in the published app.
 
 There is **no `build_runner` step**. The models are hand-written, so code
 generation is not part of the build.

@@ -257,6 +257,12 @@ SHA-1   0B:8F:32:33:C7:49:49:EB:F4:D4:70:DB:99:8C:A5:28:B3:7A:EE:41
 SHA-256 66:09:19:FA:38:4F:C4:FD:54:5A:D7:27:CD:04:6D:9E:9F:5D:BA:D6:02:45:1E:34:9A:D5:5D:C9:06:94:74:8B
 ```
 
+A PKCS#12 store has one password for the store and its key, so
+`STAY_SERVE_RELEASE_KEY_PASSWORD` is the same value as
+`STAY_SERVE_RELEASE_STORE_PASSWORD`. The full procedure — the build, the
+signature check, the bundletool size check and the CI secrets — is in
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
+
 When all four values are absent, the build falls back to the debug key so
 local and CI size validation can still run. A partial configuration (including
 a missing or blank value) fails the Gradle build instead of silently producing
