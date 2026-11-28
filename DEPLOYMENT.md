@@ -999,6 +999,30 @@ flutter analyze lib      # ~4 seconds
 
 `dart analyze .` produces the same diagnostics for the whole project.
 
+### 7.3 "Could not load requests" / "Could not load your requests"
+
+The list of the join requests (owner) or of the bookings (student) is a
+Firestore **listener**. A listener which is attached while Firebase Auth
+replaces the account is evaluated with the token of the previous account, the
+security rules refuse that read, and the listener would stay in its error
+state for good — the screen showed "Could not load …" although the new
+account is allowed to read the data.
+
+The app recovers from this on its own:
+
+* the lists watch the auth session, so they are rebuilt when the account
+  changes;
+* they are gated by the role of the live profile, so a listener is never
+  attached for an account which cannot read the collection;
+* a refused listener is attached again with a growing delay (five attempts);
+* the reason — the identity and the claims of the token — is written to the
+  log as `The listener "…" was refused`.
+
+If the message is still there after the last attempt, the **Retry** button
+rebuilds the list. The log line of the refusal says which account the read
+was made with; a wrong uid or a missing `stayServeVerifiedPhone` claim is
+the reason in that case.
+
 ---
 
 ## 8. Promoting a user to admin
