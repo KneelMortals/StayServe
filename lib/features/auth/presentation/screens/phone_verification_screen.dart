@@ -386,10 +386,11 @@ class _PhoneVerificationScreenState
                 const SizedBox(height: AppSpacing.sm),
                 Text(
                   _isLinking
-                      ? 'Firebase will send an SMS code. A verified phone is '
-                            'required before student or owner services can be used.'
-                      : 'Firebase will send an SMS code. Phone-only accounts may '
-                            'add a verified email later.',
+                      ? 'We will send an SMS code to your phone. A verified '
+                            'phone is required before student or owner services '
+                            'can be used.'
+                      : 'We will send an SMS code to your phone. Phone-only '
+                            'accounts may add a verified email later.',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),

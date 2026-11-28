@@ -61,3 +61,26 @@ extension AppSnackBarX on BuildContext {
     return true;
   }
 }
+
+/// The message which tells the student that the booking request was sent.
+///
+/// A snack bar which carries an action **persists** by default: it stays on
+/// the screen until the action is pressed. The bar of the room screen floats
+/// above the keyboard of the **next** screen as well, so it covered the
+/// message composer of the chat and swallowed every tap of the user on
+/// "Send" — without any visible reaction. The bar therefore disappears on
+/// its own.
+SnackBar bookingRequestSentSnackBar({VoidCallback? onViewRequests}) {
+  return SnackBar(
+    content: const Text(
+      'Request sent! The owner will review it. You can pay the platform fee '
+      'once they approve.',
+    ),
+    backgroundColor: Colors.green,
+    persist: false,
+    duration: const Duration(seconds: 8),
+    action: onViewRequests == null
+        ? null
+        : SnackBarAction(label: 'View requests', onPressed: onViewRequests),
+  );
+}

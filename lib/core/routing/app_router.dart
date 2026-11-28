@@ -576,6 +576,11 @@ String? resolveAuthRedirect({
       return homeForRole(role);
     }
 
+    // A signed-in account may open the password-reset screen to change the
+    // password of **its own** account. The screen sends the reset link to
+    // the address of the account, so nothing else is exposed.
+    if (location == '/forgot-password') return null;
+
     return homeForRole(role);
   }
 

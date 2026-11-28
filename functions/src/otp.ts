@@ -441,7 +441,11 @@ async function sendMobile(identifier: string, otp: string): Promise<boolean> {
   const twilioSid = process.env.TWILIO_ACCOUNT_SID;
   const twilioToken = process.env.TWILIO_AUTH_TOKEN;
   const twilioFrom = process.env.TWILIO_FROM_NUMBER;
-  const body = `${otp} is your StayServe verification code. It expires in ${Math.floor(OTP_TTL_MS / 60000)} minutes. Do not share it with anyone.`;
+  // The message of the code carries the name of the product. The code which
+  // Firebase Auth sends by itself cannot be changed — Google marks its
+  // template as read-only — so the messages of StayServe are the branded
+  // ones.
+  const body = `${otp} is your StayServe login OTP. It expires in ${Math.floor(OTP_TTL_MS / 60000)} minutes. Do not share it with anyone.`;
 
   if (twilioSid && twilioToken && twilioFrom) {
     const response = await fetch(

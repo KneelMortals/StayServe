@@ -34,7 +34,24 @@ class OwnerProfileScreen extends ConsumerWidget {
               icon: Icons.lock_outline,
               title: 'Change Password',
               subtitle: 'We send you a reset link by email',
-              onTap: () => context.push('/forgot-password'),
+              // A phone-only account has no password to change. The old tile
+              // opened the reset screen, which the router sent straight back
+              // to the dashboard — a dead end without an explanation.
+              onTap: () {
+                final email = profile?.email ?? '';
+                if (email.isEmpty) {
+                  _showInfo(
+                    context,
+                    title: 'No password to change',
+                    message:
+                        'This account signs in with your phone number, so it '
+                        'has no password. Add an email address in "Edit '
+                        'Profile" if you want to use a password as well.',
+                  );
+                  return;
+                }
+                context.push('/forgot-password');
+              },
             ),
             _ProfileTile(
               icon: Icons.account_balance_outlined,
@@ -113,6 +130,15 @@ class OwnerProfileScreen extends ConsumerWidget {
     final theme = Theme.of(context);
     final name = profile?.name ?? '';
     final email = profile?.email ?? '';
+    final phone = profile?.phone ?? '';
+    // A phone-only account has no address. It is nevertheless signed in, so
+    // the header names the way it signed in instead of claiming that nobody
+    // is signed in.
+    final subtitle = email.isNotEmpty
+        ? email
+        : phone.isNotEmpty
+        ? 'Signed in with your phone number'
+        : 'Signed in';
 
     return Center(
       child: Column(
@@ -131,12 +157,14 @@ class OwnerProfileScreen extends ConsumerWidget {
           ),
           const SizedBox(height: AppSpacing.xs),
           Text(
-            email.isEmpty ? 'Not signed in' : email,
+            subtitle,
             style: theme.textTheme.bodyMedium?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
-          if (profile != null && profile.phone != null && profile.phone!.isNotEmpty) ...[
+          if (profile != null &&
+              profile.phone != null &&
+              profile.phone!.isNotEmpty) ...[
             const SizedBox(height: AppSpacing.xs),
             Text(
               profile.phone!,
@@ -150,7 +178,11 @@ class OwnerProfileScreen extends ConsumerWidget {
     );
   }
 
-  Widget _buildSection(BuildContext context, String title, List<Widget> children) {
+  Widget _buildSection(
+    BuildContext context,
+    String title,
+    List<Widget> children,
+  ) {
     final theme = Theme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -223,7 +255,10 @@ class OwnerProfileScreen extends ConsumerWidget {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(title),
-        content: SingleChildScrollView(child: Text(message)),
+        // The text is **not** wrapped in a scroll view: a scroll view hides
+        // the words from the screen reader, so the message would be read as
+        // an empty box.
+        content: Text(message),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),

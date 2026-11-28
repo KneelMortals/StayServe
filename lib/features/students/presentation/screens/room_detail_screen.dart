@@ -815,9 +815,7 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(
-            'Could not open the chat: ${readableAuthError(e)}',
-          ),
+          content: Text('Could not open the chat: ${readableAuthError(e)}'),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
@@ -1147,16 +1145,11 @@ class _RoomDetailContentState extends ConsumerState<_RoomDetailContent> {
     ref.invalidate(myJoinRequestsProvider);
 
     messenger.showSnackBar(
-      SnackBar(
-        content: const Text(
-          'Request sent! The owner will review it. You can pay the platform '
-          'fee once they approve.',
-        ),
-        backgroundColor: Colors.green,
-        action: SnackBarAction(
-          label: 'View requests',
-          onPressed: () => context.go('/student/requests'),
-        ),
+      bookingRequestSentSnackBar(
+        // The router is used instead of the context of this screen: the
+        // action can be pressed long after the room was left, and a context
+        // of a disposed widget throws instead of navigating.
+        onViewRequests: () => ref.read(routerProvider).go('/student/requests'),
       ),
     );
   }

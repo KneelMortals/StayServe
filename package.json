@@ -21,6 +21,7 @@
     "storage:cors:apply": "node tools/configure_storage_cors.mjs --apply",
     "phone:test-numbers": "node tools/firebase_phone_test_numbers.mjs",
     "phone:test-numbers:probe": "node tools/firebase_phone_test_numbers.mjs --probe",
+    "phone:branding": "node tools/firebase_auth_branding.mjs",
     "web:html:check": "html-validate web/index.html web/home/index.html web/terms/index.html web/privacy-policy/index.html",
     "web:seo:check": "node tools/verify_web_seo.mjs build/web",
     "domain:status": "node tools/domain_cutover.mjs status",

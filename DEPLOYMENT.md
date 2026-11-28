@@ -309,6 +309,45 @@ after the console has provisioned the keys, and check
 `GET identitytoolkit.googleapis.com/v2/recaptchaConfig?clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE`
 for a `recaptchaKey` before a release.
 
+#### The wording of the phone code
+
+The code which the **Firebase Auth phone provider** sends cannot be given a
+wording. Google builds it from its own template:
+
+```
+%LOGIN_CODE% is your verification code for %APP_NAME%.
+```
+
+That field is **read only** in the Identity Platform API (`"readOnly": true` in
+the discovery document of `identitytoolkit`), the console offers no editor for
+it, and a `PATCH` is accepted but silently ignored. What can be seen is the
+value which fills `%APP_NAME%`:
+
+| Where the app runs | The name in the message |
+|---|---|
+| An Android app which is installed **from Google Play** | the name of the Play listing |
+| A sideloaded Android build, or the web build without a custom domain | the name of the default Hosting site (`myfirstapp-fa30f52b`) |
+| The web build on the custom domain | `stayserve.co.in` |
+
+So a code which carries `myfirstapp` is the normal result of a build which is
+**not** installed from Google Play. There are three ways to get the name of the
+product into the message:
+
+1. **Publish the app on Google Play** with the title *StayServe*. A build
+   which is installed from Play then receives the name of the listing. This
+   also needs the Play App Signing enrolment.
+2. **Set the public-facing name of the project** in the console
+   (Authentication → Settings → General → *Public-facing name* = `StayServe`).
+   The mail templates of Firebase Auth use it.
+3. **Let StayServe send the code by itself.** The backend supports Twilio,
+   Fast2SMS and MSG91 and sends
+   `"<code> is your StayServe login OTP."` — the wording of the product, with
+   no technical name in it. It needs a sender: put the key into
+   `functions/.env` and set `REQUIRE_PHONE_OTP=true` (see §3.3).
+
+`npm run phone:branding` prints the state of both: the template of Firebase
+Auth, the name of the default Hosting site and the messages of the backend.
+
 ### 4.1 What the payment functions do
 
 | Function | Callable | Purpose |
@@ -1106,6 +1145,13 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
     verification reports `publicExactRemaining = 0`. The `onRoomCreated`
     trigger must remain deployed: it assigns the server-owned listing
     defaults and the immutable listing generation.
+13. **The code of the Firebase Auth phone provider carries the technical name
+    of the project.** The template of Google is read only, so a sideloaded
+    build receives `… your verification code for myfirstapp-fa30f52b`. The
+    build which is installed from Google Play receives the name of the Play
+    listing, and the backend sends `<code> is your StayServe login OTP.` as
+    soon as a sender is configured. The three ways out are listed in
+    §4.1 ("The wording of the phone code").
 
 ---
 

@@ -109,6 +109,16 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
 
       if (!mounted) return;
 
+      // The server attached the custom claims (`role`,
+      // `stayServeVerifiedPhone`) to the account while it wrote the profile.
+      // The token which was issued at sign-in time does not carry them yet, so
+      // it has to be refreshed. Without the refresh the Firestore rules do not
+      // see a verified phone and refuse the owner-only reads — the exact
+      // address of a listing, for example.
+      await ref.read(authRepositoryProvider).refreshIdToken();
+
+      if (!mounted) return;
+
       // The Firestore snapshot may still contain the incomplete profile for a
       // short moment. Remember the server-confirmed role and registration
       // marker so the router does not bounce the user back here.
@@ -165,117 +175,128 @@ class _RoleSelectionScreenState extends ConsumerState<RoleSelectionScreen> {
 
     return Scaffold(
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(AppSpacing.xl),
-          child: Form(
-            key: _formKey,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const SizedBox(height: AppSpacing.xl),
-                Center(
+        child: Column(
+          children: [
+            // The page scrolls. The role cards keep their natural height on
+            // every screen size, so their words can never be squeezed into
+            // each other on a small phone.
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(
+                  AppSpacing.xl,
+                  AppSpacing.lg,
+                  AppSpacing.xl,
+                  0,
+                ),
+                child: Form(
+                  key: _formKey,
                   child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Container(
-                        width: 80,
-                        height: 80,
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(
-                            AppBorderRadius.xl,
-                          ),
-                        ),
-                        child: Icon(
-                          Icons.home_outlined,
-                          size: 40,
-                          color: theme.colorScheme.primary,
+                      Center(
+                        child: Column(
+                          children: [
+                            Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                color: theme.colorScheme.primaryContainer,
+                                borderRadius: BorderRadius.circular(
+                                  AppBorderRadius.xl,
+                                ),
+                              ),
+                              child: Icon(
+                                Icons.home_outlined,
+                                size: 36,
+                                color: theme.colorScheme.primary,
+                              ),
+                            ),
+                            const SizedBox(height: AppSpacing.md),
+                            Text(
+                              'Complete Your Profile',
+                              style: theme.textTheme.headlineSmall,
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: AppSpacing.xs),
+                            Text(
+                              'Tell us your name and select your role to '
+                              'personalize your experience',
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
                         ),
                       ),
                       const SizedBox(height: AppSpacing.lg),
                       Text(
-                        'Complete Your Profile',
-                        style: theme.textTheme.headlineMedium,
-                      ),
-                      const SizedBox(height: AppSpacing.sm),
-                      Text(
-                        'Tell us your name and select your role to personalize '
-                        'your experience',
-                        style: theme.textTheme.bodyMedium?.copyWith(
+                        user?.emailVerified == true
+                            ? 'Your email address is verified. Select a role '
+                                  'to finish.'
+                            : user?.phoneNumber?.trim().isNotEmpty == true
+                            ? 'Your phone number is verified. Select a role to '
+                                  'finish.'
+                            : 'We will send a verification code to your email '
+                                  'address before finishing your profile.',
+                        style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
                         ),
                         textAlign: TextAlign.center,
                       ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: AppSpacing.xl),
-                Text(
-                  user?.emailVerified == true
-                      ? 'Your email address is verified. Select a role to finish.'
-                      : user?.phoneNumber?.trim().isNotEmpty == true
-                      ? 'Your phone number is verified. Select a role to finish.'
-                      : 'We will send a verification code to your email address '
-                            'before finishing your profile.',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: AppSpacing.xl),
-                AppTextField(
-                  label: 'Full name',
-                  hint: 'Your name',
-                  controller: _nameController,
-                  validator: AppValidators.validateName,
-                  prefixIcon: const Icon(Icons.person_outline),
-                  enabled: !_isLoading,
-                  maxLength: AppValidators.maxNameLength,
-                ),
-                const SizedBox(height: AppSpacing.lg),
-                Expanded(
-                  child: Column(
-                    children: [
-                      Expanded(
-                        child: _RoleSelectionCard(
-                          role: UserRole.student,
-                          title: 'Student',
-                          subtitle: 'Looking for a room to rent',
-                          description:
-                              'Search rooms, contact owners, and manage your stay',
-                          icon: Icons.school_outlined,
-                          selected: _selectedRole == UserRole.student,
-                          onTap: () =>
-                              setState(() => _selectedRole = UserRole.student),
-                        ),
+                      const SizedBox(height: AppSpacing.lg),
+                      AppTextField(
+                        label: 'Full name',
+                        hint: 'Your name',
+                        controller: _nameController,
+                        validator: AppValidators.validateName,
+                        prefixIcon: const Icon(Icons.person_outline),
+                        enabled: !_isLoading,
+                        maxLength: AppValidators.maxNameLength,
+                      ),
+                      const SizedBox(height: AppSpacing.lg),
+                      _RoleSelectionCard(
+                        role: UserRole.student,
+                        title: 'Student',
+                        subtitle: 'Looking for a room to rent',
+                        description:
+                            'Search rooms, contact owners, and manage your stay',
+                        icon: Icons.school_outlined,
+                        selected: _selectedRole == UserRole.student,
+                        onTap: () =>
+                            setState(() => _selectedRole = UserRole.student),
                       ),
                       const SizedBox(height: AppSpacing.md),
-                      Expanded(
-                        child: _RoleSelectionCard(
-                          role: UserRole.owner,
-                          title: 'Room Owner',
-                          subtitle: 'Have rooms to rent out',
-                          description:
-                              'List rooms, manage bookings, and earn income',
-                          icon: Icons.apartment_outlined,
-                          selected: _selectedRole == UserRole.owner,
-                          onTap: () =>
-                              setState(() => _selectedRole = UserRole.owner),
-                        ),
+                      _RoleSelectionCard(
+                        role: UserRole.owner,
+                        title: 'Room Owner',
+                        subtitle: 'Have rooms to rent out',
+                        description:
+                            'List rooms, manage bookings, and earn income',
+                        icon: Icons.apartment_outlined,
+                        selected: _selectedRole == UserRole.owner,
+                        onTap: () =>
+                            setState(() => _selectedRole = UserRole.owner),
                       ),
+                      const SizedBox(height: AppSpacing.lg),
                     ],
                   ),
                 ),
-                const SizedBox(height: AppSpacing.lg),
-                AppButton(
-                  label: 'Continue',
-                  onPressed: _selectedRole != null && !_isLoading
-                      ? _continue
-                      : null,
-                  isLoading: _isLoading,
-                ),
-              ],
+              ),
             ),
-          ),
+            // The button stays visible: it is never pushed off the screen by
+            // the cards above it.
+            Padding(
+              padding: const EdgeInsets.all(AppSpacing.xl),
+              child: AppButton(
+                label: 'Continue',
+                onPressed: _selectedRole != null && !_isLoading
+                    ? _continue
+                    : null,
+                isLoading: _isLoading,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -309,7 +330,7 @@ class _RoleSelectionCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(AppBorderRadius.xl),
       child: AnimatedContainer(
         duration: AppConstants.animationDuration,
-        padding: const EdgeInsets.all(AppSpacing.lg),
+        padding: const EdgeInsets.all(AppSpacing.md),
         decoration: BoxDecoration(
           color: selected
               ? theme.colorScheme.primaryContainer
@@ -323,57 +344,69 @@ class _RoleSelectionCard extends StatelessWidget {
           ),
           boxShadow: selected ? AppShadows.level2 : AppShadows.level1,
         ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+        // The icon sits beside the words instead of above them. The text
+        // gets the whole width of the card and wraps on its own lines, so
+        // nothing can overlap.
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             Container(
-              padding: const EdgeInsets.all(AppSpacing.lg),
+              width: 52,
+              height: 52,
               decoration: BoxDecoration(
                 color: selected
                     ? theme.colorScheme.primary
                     : theme.colorScheme.primaryContainer,
-                shape: BoxShape.circle,
+                borderRadius: BorderRadius.circular(AppBorderRadius.lg),
               ),
               child: Icon(
                 icon,
-                size: 40,
+                size: 26,
                 color: selected
                     ? theme.colorScheme.onPrimary
                     : theme.colorScheme.primary,
               ),
             ),
-            const SizedBox(height: AppSpacing.md),
-            Text(
-              title,
-              style: theme.textTheme.headlineSmall?.copyWith(
-                color: selected
-                    ? theme.colorScheme.primary
-                    : theme.colorScheme.onSurface,
-                fontWeight: FontWeight.w600,
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      color: selected
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.onSurface,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.xs),
+                  Text(
+                    subtitle,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    description,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              subtitle,
-              style: theme.textTheme.titleMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: AppSpacing.sm),
-            Text(
-              description,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: AppSpacing.md),
-            if (selected)
+            if (selected) ...[
+              const SizedBox(width: AppSpacing.sm),
               Icon(
                 Icons.check_circle,
                 color: theme.colorScheme.primary,
-                size: 28,
+                size: 26,
               ),
+            ],
           ],
         ),
       ),

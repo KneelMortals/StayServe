@@ -90,6 +90,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           .markConversationRead(widget.conversationId);
       ref.invalidate(conversationsProvider);
     });
+
+    // A message of the previous screen must not lie over the composer.
+    //
+    // The message bar of a screen which is left open floats above the
+    // keyboard and covers the whole bottom of the next screen — the taps of
+    // the user on "Send" would then be swallowed without any visible
+    // reaction.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+    });
   }
 
   /// Reads the other participant of the conversation from Firestore.

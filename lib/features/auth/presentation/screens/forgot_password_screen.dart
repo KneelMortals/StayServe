@@ -9,13 +9,25 @@ class ForgotPasswordScreen extends ConsumerStatefulWidget {
   const ForgotPasswordScreen({super.key});
 
   @override
-  ConsumerState<ForgotPasswordScreen> createState() => _ForgotPasswordScreenState();
+  ConsumerState<ForgotPasswordScreen> createState() =>
+      _ForgotPasswordScreenState();
 }
 
 class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   bool _emailSent = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // A signed-in account opens this screen to change **its own** password.
+    // The address of the account is filled in, so the reset link cannot be
+    // sent to somebody else by accident.
+    final profile = ref.read(authSessionProvider).valueOrNull?.profile;
+    final email = profile?.email ?? '';
+    if (email.isNotEmpty) _emailController.text = email;
+  }
 
   @override
   void dispose() {
@@ -26,9 +38,9 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
   Future<void> _handleReset() async {
     if (!_formKey.currentState!.validate()) return;
 
-    await ref.read(authControllerProvider.notifier).sendPasswordResetEmail(
-      _emailController.text.trim(),
-    );
+    await ref
+        .read(authControllerProvider.notifier)
+        .sendPasswordResetEmail(_emailController.text.trim());
 
     if (mounted && ref.read(authControllerProvider).hasError == false) {
       setState(() => _emailSent = true);
@@ -58,7 +70,9 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(AppSpacing.xl),
-          child: _emailSent ? _buildSuccessView(context) : _buildFormView(context, ref),
+          child: _emailSent
+              ? _buildSuccessView(context)
+              : _buildFormView(context, ref),
         ),
       ),
     );
@@ -67,6 +81,11 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
   Widget _buildFormView(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final authState = ref.watch(authControllerProvider);
+    // The signed-in account may only reset **its own** password, so its
+    // address is fixed. A signed-out visitor fills the address in.
+    final signedInEmail =
+        ref.watch(authSessionProvider).valueOrNull?.profile?.email ?? '';
+    final ownAccount = signedInEmail.isNotEmpty;
     return Form(
       key: _formKey,
       child: Column(
@@ -91,12 +110,14 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
                 ),
                 const SizedBox(height: AppSpacing.lg),
                 Text(
-                  'Forgot Password?',
+                  ownAccount ? 'Change Password' : 'Forgot Password?',
                   style: theme.textTheme.headlineMedium,
                 ),
                 const SizedBox(height: AppSpacing.sm),
                 Text(
-                  'Enter your email and we\'ll send you a link to reset your password',
+                  ownAccount
+                      ? 'We send a reset link to $signedInEmail'
+                      : 'Enter your email and we\'ll send you a link to reset your password',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -114,6 +135,7 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
             textInputAction: TextInputAction.done,
             validator: AppValidators.validateEmail,
             prefixIcon: const Icon(Icons.email_outlined),
+            readOnly: ownAccount,
             onFieldSubmitted: (_) => _handleReset(),
           ),
           const SizedBox(height: AppSpacing.lg),
@@ -162,10 +184,7 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
           ),
         ),
         const SizedBox(height: AppSpacing.xl),
-        Text(
-          'Email Sent!',
-          style: theme.textTheme.headlineMedium,
-        ),
+        Text('Email Sent!', style: theme.textTheme.headlineMedium),
         const SizedBox(height: AppSpacing.sm),
         Text(
           'We\'ve sent a password reset link to ${_emailController.text}',

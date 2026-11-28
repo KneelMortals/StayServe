@@ -18,6 +18,8 @@ import {
 import {
   ACTIVE_BOOKING_STATUSES,
   canActAsRoomOwner,
+  paymentAlreadyMade,
+  TERMINAL_BOOKING_STATUSES,
 } from './bookingAccess';
 import { isActiveBookingStatus } from './bookings';
 import {
@@ -1423,6 +1425,15 @@ export type RoomDeletionDecision =
  * the payment/invoice history would point at a room that does not exist.
  * Deleting an empty listing is safe because the open requests are cancelled
  * by the server in the same operation.
+ *
+ * A **finished** request whose payment was already settled is history. The
+ * money changed hands, the platform cut was taken and the booking itself is
+ * over — for example because the owner marked the listing available and
+ * released the student. Such a request must not keep the listing alive
+ * forever: the invoice and the payment record stay in the database and keep
+ * the financial trail, exactly like they do for the deletion of an account.
+ * The rule is the same as the one which guards the deletion of an account
+ * (see `requestBlocksAccountDeletion`).
  */
 export function decideRoomDeletion(
   currentOccupancy: number,
@@ -1437,16 +1448,24 @@ export function decideRoomDeletion(
   }
 
   for (const request of requests) {
-    if (isActiveBookingStatus(String(request.status || ''))) {
+    const status = String(request.status || '').trim();
+
+    if (isActiveBookingStatus(status)) {
       return { allowed: false, reason: 'active-booking' };
     }
 
-    if (
-      request.advancePaid === true ||
-      request.platformCutTaken === true ||
-      request.advancePaymentStatus === 'submitted' ||
-      request.advancePaymentStatus === 'verified'
-    ) {
+    // A payment which is still waiting for the administrator has to be
+    // settled before the listing may disappear. The money is in limbo and
+    // that decision belongs to the administrator, not to the owner.
+    const paymentState = String(request.advancePaymentStatus || '').trim();
+    if (paymentState === 'submitted') {
+      return { allowed: false, reason: 'payment-in-progress' };
+    }
+
+    // A request which is still open and already carries money (or the
+    // platform cut) has to survive until the administrator settled it.
+    const requestIsFinished = TERMINAL_BOOKING_STATUSES.indexOf(status) >= 0;
+    if (!requestIsFinished && paymentAlreadyMade(request)) {
       return { allowed: false, reason: 'payment-in-progress' };
     }
   }
@@ -1931,12 +1950,22 @@ async function executeRoomDeletionOperation(
       Number(room.currentOccupancy || 0),
     );
     if (!deletionDecision.allowed) {
-      const message =
-        deletionDecision.reason === 'active-booking'
-          ? 'This room has an active booking and cannot be deleted.'
-          : deletionDecision.reason === 'payment-in-progress'
-            ? 'This room has a payment waiting for verification and cannot be deleted.'
-            : 'This room still has occupants and cannot be deleted.';
+      // The message names the **actual** reason. A listing whose payment is
+      // still waiting for the administrator and a listing whose occupancy is
+      // broken need a different answer than a listing with an occupant.
+      let message: string;
+      if (deletionDecision.reason === 'active-booking') {
+        message =
+          'This room has an active booking and cannot be deleted. End the booking first.';
+      } else if (deletionDecision.reason === 'payment-in-progress') {
+        message =
+          'This room has a payment which still has to be settled and cannot be deleted.';
+      } else if (deletionDecision.reason === 'invalid-occupancy') {
+        message =
+          'The occupancy of this room is invalid. It must be repaired before the listing can be deleted.';
+      } else {
+        message = 'This room still has occupants and cannot be deleted.';
+      }
       throw new functions.https.HttpsError('failed-precondition', message);
     }
 

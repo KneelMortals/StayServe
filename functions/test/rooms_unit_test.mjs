@@ -123,6 +123,69 @@ check(
   { allowed: false, reason: 'invalid-occupancy' },
 );
 
+console.log('\n=== a finished booking with a settled payment is history ===');
+
+check(
+  'a released booking with a verified payment does not block the deletion',
+  decideRoomDeletion(0, [
+    {
+      status: 'cancelled',
+      advancePaid: true,
+      platformCutTaken: true,
+      advancePaymentStatus: 'verified',
+    },
+  ]),
+  { allowed: true },
+);
+check(
+  'a rejected booking with a settled payment does not block the deletion',
+  decideRoomDeletion(0, [
+    {
+      status: 'rejected',
+      advancePaid: true,
+      platformCutTaken: true,
+      advancePaymentStatus: 'verified',
+    },
+  ]),
+  { allowed: true },
+);
+check(
+  'a cancelled booking whose payment still waits for the administrator blocks the deletion',
+  decideRoomDeletion(0, [
+    {
+      status: 'cancelled',
+      advancePaid: false,
+      platformCutTaken: false,
+      advancePaymentStatus: 'submitted',
+    },
+  ]),
+  { allowed: false, reason: 'payment-in-progress' },
+);
+check(
+  'an open request with a verified payment blocks the deletion',
+  decideRoomDeletion(0, [
+    {
+      status: 'ownerConfirmed',
+      advancePaid: true,
+      platformCutTaken: true,
+      advancePaymentStatus: 'verified',
+    },
+  ]),
+  { allowed: false, reason: 'payment-in-progress' },
+);
+check(
+  'a released booking with a settled payment still needs an empty room',
+  decideRoomDeletion(1, [
+    {
+      status: 'cancelled',
+      advancePaid: true,
+      platformCutTaken: true,
+      advancePaymentStatus: 'verified',
+    },
+  ]),
+  { allowed: false, reason: 'has-occupants' },
+);
+
 console.log('\n=== room-photo Storage cleanup paths ===');
 
 check(

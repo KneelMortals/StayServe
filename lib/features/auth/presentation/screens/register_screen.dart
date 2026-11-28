@@ -214,32 +214,25 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                 const SizedBox(height: AppSpacing.xl),
                 Text('I am a', style: theme.textTheme.labelLarge),
                 const SizedBox(height: AppSpacing.sm),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _RoleCard(
-                        role: UserRole.student,
-                        title: 'Student',
-                        subtitle: 'Looking for a room',
-                        icon: Icons.school_outlined,
-                        selected: _selectedRole == UserRole.student,
-                        onTap: () =>
-                            setState(() => _selectedRole = UserRole.student),
-                      ),
-                    ),
-                    const SizedBox(width: AppSpacing.md),
-                    Expanded(
-                      child: _RoleCard(
-                        role: UserRole.owner,
-                        title: 'Owner',
-                        subtitle: 'Listing rooms for rent',
-                        icon: Icons.apartment_outlined,
-                        selected: _selectedRole == UserRole.owner,
-                        onTap: () =>
-                            setState(() => _selectedRole = UserRole.owner),
-                      ),
-                    ),
-                  ],
+                // The two choices stand under each other. Side by side they
+                // were squeezed into a narrow column on a small phone, and
+                // their words ran into each other.
+                _RoleCard(
+                  role: UserRole.student,
+                  title: 'Student',
+                  subtitle: 'Looking for a room to rent',
+                  icon: Icons.school_outlined,
+                  selected: _selectedRole == UserRole.student,
+                  onTap: () => setState(() => _selectedRole = UserRole.student),
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                _RoleCard(
+                  role: UserRole.owner,
+                  title: 'Room Owner',
+                  subtitle: 'Have rooms to rent out',
+                  icon: Icons.apartment_outlined,
+                  selected: _selectedRole == UserRole.owner,
+                  onTap: () => setState(() => _selectedRole = UserRole.owner),
                 ),
                 const SizedBox(height: AppSpacing.lg),
                 AppTextField(
@@ -357,10 +350,14 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Text(
-                      'Already have an account? ',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                    // The text wraps instead of pushing the button off the
+                    // screen when the font of the phone is large.
+                    Flexible(
+                      child: Text(
+                        'Already have an account? ',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
                       ),
                     ),
                     TextButton(
@@ -416,33 +413,60 @@ class _RoleCard extends StatelessWidget {
             width: selected ? 2 : 1,
           ),
         ),
-        child: Column(
+        // The icon sits beside the words. The text gets the whole width of
+        // the card and wraps on its own lines, so nothing can overlap.
+        child: Row(
           children: [
-            Icon(
-              icon,
-              size: 32,
-              color: selected
-                  ? theme.colorScheme.primary
-                  : theme.colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(height: AppSpacing.sm),
-            Text(
-              title,
-              style: theme.textTheme.titleMedium?.copyWith(
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
                 color: selected
                     ? theme.colorScheme.primary
-                    : theme.colorScheme.onSurface,
-                fontWeight: FontWeight.w600,
+                    : theme.colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(AppBorderRadius.md),
+              ),
+              child: Icon(
+                icon,
+                size: 24,
+                color: selected
+                    ? theme.colorScheme.onPrimary
+                    : theme.colorScheme.primary,
               ),
             ),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              subtitle,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: selected
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.onSurface,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.xs),
+                  Text(
+                    subtitle,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
               ),
-              textAlign: TextAlign.center,
             ),
+            if (selected) ...[
+              const SizedBox(width: AppSpacing.sm),
+              Icon(
+                Icons.check_circle,
+                color: theme.colorScheme.primary,
+                size: 24,
+              ),
+            ],
           ],
         ),
       ),

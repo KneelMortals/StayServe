@@ -217,6 +217,10 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
 
     if (profile != null) _prefill(profile);
 
+    // The Google account counts as linked when the server says so. The name
+    // of the provider is never shown to the user.
+    final googleLinked = profile?.authProviders.contains('google.com') == true;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Edit Profile')),
       body: profile == null
@@ -324,7 +328,7 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                         ),
                         subtitle: Text(
                           profile.phoneVerified
-                              ? 'Firebase SMS verified'
+                              ? 'Phone number verified'
                               : 'A verified phone is required for services',
                         ),
                         trailing: profile.phoneVerified
@@ -355,7 +359,7 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                         ),
                         subtitle: Text(
                           profile.emailVerified
-                              ? 'Email ownership verified'
+                              ? 'Email address verified'
                               : 'You can add a verified email later',
                         ),
                         trailing: profile.emailVerified
@@ -368,22 +372,32 @@ class _EditProfileScreenState extends ConsumerState<EditProfileScreen> {
                               ),
                       ),
                     ),
-                    if (!profile.authProviders.contains('google.com')) ...[
-                      const SizedBox(height: AppSpacing.sm),
-                      Card(
-                        child: ListTile(
-                          leading: const Icon(Icons.g_mobiledata),
-                          title: const Text('Google account'),
-                          subtitle: const Text(
-                            'Link Google OpenID Connect for another sign-in method',
-                          ),
-                          trailing: TextButton(
-                            onPressed: profileBusy ? null : _linkGoogle,
-                            child: const Text('Link'),
-                          ),
+                    const SizedBox(height: AppSpacing.sm),
+                    // The sign-in methods are shown in the words of the
+                    // product. The name of the service which verified them
+                    // is not part of the interface.
+                    Card(
+                      child: ListTile(
+                        leading: Icon(
+                          googleLinked ? Icons.verified : Icons.g_mobiledata,
+                          color: googleLinked
+                              ? Theme.of(context).colorScheme.primary
+                              : Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
+                        title: const Text('Google account'),
+                        subtitle: Text(
+                          googleLinked
+                              ? 'Google account verified'
+                              : 'Not linked — sign in faster with Google',
+                        ),
+                        trailing: googleLinked
+                            ? null
+                            : TextButton(
+                                onPressed: profileBusy ? null : _linkGoogle,
+                                child: const Text('Link'),
+                              ),
                       ),
-                    ],
+                    ),
                     const SizedBox(height: AppSpacing.lg),
                     AppButton(
                       label: 'Save changes',

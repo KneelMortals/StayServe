@@ -5,7 +5,9 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../core/constants/app_constants.dart';
 
-final paymentServiceProvider = Provider<PaymentService>((ref) => PaymentService());
+final paymentServiceProvider = Provider<PaymentService>(
+  (ref) => PaymentService(),
+);
 
 /// The limits of a UPI intent.
 ///
@@ -77,15 +79,25 @@ class UpiIntentValidator {
     final problems = <String>[];
     void check(String name, String value, int limit) {
       if (value.length > limit) {
-        problems.add('$name is ${value.length} characters long (the limit is $limit)');
+        problems.add(
+          '$name is ${value.length} characters long (the limit is $limit)',
+        );
       }
     }
 
     check('The payee address', payee, UpiIntentLimits.payeeAddress);
     check('The payee name', params['pn'] ?? '', UpiIntentLimits.payeeName);
     check('The amount', amount, UpiIntentLimits.amount);
-    check('The transaction reference', params['tr'] ?? '', UpiIntentLimits.transactionRef);
-    check('The transaction note', params['tn'] ?? '', UpiIntentLimits.transactionNote);
+    check(
+      'The transaction reference',
+      params['tr'] ?? '',
+      UpiIntentLimits.transactionRef,
+    );
+    check(
+      'The transaction note',
+      params['tn'] ?? '',
+      UpiIntentLimits.transactionNote,
+    );
 
     if (problems.isNotEmpty) {
       return 'This payment link breaks the UPI specification: '
@@ -259,8 +271,28 @@ class PaymentService {
             'reference below so we can verify it.',
       );
     } catch (e) {
-      return UpiPaymentResult.failure(e.toString());
+      return UpiPaymentResult.failure(readableLaunchFailure(e));
     }
+  }
+
+  /// The message which the user sees when the UPI app could not be opened.
+  ///
+  /// The plugin **throws** instead of answering `false` when no app on the
+  /// phone can handle the intent. The text of that exception is technical
+  /// ("PlatformException(ACTIVITY_NOT_FOUND, No Activity found to handle
+  /// intent { upi://pay?pa=… })") and must never reach the screen of a
+  /// user.
+  static String readableLaunchFailure(Object error) {
+    if (error is PlatformException) {
+      if (error.code == 'ACTIVITY_NOT_FOUND' ||
+          error.code == 'INVALID_URL' ||
+          error.code == 'NO_ACTIVITY_FOUND') {
+        return 'No UPI app found. Please install GPay, PhonePe, Paytm, or '
+            'BHIM — or copy the UPI ID and pay in your own app.';
+      }
+    }
+    return 'Could not open the UPI app. You can copy the UPI ID and pay in '
+        'your own app.';
   }
 
   /// Puts [text] on the clipboard.
@@ -274,11 +306,31 @@ class PaymentService {
   /// Get list of common UPI apps for user guidance.
   static List<UpiApp> getPopularUpiApps() {
     return [
-      UpiApp(name: 'Google Pay', packageName: 'com.google.android.apps.nbu.paisa.user', icon: Icons.payment),
-      UpiApp(name: 'PhonePe', packageName: 'com.phonepe.app', icon: Icons.phone_android),
-      UpiApp(name: 'Paytm', packageName: 'net.one97.paytm', icon: Icons.account_balance_wallet),
-      UpiApp(name: 'BHIM', packageName: 'in.org.npci.bhimapp', icon: Icons.security),
-      UpiApp(name: 'Amazon Pay', packageName: 'in.amazon.mShop.android.shopping', icon: Icons.shopping_cart),
+      UpiApp(
+        name: 'Google Pay',
+        packageName: 'com.google.android.apps.nbu.paisa.user',
+        icon: Icons.payment,
+      ),
+      UpiApp(
+        name: 'PhonePe',
+        packageName: 'com.phonepe.app',
+        icon: Icons.phone_android,
+      ),
+      UpiApp(
+        name: 'Paytm',
+        packageName: 'net.one97.paytm',
+        icon: Icons.account_balance_wallet,
+      ),
+      UpiApp(
+        name: 'BHIM',
+        packageName: 'in.org.npci.bhimapp',
+        icon: Icons.security,
+      ),
+      UpiApp(
+        name: 'Amazon Pay',
+        packageName: 'in.amazon.mShop.android.shopping',
+        icon: Icons.shopping_cart,
+      ),
     ];
   }
 }
@@ -300,9 +352,9 @@ class UpiPaymentResult {
   });
 
   UpiPaymentResult.failure(this.error)
-      : success = false,
-        transactionRef = null,
-        message = null;
+    : success = false,
+      transactionRef = null,
+      message = null;
 }
 
 /// UPI App info.

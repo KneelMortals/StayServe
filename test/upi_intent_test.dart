@@ -15,6 +15,7 @@
 // "the amount exceeds the limit", "the transaction cannot be completed".
 // The amount was fine; the *address* was the problem.
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:stayserve/services/payment_service.dart';
@@ -162,6 +163,40 @@ void main() {
         UpiIntentValidator.validate('https://example.com'),
         contains('not a UPI link'),
       );
+    });
+  });
+
+  group('the message of a UPI app which cannot be opened', () {
+    test('names the missing app instead of the exception', () {
+      final message = PaymentService.readableLaunchFailure(
+        PlatformException(
+          code: 'ACTIVITY_NOT_FOUND',
+          message:
+              'No Activity found to handle intent { upi://pay?pa=payee@bank }',
+        ),
+      );
+
+      expect(message, contains('No UPI app found'));
+      expect(message, isNot(contains('PlatformException')));
+      expect(message, isNot(contains('upi://')));
+    });
+
+    test('stays readable for every other failure', () {
+      final message = PaymentService.readableLaunchFailure(
+        PlatformException(code: 'SOMETHING_ELSE', message: 'boom'),
+      );
+
+      expect(message, contains('Could not open the UPI app'));
+      expect(message, isNot(contains('boom')));
+    });
+
+    test('stays readable for an unknown error', () {
+      final message = PaymentService.readableLaunchFailure(
+        StateError('the intent was broken'),
+      );
+
+      expect(message, contains('Could not open the UPI app'));
+      expect(message, isNot(contains('StateError')));
     });
   });
 }
