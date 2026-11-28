@@ -255,10 +255,10 @@ class OwnerProfileScreen extends ConsumerWidget {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: Text(title),
-        // The text is **not** wrapped in a scroll view: a scroll view hides
-        // the words from the screen reader, so the message would be read as
-        // an empty box.
-        content: Text(message),
+        // The message scrolls: a long text would otherwise be cut off by the
+        // dialog. The scroll view does not hide the words from the screen
+        // reader — the text keeps its own node in the accessibility tree.
+        content: SingleChildScrollView(child: Text(message)),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),

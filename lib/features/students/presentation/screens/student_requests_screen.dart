@@ -56,25 +56,34 @@ class _StudentRequestsViewState extends ConsumerState<StudentRequestsView> {
 
     return requestsAsync.when(
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (error, _) => Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              Icons.error_outline,
-              size: 64,
-              color: Theme.of(context).colorScheme.error,
-            ),
-            const SizedBox(height: AppSpacing.md),
-            const Text('Could not load your requests'),
-            const SizedBox(height: AppSpacing.md),
-            TextButton(
-              onPressed: () => ref.invalidate(myJoinRequestsProvider),
-              child: const Text('Retry'),
-            ),
-          ],
-        ),
-      ),
+      error: (error, stackTrace) {
+        // The reason is logged: the screen itself keeps a friendly message,
+        // but a support request needs the real cause.
+        AppLogger.error(
+          'Could not load the join requests of the student',
+          error: error,
+          stackTrace: stackTrace,
+        );
+        return Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.error_outline,
+                size: 64,
+                color: Theme.of(context).colorScheme.error,
+              ),
+              const SizedBox(height: AppSpacing.md),
+              const Text('Could not load your requests'),
+              const SizedBox(height: AppSpacing.md),
+              TextButton(
+                onPressed: () => ref.invalidate(myJoinRequestsProvider),
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
+        );
+      },
       data: (requests) {
         if (requests.isEmpty) {
           return EmptyState(

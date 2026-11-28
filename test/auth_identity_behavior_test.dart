@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -14,10 +15,49 @@ import 'package:stayserve/features/auth/presentation/providers/auth_provider.dar
 import 'package:stayserve/features/auth/presentation/screens/phone_verification_screen.dart';
 import 'package:stayserve/features/auth/presentation/screens/role_selection_screen.dart';
 import 'package:stayserve/firebase/auth/auth_service.dart';
+import 'package:stayserve/firebase/messaging/messaging_service.dart';
 import 'package:stayserve/firebase/otp/otp_service.dart';
 import 'package:stayserve/models/user_model.dart';
 
 import 'support/auth_identity_fakes.dart';
+
+/// A registrar which does not touch the network.
+///
+/// These tests exercise the **authentication** behaviour. The push token of
+/// the device is not part of it, and a token which cannot be removed blocks
+/// the account change on purpose — so the tests need a registrar which
+/// succeeds.
+class _NoopPushNotificationRegistrar extends PushNotificationRegistrar {
+  _NoopPushNotificationRegistrar() : super(_NoopMessagingService());
+
+  @override
+  Future<void> register(String uid) async {}
+
+  @override
+  Future<void> unregister(String uid) async {}
+}
+
+/// A messaging service which is never asked for anything.
+class _NoopMessagingService extends MessagingService {
+  _NoopMessagingService()
+    : super(
+        messaging: _NeverAskedFirebaseMessaging(),
+        firestore: IdentityFakeFirestore(),
+      );
+
+  @override
+  Future<String?> getToken() async => null;
+
+  @override
+  Future<void> requestPermission() async {}
+}
+
+/// Firebase Messaging is deliberately unavailable in the identity unit tests.
+class _NeverAskedFirebaseMessaging implements FirebaseMessaging {
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw StateError('Firebase Messaging is not available in this test');
+}
 
 PhoneAuthCredential _phoneCredential() {
   return PhoneAuthProvider.credential(
@@ -857,7 +897,12 @@ void main() {
           profile: _profile(isActive: false),
         );
         final container = ProviderContainer(
-          overrides: [authRepositoryProvider.overrideWithValue(repository)],
+          overrides: [
+            authRepositoryProvider.overrideWithValue(repository),
+            pushNotificationRegistrarProvider.overrideWithValue(
+              _NoopPushNotificationRegistrar(),
+            ),
+          ],
         );
         addTearDown(container.dispose);
         await container.read(authControllerProvider.future);
@@ -1136,7 +1181,12 @@ void main() {
 
       await tester.pumpWidget(
         ProviderScope(
-          overrides: [authRepositoryProvider.overrideWithValue(repository)],
+          overrides: [
+            authRepositoryProvider.overrideWithValue(repository),
+            pushNotificationRegistrarProvider.overrideWithValue(
+              _NoopPushNotificationRegistrar(),
+            ),
+          ],
           child: MaterialApp.router(routerConfig: router),
         ),
       );

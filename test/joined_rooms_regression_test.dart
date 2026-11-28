@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -10,6 +9,7 @@ import 'package:stayserve/features/auth/presentation/providers/auth_provider.dar
 import 'package:stayserve/features/students/presentation/providers/student_providers.dart';
 import 'package:stayserve/firebase/student/student_repository.dart';
 import 'package:stayserve/models/room_model.dart';
+import 'package:stayserve/models/user_model.dart';
 
 class _FakeStudentRepository implements StudentRepository {
   final List<String> watchedUids = <String>[];
@@ -22,6 +22,21 @@ class _FakeStudentRepository implements StudentRepository {
 
   @override
   dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+/// A profile of a signed-in account with the given role.
+UserModel _profile(String uid, UserRole role) {
+  final now = DateTime.utc(2026, 1, 1);
+  return UserModel(
+    uid: uid,
+    name: 'Test $uid',
+    email: '$uid@example.com',
+    role: role,
+    registrationCompleted: true,
+    phoneVerified: true,
+    createdAt: now,
+    updatedAt: now,
+  );
 }
 
 RoomModel _room() {
@@ -166,11 +181,11 @@ void main() {
   test(
     'the joined-rooms provider starts when Firebase restores the user',
     () async {
-      final authEvents = StreamController<User?>.broadcast();
+      final authEvents = StreamController<AuthSession?>.broadcast();
       final repository = _FakeStudentRepository();
       final container = ProviderContainer(
         overrides: [
-          authStateProvider.overrideWith((ref) => authEvents.stream),
+          authSessionProvider.overrideWith((ref) => authEvents.stream),
           studentRepositoryProvider.overrideWithValue(repository),
         ],
       );
@@ -187,7 +202,10 @@ void main() {
       expect(container.read(myJoinedRoomsProvider).valueOrNull, isEmpty);
 
       authEvents.add(
-        MockUser(uid: 'student-1', email: 'student-1@example.com'),
+        AuthSession(
+          user: MockUser(uid: 'student-1', email: 'student-1@example.com'),
+          profile: _profile('student-1', UserRole.student),
+        ),
       );
       await pumpEventQueue();
 
@@ -198,4 +216,36 @@ void main() {
       );
     },
   );
+
+  test('the joined-rooms provider stays empty for an owner account', () async {
+    final authEvents = StreamController<AuthSession?>.broadcast();
+    final repository = _FakeStudentRepository();
+    final container = ProviderContainer(
+      overrides: [
+        authSessionProvider.overrideWith((ref) => authEvents.stream),
+        studentRepositoryProvider.overrideWithValue(repository),
+      ],
+    );
+    addTearDown(() async {
+      container.dispose();
+      await authEvents.close();
+    });
+
+    final subscription = container.listen(myJoinedRoomsProvider, (_, __) {});
+    addTearDown(subscription.close);
+
+    authEvents.add(
+      AuthSession(
+        user: MockUser(uid: 'owner-1', email: 'owner-1@example.com'),
+        profile: _profile('owner-1', UserRole.owner),
+      ),
+    );
+    await pumpEventQueue();
+
+    // The student-side collections are scoped to the student of a booking.
+    // A listener which is attached for an owner is refused by the rules, so
+    // it is never attached at all.
+    expect(repository.watchedUids, isEmpty);
+    expect(container.read(myJoinedRoomsProvider).valueOrNull, isEmpty);
+  });
 }

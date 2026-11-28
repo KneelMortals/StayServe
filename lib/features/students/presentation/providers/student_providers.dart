@@ -271,13 +271,38 @@ double? roomDistanceFromUser(RoomModel room, UserLocation? location) {
   );
 }
 
+/// The signed-in account, or `null` while nobody is signed in.
+///
+/// Every student-side list watches it: a listener which is attached while
+/// Firebase Auth is switching the account is evaluated with the token of the
+/// **previous** account, and the security rules refuse that read. Without the
+/// watch the refused listener would keep its error state until the screen
+/// was rebuilt by hand.
+///
+/// The **role** gate matters just as much: the student-side collections are
+/// scoped to the student of the booking, and the security rules refuse that
+/// read for an owner. The listener is therefore never attached for an
+/// account which cannot read it. An administrator may read every collection
+/// and is allowed through.
+final studentUidProvider = Provider<String?>((ref) {
+  final session = ref.watch(authSessionProvider).valueOrNull;
+  if (session == null) return null;
+
+  // The role of the **live** profile: it fails closed while the profile is
+  // still loading instead of briefly assuming the wrong role.
+  final role = session.profile?.role;
+  if (role != UserRole.student && role != UserRole.admin) return null;
+
+  return session.user.uid;
+});
+
 final myJoinedRoomsProvider = StreamProvider.autoDispose<List<RoomModel>>((
   ref,
 ) {
   // Watching the auth state is important: the provider may be created
   // before Firebase has restored the current user. It is then rebuilt when
   // the user becomes available instead of remaining permanently empty.
-  final uid = ref.watch(authStateProvider).valueOrNull?.uid;
+  final uid = ref.watch(studentUidProvider);
   if (uid == null) return Stream.value([]);
 
   return ref.watch(studentRepositoryProvider).watchJoinedRoomsForUid(uid);
@@ -285,9 +310,20 @@ final myJoinedRoomsProvider = StreamProvider.autoDispose<List<RoomModel>>((
 
 final myJoinRequestsProvider =
     StreamProvider.autoDispose<List<JoinRequestModel>>((ref) {
-      return ref.watch(studentRepositoryProvider).watchMyJoinRequests();
+      // Watching the auth state is important: the provider may be created
+      // before Firebase has restored the current user, and a listener which
+      // is attached while Firebase Auth switches the account is evaluated
+      // with the token of the **previous** account. The security rules refuse
+      // that read, and the refusal would stay visible until the screen was
+      // rebuilt by hand.
+      final uid = ref.watch(studentUidProvider);
+      if (uid == null) return Stream.value([]);
+
+      return ref.watch(studentRepositoryProvider).watchMyJoinRequests(uid);
     });
 
 final savedRoomsProvider = StreamProvider.autoDispose<List<RoomModel>>((ref) {
-  return ref.watch(studentRepositoryProvider).watchSavedRooms();
+  final uid = ref.watch(studentUidProvider);
+  if (uid == null) return Stream.value([]);
+  return ref.watch(studentRepositoryProvider).watchSavedRooms(uid);
 });

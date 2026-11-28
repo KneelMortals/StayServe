@@ -670,9 +670,13 @@ class AuthController extends AsyncNotifier<void> {
   /// Runs an operation which can replace the current Firebase Auth account.
   ///
   /// The old account's device token is removed before Firebase Auth is
-  /// allowed to change accounts. If the Auth operation itself fails and the
-  /// old account is still current, its token is restored on a best-effort
-  /// basis.
+  /// allowed to change accounts: the profile of an account may only be
+  /// written by that account itself, so a cleanup which runs afterwards is
+  /// refused by the rules and the old account would keep the token of this
+  /// device.
+  ///
+  /// If the Auth operation itself fails and the old account is still current,
+  /// its token is restored on a best-effort basis.
   Future<T> _runAuthAccountChange<T>(
     AuthRepository authRepo,
     Future<T> Function() action,
@@ -680,6 +684,9 @@ class AuthController extends AsyncNotifier<void> {
     final oldUid = authRepo.currentUser?.uid;
     if (oldUid == null) return await action();
 
+    // The removal has to succeed before the account is changed: a token which
+    // stays on the old profile would send the notifications of the old
+    // account to this device.
     await ref.read(pushNotificationRegistrarProvider).unregister(oldUid);
 
     try {
@@ -974,9 +981,12 @@ class AuthController extends AsyncNotifier<void> {
     state = const AsyncLoading();
     state = await AsyncValue.guard(() async {
       final authRepo = ref.read(authRepositoryProvider);
-      final credential = await authRepo.signInWithEmailAndPassword(
-        email: email,
-        password: password,
+      final credential = await _runAuthAccountChange(
+        authRepo,
+        () => authRepo.signInWithEmailAndPassword(
+          email: email,
+          password: password,
+        ),
       );
       await _validateActiveProfile(credential);
     });
@@ -988,7 +998,10 @@ class AuthController extends AsyncNotifier<void> {
     state = const AsyncLoading();
     state = await AsyncValue.guard(() async {
       final authRepo = ref.read(authRepositoryProvider);
-      final credential = await authRepo.signInWithGoogle();
+      final credential = await _runAuthAccountChange(
+        authRepo,
+        () => authRepo.signInWithGoogle(),
+      );
       await _validateActiveProfile(credential);
     });
   }
@@ -999,8 +1012,9 @@ class AuthController extends AsyncNotifier<void> {
     state = const AsyncLoading();
     state = await AsyncValue.guard(() async {
       final authRepo = ref.read(authRepositoryProvider);
-      final userCredential = await authRepo.signInWithPhoneCredential(
-        credential,
+      final userCredential = await _runAuthAccountChange(
+        authRepo,
+        () => authRepo.signInWithPhoneCredential(credential),
       );
       await _validateActiveProfile(userCredential);
     });

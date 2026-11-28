@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
+import '../../core/errors/failures.dart';
 import '../../core/utils/app_logger.dart';
 import '../auth/auth_service.dart';
 
@@ -158,13 +159,19 @@ class MessagingService {
 /// The old account's token can still be attached when this exception is
 /// raised. Callers must therefore not continue with a Firebase Auth sign-out
 /// or register the token for another account.
-class FcmTokenCleanupException implements Exception {
+///
+/// The message is written for the user: the screen shows it as it is, and it
+/// must not name the technology behind the notifications.
+class FcmTokenCleanupException extends Failure implements Exception {
   const FcmTokenCleanupException({
     required this.uid,
     required this.attempts,
     required this.cause,
     this.causeStackTrace,
-  });
+  }) : super(
+         'The notifications of the previous account could not be switched '
+         'off. Please try again.',
+       );
 
   final String uid;
   final int attempts;
@@ -247,6 +254,14 @@ class PushNotificationRegistrar {
   /// finish just as the cleanup removed that token from the profile.
   Future<void>? _pendingCleanup;
 
+  /// The accounts whose device token was already removed from the profile.
+  ///
+  /// The profile of an account may only be written by that account itself, so
+  /// the token has to be removed **before** Firebase Auth switches to another
+  /// account. A second cleanup of the same account would be refused by the
+  /// rules — it would only report a token which is not there any more.
+  final Set<String> _cleanedTokenUids = <String>{};
+
   bool _disposed = false;
 
   /// Whether the permission was already asked for in this session.
@@ -326,6 +341,10 @@ class PushNotificationRegistrar {
   /// the token unconditionally would be an endless loop of writes.
   Future<void> register(String uid) async {
     if (_disposed || uid.trim().isEmpty) return;
+
+    // The account receives the token of this device again, so a cleanup of
+    // this account has to be possible once more.
+    _cleanedTokenUids.remove(uid);
 
     // Invalidate every older operation before doing any asynchronous work.
     final generation = ++_generation;
@@ -459,6 +478,15 @@ class PushNotificationRegistrar {
   Future<void> unregister(String uid) async {
     if (uid.trim().isEmpty) return;
 
+    // The token of this account was already removed — for example before a
+    // sign-in which replaced the account. A second write would be refused by
+    // the rules, because the client already carries the token of the new
+    // account.
+    if (_cleanedTokenUids.contains(uid)) {
+      AppLogger.info('The FCM token of $uid was already removed');
+      return;
+    }
+
     // Invalidate pending registration and refresh operations for every
     // account. A delayed callback for the old UID must not be able to
     // restore its token while this cleanup is running.
@@ -478,6 +506,7 @@ class PushNotificationRegistrar {
     }
 
     await cleanup;
+    _cleanedTokenUids.add(uid);
   }
 
   /// Waits for the most recent cleanup without hiding its failure.

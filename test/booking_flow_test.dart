@@ -112,7 +112,7 @@ class _FakeStudentRepository extends StudentRepository {
   Future<bool> isRoomSaved(String roomId) async => false;
 
   @override
-  Stream<List<JoinRequestModel>> watchMyJoinRequests() async* {
+  Stream<List<JoinRequestModel>> watchMyJoinRequests(String uid) async* {
     yield List<JoinRequestModel>.of(requests);
   }
 }

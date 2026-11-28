@@ -17,6 +17,7 @@ import '../../../models/owned_room_model.dart';
 import '../../../models/room_model.dart';
 import '../../../models/room_private_location.dart';
 import '../auth/auth_service.dart';
+import '../firestore/firestore_listener.dart';
 import '../functions/functions_service.dart';
 
 final ownerRepositoryProvider = Provider<OwnerRepository>((ref) {
@@ -273,10 +274,7 @@ class OwnerRepository {
   /// owner-scoped collections, so both of them are watched and merged. A
   /// draft which survived an interrupted publication has to stay visible to
   /// its owner — otherwise it could never be completed or removed.
-  Stream<List<OwnedRoomModel>> watchMyRooms() {
-    final uid = _uid;
-    if (uid == null) return Stream.value([]);
-
+  Stream<List<OwnedRoomModel>> watchMyRooms(String uid) {
     final published = _firestore
         .collection(publishedRoomsCollection)
         .where('ownerId', isEqualTo: uid)
@@ -321,10 +319,7 @@ class OwnerRepository {
 
       RoomPrivateLocation? privateLocation;
       try {
-        final privateSnapshot = await _firestore
-            .collection('roomPrivate')
-            .doc(doc.id)
-            .get();
+        final privateSnapshot = await _readPrivateLocation(doc.id);
         if (privateSnapshot.exists) {
           final candidate = RoomPrivateLocation.fromJson(
             privateSnapshot.data() ?? const <String, dynamic>{},
@@ -363,12 +358,33 @@ class OwnerRepository {
     return rooms;
   }
 
-  /// Join requests addressed to the current owner's rooms.
-  Stream<List<JoinRequestModel>> watchMyJoinRequests() {
-    final uid = _uid;
-    if (uid == null) return Stream.value([]);
+  /// Reads the private location of a listing.
+  ///
+  /// The read is retried a few times: a request which is sent while Firebase
+  /// Auth is switching the account can be evaluated with the token of the
+  /// previous account, and the rules refuse that read. Without the retry the
+  /// owner would see the coarse location of their own listing.
+  Future<DocumentSnapshot<Map<String, dynamic>>> _readPrivateLocation(
+    String roomId,
+  ) async {
+    Object? lastError;
+    StackTrace? lastStackTrace;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await _firestore.collection('roomPrivate').doc(roomId).get();
+      } catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        if (attempt == 2) break;
+        await Future<void>.delayed(Duration(milliseconds: 400 * (attempt + 1)));
+      }
+    }
+    Error.throwWithStackTrace(lastError!, lastStackTrace!);
+  }
 
-    return _firestore
+  /// Join requests addressed to the current owner's rooms.
+  Stream<List<JoinRequestModel>> watchMyJoinRequests(String uid) {
+    final requests = _firestore
         .collection('joinRequests')
         .where('ownerId', isEqualTo: uid)
         .orderBy('createdAt', descending: true)
@@ -383,13 +399,16 @@ class OwnerRepository {
             ),
           ),
         );
+
+    return firestoreListenerWithRecovery<List<JoinRequestModel>>(
+      requests,
+      description: 'the join requests of the owner',
+      auth: _auth,
+    );
   }
 
   /// Commission invoices raised against the current owner's rooms.
-  Stream<List<CommissionInvoiceModel>> watchMyInvoices() {
-    final uid = _uid;
-    if (uid == null) return Stream.value([]);
-
+  Stream<List<CommissionInvoiceModel>> watchMyInvoices(String uid) {
     return _firestore
         .collection('commissionInvoices')
         .where('ownerId', isEqualTo: uid)

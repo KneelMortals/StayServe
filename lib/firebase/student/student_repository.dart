@@ -8,6 +8,7 @@ import '../../../core/utils/safe_document_parser.dart';
 import '../../../models/join_request_model.dart';
 import '../../../models/room_model.dart';
 import '../auth/auth_service.dart';
+import '../firestore/firestore_listener.dart';
 
 final studentRepositoryProvider = Provider<StudentRepository>((ref) {
   return StudentRepository(
@@ -270,11 +271,8 @@ class StudentRepository {
   }
 
   /// Join requests the student has created, newest first.
-  Stream<List<JoinRequestModel>> watchMyJoinRequests() {
-    final uid = _uid;
-    if (uid == null) return Stream.value([]);
-
-    return _firestore
+  Stream<List<JoinRequestModel>> watchMyJoinRequests(String uid) {
+    final requests = _firestore
         .collection('joinRequests')
         .where('studentId', isEqualTo: uid)
         .orderBy('createdAt', descending: true)
@@ -289,12 +287,21 @@ class StudentRepository {
             ),
           ),
         );
+
+    return firestoreListenerWithRecovery<List<JoinRequestModel>>(
+      requests,
+      description: 'the join requests of the student',
+      auth: _auth,
+    );
   }
 
   /// Rooms the student has bookmarked.
-  Stream<List<RoomModel>> watchSavedRooms() {
-    final uid = _uid;
-    if (uid == null) return Stream.value([]);
+  ///
+  /// The uid is passed in explicitly so the Riverpod provider can depend on
+  /// the Firebase auth state: a provider which is created while Firebase Auth
+  /// switches the account would keep the state of the previous account.
+  Stream<List<RoomModel>> watchSavedRooms(String uid) {
+    if (uid.isEmpty) return Stream.value([]);
 
     return _firestore.collection('users').doc(uid).snapshots().asyncMap((
       snapshot,
