@@ -1227,6 +1227,13 @@ The current admin of this project is **`shauryapratapraiom@gmail.com`**
     listing, and the backend sends `<code> is your StayServe login OTP.` as
     soon as a sender is configured. The three ways out are listed in
     §4.1 ("The wording of the phone code").
+14. **The page of Google after "Continue with Google" names the web address
+    of the project.** It says "Sign in to continue to
+    myfirstapp-fa30f52b.firebaseapp.com", because that is the `authDomain`
+    of the app. The page belongs to Google, but the name behind the text is
+    ours: it becomes `stayserve.co.in` as soon as the own address points to
+    Firebase and `lib/firebase/firebase_config.dart` uses it. §7.5 ("The
+    Google page shows …") lists the two ways and what they need.
 
 ---
 

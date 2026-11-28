@@ -3,8 +3,9 @@
 // A phone which is small, or a user who has made the letters of the system
 // larger, must still be able to read every screen of the sign-in flow. The
 // test pumps every screen of that flow at the sizes and font sizes which a
-// phone may use and fails when a word is cut off or when two words are drawn
-// on the same place.
+// phone may use. It fails when two words are drawn on the same place, and
+// when a page reports an overflow — Flutter raises an error for a word which
+// does not fit.
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_auth_mocks/firebase_auth_mocks.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
