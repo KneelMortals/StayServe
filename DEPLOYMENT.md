@@ -905,6 +905,31 @@ Every APK must show the fingerprint of the upload key
 (`660919fa384fc4fd545ad727cd046d9e9f5dbad602451e349ad55dc90694748b`) and
 never the fingerprint of the debug key.
 
+#### Which APK a phone needs
+
+`--split-per-abi` writes one small APK for every kind of processor. The
+phone needs the one which matches it:
+
+| File | For |
+|---|---|
+| `app-arm64-v8a-release.apk` | **almost every phone** (Samsung, Xiaomi, OnePlus, Google, Realme — every phone of the last years) |
+| `app-armeabi-v7a-release.apk` | old phones (before ~2017) |
+| `app-x86_64-release.apk` | only the Android emulator on a computer with an Intel/AMD processor |
+
+A phone which is not sure about its kind can install the **one APK for every
+phone**:
+
+```bash
+flutter build apk --release   # → build/app/outputs/flutter-apk/app-release.apk
+```
+
+It is bigger (it carries every processor), but it runs on every phone. The
+package name is `com.stayserve.stayserve`, the version is `1.0.0+1`.
+
+A phone which already has an earlier build of StayServe accepts the new file
+over it (the signature is the same); Android asks first, and the answer has to
+be **Install anyway**.
+
 The per-device download size is checked with bundletool, exactly like the CI
 does it:
 
