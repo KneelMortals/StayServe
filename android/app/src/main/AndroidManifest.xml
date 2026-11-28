@@ -9,7 +9,7 @@
          makes the session permanently unreadable after restore, causing the
          user to be logged out on every launch. -->
     <application
-        android:label="stayserve"
+        android:label="StayServe"
         android:name="${applicationName}"
         android:icon="@mipmap/launcher_icon"
         android:allowBackup="false">
