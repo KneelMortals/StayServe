@@ -896,7 +896,7 @@ Verify the result before it is published:
 
 ```bash
 APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)"
-for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+for apk in build/app/outputs/flutter-apk/*.apk; do
   "$APKSIGNER" verify --print-certs "$apk" | sed -n 's/.*certificate SHA-256 digest: //p'
 done
 ```
@@ -907,24 +907,38 @@ never the fingerprint of the debug key.
 
 #### Which APK a phone needs
 
-`--split-per-abi` writes one small APK for every kind of processor. The
-phone needs the one which matches it:
-
-| File | For |
-|---|---|
-| `app-arm64-v8a-release.apk` | **almost every phone** (Samsung, Xiaomi, OnePlus, Google, Realme — every phone of the last years) |
-| `app-armeabi-v7a-release.apk` | old phones (before ~2017) |
-| `app-x86_64-release.apk` | only the Android emulator on a computer with an Intel/AMD processor |
-
-A phone which is not sure about its kind can install the **one APK for every
-phone**:
+`--split-per-abi` writes one small APK for every kind of processor. **The
+files are renamed afterwards**, so every file in
+`build/app/outputs/flutter-apk/` carries the name of the app and the folder
+holds nothing else:
 
 ```bash
-flutter build apk --release   # → build/app/outputs/flutter-apk/app-release.apk
+cd build/app/outputs/flutter-apk
+rm -f ./*.sha1
+mv app-arm64-v8a-release.apk StayServe-1.0.0-arm64-v8a.apk
+mv app-armeabi-v7a-release.apk StayServe-1.0.0-armeabi-v7a.apk
+mv app-x86_64-release.apk StayServe-1.0.0-x86_64.apk
+mv app-release.apk StayServe-1.0.0-universal.apk
 ```
 
-It is bigger (it carries every processor), but it runs on every phone. The
-package name is `com.stayserve.stayserve`, the version is `1.0.0+1`.
+| File | Size | For |
+|---|---|---|
+| `StayServe-1.0.0-arm64-v8a.apk` | 26.9 MB | **almost every phone** (Samsung, Xiaomi, OnePlus, Google, Realme — every phone of the last years) |
+| `StayServe-1.0.0-universal.apk` | 70.4 MB | the fallback — runs on every phone (it carries all three processors) |
+| `StayServe-1.0.0-armeabi-v7a.apk` | 25.2 MB | old phones (before ~2017) |
+| `StayServe-1.0.0-x86_64.apk` | 28.3 MB | only the Android emulator on a computer with an Intel/AMD processor |
+
+The **universal** file is bigger because it carries the native engine of every
+processor (arm64-v8a 20.8 MB + armeabi-v7a 19.3 MB + x86_64 22.2 MB). The app
+itself is not bigger — the phone runs only its own part, so the space it takes
+on the phone is the same.
+
+`build/app/outputs/bundle/release/app-release.aab` is **not** installed on a
+phone: it is the file for Google Play (the Play Console splits it into the
+right file for every phone itself).
+
+The package name is `com.stayserve.stayserve`, the version is `1.0.0+1`, and
+the name on the home screen is **StayServe**.
 
 A phone which already has an earlier build of StayServe accepts the new file
 over it (the signature is the same); Android asks first, and the answer has to
