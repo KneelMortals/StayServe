@@ -1023,6 +1023,57 @@ rebuilds the list. The log line of the refusal says which account the read
 was made with; a wrong uid or a missing `stayServeVerifiedPhone` claim is
 the reason in that case.
 
+### 7.4 The words of a screen are drawn on top of each other
+
+Every screen of the sign-in flow must show its words on their own lines, on
+every phone and with every font size. Three things broke that rule and are
+fixed now:
+
+* the **Forgot Password** page ended with a `Row` which held "Remember your
+  password?" and the "Sign In" button. On a 320-pixel-wide phone that row was
+  **209 pixels too wide**, so the words were drawn on top of each other. The
+  row is a `Wrap` now, and the page scrolls;
+* the **splash** page and the **Forgot Password** page did not scroll, so
+  their last words were cut off on a short phone. Both pages scroll now;
+* a long **button label** ("Continue with Google") was cut off with an
+  ellipsis. The label may use a second line now, and the button grows with
+  it.
+
+The rule is kept by `test/auth_screen_layout_test.dart`. The test pumps the
+login page, the phone page, the role choice of a **Google** account, the
+registration and the forgotten password at 320×568, 360×640 and 412×732 with
+the font 1.0, 1.3 and 1.6, and fails when
+
+* a word is drawn on another word (the places of the words are compared), or
+* the page reports an overflow (Flutter raises an error for that).
+
+```bash
+flutter test test/auth_screen_layout_test.dart
+```
+
+### 7.5 The Google page shows "myfirstapp-fa30f52b.firebaseapp.com"
+
+After "Continue with Google" the page of Google says *"Sign in to continue
+to …"*. The name behind that text is the **address of the sign-in** — the
+`authDomain` of the app (`lib/firebase/firebase_config.dart`). The project
+was created with the name `myfirstapp-fa30f52b`, so that is what a user
+sees.
+
+Two ways to change it:
+
+1. **The own address of StayServe** (the better one): as soon as
+   `stayserve.co.in` points to Firebase (see the records in the
+   prerequisites), put `authDomain: 'stayserve.co.in'` into the `android`,
+   `ios` and `web` options of `lib/firebase/firebase_config.dart`. The page
+   of Google then says "Sign in to continue to stayserve.co.in". The address
+   has to be an **authorized domain** of the project (Authentication →
+   Settings → Authorized domains).
+2. **The name of the OAuth client**: in the Google Cloud console
+   (APIs & Services → Credentials) the Android client of the project can be
+   renamed to "StayServe". The API of the OAuth clients (`oauth2.googleapis.com`)
+   is not switched on for this project, so the rename is a task of the owner
+   in the console.
+
 ---
 
 ## 8. Promoting a user to admin

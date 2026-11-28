@@ -1004,65 +1004,76 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     final theme = Theme.of(context);
     return Scaffold(
       backgroundColor: Colors.white,
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Semantics(
-              label: 'StayServe logo',
-              image: true,
-              child: Image.asset(
-                'assets/images/logo.png',
-                width: 120,
-                height: 120,
-                fit: BoxFit.cover,
+      // The page scrolls. On a short phone the words of the page would
+      // otherwise be cut off at the bottom.
+      body: LayoutBuilder(
+        builder: (context, constraints) => SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Semantics(
+                    label: 'StayServe logo',
+                    image: true,
+                    child: Image.asset(
+                      'assets/images/logo.png',
+                      width: 120,
+                      height: 120,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.xl),
+                  Text(
+                    AppConstants.appName,
+                    style: theme.textTheme.headlineLarge?.copyWith(
+                      color: AppColors.textPrimary,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.sm),
+                  Text(
+                    'Find your perfect stay',
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: AppColors.textSecondary,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.xxl),
+                  if (_retryActionVisible) ...[
+                    const Icon(
+                      Icons.error_outline,
+                      size: 44,
+                      color: AppColors.textPrimary,
+                    ),
+                    const SizedBox(height: AppSpacing.md),
+                    FilledButton.icon(
+                      onPressed: _retryStartup,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Try again'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.primary,
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ] else
+                    const CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        AppColors.primary,
+                      ),
+                    ),
+                  const SizedBox(height: AppSpacing.lg),
+                  Text(
+                    _statusMessage,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: AppColors.textSecondary,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: AppSpacing.xl),
-            Text(
-              AppConstants.appName,
-              style: theme.textTheme.headlineLarge?.copyWith(
-                color: AppColors.textPrimary,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(height: AppSpacing.sm),
-            Text(
-              'Find your perfect stay',
-              style: theme.textTheme.bodyLarge?.copyWith(
-                color: AppColors.textSecondary,
-              ),
-            ),
-            const SizedBox(height: AppSpacing.xxl),
-            if (_retryActionVisible) ...[
-              const Icon(
-                Icons.error_outline,
-                size: 44,
-                color: AppColors.textPrimary,
-              ),
-              const SizedBox(height: AppSpacing.md),
-              FilledButton.icon(
-                onPressed: _retryStartup,
-                icon: const Icon(Icons.refresh),
-                label: const Text('Try again'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: AppColors.primary,
-                  foregroundColor: Colors.white,
-                ),
-              ),
-            ] else
-              const CircularProgressIndicator(
-                valueColor: AlwaysStoppedAnimation<Color>(AppColors.primary),
-              ),
-            const SizedBox(height: AppSpacing.lg),
-            Text(
-              _statusMessage,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: AppColors.textSecondary,
-              ),
-              textAlign: TextAlign.center,
-            ),
-          ],
+          ),
         ),
       ),
     );

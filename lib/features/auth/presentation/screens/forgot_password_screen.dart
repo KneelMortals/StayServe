@@ -70,9 +70,13 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(AppSpacing.xl),
-          child: _emailSent
-              ? _buildSuccessView(context)
-              : _buildFormView(context, ref),
+          // The page scrolls. On a short phone the words of the page would
+          // otherwise be cut off at the bottom.
+          child: SingleChildScrollView(
+            child: _emailSent
+                ? _buildSuccessView(context)
+                : _buildFormView(context, ref),
+          ),
         ),
       ),
     );
@@ -145,11 +149,15 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
             isLoading: authState.isLoading,
           ),
           const SizedBox(height: AppSpacing.xl),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          // A `Wrap` and not a `Row`: on a narrow phone the row was 209
+          // pixels too wide, so the words were drawn on top of each other.
+          Wrap(
+            alignment: WrapAlignment.center,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: AppSpacing.xs,
             children: [
               Text(
-                'Remember your password? ',
+                'Remember your password?',
                 style: theme.textTheme.bodyMedium?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),

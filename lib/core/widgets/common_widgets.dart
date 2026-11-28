@@ -45,14 +45,16 @@ class AppButton extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               if (icon != null) ...[icon!, const SizedBox(width: 8)],
-              // The label is flexible and clipped: a long label ("Pay
-              // platform fee") used to be drawn outside of the button,
-              // which is what made the words and the boxes overlap.
+              // The label is flexible and may use a second line: a long label
+              // ("Continue with Google") used to be drawn outside of the
+              // button, which is what made the words and the boxes overlap.
+              // A second line is better than a cut word, and the button grows
+              // with it.
               Flexible(
                 child: Text(
                   label,
                   style: theme.textTheme.labelLarge,
-                  maxLines: 1,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.center,
                 ),
