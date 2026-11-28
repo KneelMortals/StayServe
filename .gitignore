@@ -61,5 +61,8 @@ app.*.map.json
 /functions/.env.*
 !/functions/.env.example
 /android/build/
+# The session files of the Kotlin compiler. They are written and removed by
+# every Gradle build, so they must not be part of the repository.
+/android/.kotlin/
 devtools_options.yaml
 node_modules
